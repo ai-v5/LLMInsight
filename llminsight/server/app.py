@@ -147,8 +147,10 @@ class AppState:
         self.prof = None
         try:
             self.prof = load_profile(data_dir)
-            self.metrics = compute_all(self.prof)
+            # Read the launch-script capture BEFORE compute_all so the What-if 现实地板
+            # caveats (blocking / single-card) reflect THIS run's actual采集 config.
             self.capture = read_capture_config()
+            self.metrics = compute_all(self.prof, self.capture)
             self.cards = run_rules(self.metrics, self.capture)
             self.loaded_dir = data_dir
             self.ready = True
@@ -218,7 +220,7 @@ class AppState:
             eff.pop("kernel_index", None)
             self.metrics["efficiency"] = eff
             self.metrics["theoretical"] = metrics_core.theoretical(
-                self.prof, self.metrics.get("overview", {}), eff)
+                self.prof, self.metrics.get("overview", {}), eff, self.capture)
             self.metrics["meta"] = {**self.metrics.get("meta", {}),
                                     "settings": SETTINGS.to_dict()}
             self.cards = run_rules(self.metrics, self.capture)

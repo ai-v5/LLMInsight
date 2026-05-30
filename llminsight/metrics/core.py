@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -418,7 +418,176 @@ def memory(prof) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]:
+# Realistic optimization ceilings for the What-if "现实地板" analysis. These are
+# state-of-art engineering priors (achievable, not physical limits); they are
+# applied to the *currently loaded* profile's measured slices, so every floor
+# below adapts to whatever profiling is loaded — never hardcoded to one sample.
+REALISTIC_COMM_OVERLAP = 0.85          # achievable compute–comm overlap (good MoE schedule)
+REALISTIC_COMM_OVERLAP_BAND = (0.80, 0.90)
+REALISTIC_FREE_RESIDUAL = 0.03         # residual Free as a fraction of step (blocking-off + graph)
+REALISTIC_FREE_RESIDUAL_BAND = (0.02, 0.05)
+
+
+def _single_card(prof) -> bool:
+    """No cross-rank traffic → single-card capture. communication_matrix wraps each
+    step as {step: {p2p:{}, collective:{}}}, so emptiness must be tested on the inner
+    groups, not the (always-present) outer wrapper."""
+    cm = getattr(prof, "communication_matrix", None) or {}
+    if not isinstance(cm, dict):
+        return not bool(cm)
+    for step_v in cm.values():
+        if isinstance(step_v, dict):
+            if step_v.get("p2p") or step_v.get("collective"):
+                return False
+        elif step_v:
+            return False
+    return True
+
+
+def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
+                      op_reclaim, step_mfu, blocking, single_card, flags):
+    """Per-lever 「能否减到 0？不能则能减到多少」 analysis, derived from the LOADED
+    profile's measured slices (never the static sample). Floors come from realistic
+    ceilings applied to measured values; 失真 caveats are conditioned on this capture's
+    blocking / single-card state. Returns a render-ready dict consumed identically by
+    the web What-if panel and the shareable report."""
+    flags = flags or {}
+
+    def _mfu_at(new_step):
+        return (round(step_mfu * stage / new_step, 4)
+                if (step_mfu and new_step and new_step > 0) else None)
+
+    def _exposed_floor(overlap):  # exposed comm left if overlap reaches `overlap`
+        return max(0.0, comm_total * (1.0 - overlap))
+
+    levers = []
+
+    # ---- ① 未掩盖通信: overlap up to a realistic ceiling, never to 0 ----
+    f_mid = min(comm_no, _exposed_floor(REALISTIC_COMM_OVERLAP))
+    f_lo = min(comm_no, _exposed_floor(REALISTIC_COMM_OVERLAP_BAND[0]))   # 0.80 → higher floor
+    f_hi = min(comm_no, _exposed_floor(REALISTIC_COMM_OVERLAP_BAND[1]))   # 0.90 → lower floor
+    rec_mid, rec_lo, rec_hi = comm_no - f_mid, comm_no - f_lo, comm_no - f_hi
+    comm_caveats = []
+    if single_card:
+        comm_caveats.append("单卡采集（communication_matrix 为空）：集合通信几乎全为等待、"
+                            "Transit≈0，多卡真实暴露需以多卡重采为准。")
+    if blocking:
+        comm_caveats.append("ASCEND_LAUNCH_BLOCKING=1 阻止异步重叠，当前暴露被放大；"
+                            "关 blocking 重采后真实暴露更低。")
+    overlap_now = _pct(overlapped, comm_total)
+    levers.append({
+        "id": "comm_overlap", "title": "未掩盖通信", "can_reach_zero": False,
+        "measured_us": round(comm_no, 1), "measured_pct": _pct(comm_no, stage),
+        "floor_us": round(f_mid, 1), "floor_pct": _pct(f_mid, stage),
+        "recoverable_us": round(rec_mid, 1), "recoverable_pct": _pct(rec_mid, stage),
+        "recoverable_lo_us": round(rec_lo, 1), "recoverable_hi_us": round(rec_hi, 1),
+        "new_step_us": round(stage - rec_mid, 1), "new_mfu": _mfu_at(stage - rec_mid),
+        "floor_basis": "把计算-通信重叠率从 {now}% 提到 ~{tgt:.0f}%（业界可达 {lo:.0f}–{hi:.0f}%）→ "
+                       "暴露 = 通信总量 × (1−overlap)，不能到 0。".format(
+                           now=overlap_now, tgt=REALISTIC_COMM_OVERLAP * 100,
+                           lo=REALISTIC_COMM_OVERLAP_BAND[0] * 100,
+                           hi=REALISTIC_COMM_OVERLAP_BAND[1] * 100),
+        "methods": [
+            "计算-通信重叠：--moe-fb-overlap / --moe-permutation-async-comm，把 dispatch/combine "
+            "压到相邻 microbatch 的专家计算之下",
+            "缩短通信本身：HCCL 算法/buffsize 调优、合并小通信、EP 规模权衡（EP↓+TP↑）",
+            "减少同步点：异步集合通信 + event 依赖替代 stream 同步",
+        ],
+        "reasons": [
+            "MoE 串行依赖链 Router→dispatch→Expert→combine 的首尾无独立计算可掩盖，必落关键路径",
+            "可重叠量受并发独立计算与硬件并发上限约束（本例计算总量{rel}通信总量，"
+            "瓶颈在依赖与调度而非算力预算）".format(rel=("＞" if computing > comm_total else "≤")),
+        ],
+        "caveats": comm_caveats,
+    })
+
+    # ---- ② 空泡 Free: collapse most of it, but a residual remains ----
+    g_mid = min(free, stage * REALISTIC_FREE_RESIDUAL)
+    g_lo = min(free, stage * REALISTIC_FREE_RESIDUAL_BAND[1])   # 0.05 → higher floor
+    g_hi = min(free, stage * REALISTIC_FREE_RESIDUAL_BAND[0])   # 0.02 → lower floor
+    rec2_mid, rec2_lo, rec2_hi = free - g_mid, free - g_lo, free - g_hi
+    free_caveats = []
+    if blocking:
+        free_caveats.append("当前 Free 主因是 ASCEND_LAUNCH_BLOCKING=1 的逐算子同步（采集失真）；"
+                            "关掉后大部分气泡即塌缩。")
+    else:
+        free_caveats.append("采集未开 blocking：Free 多为真实下发/同步气泡，按上述方法逐项压缩。")
+    levers.append({
+        "id": "free_zero", "title": "空泡 Free", "can_reach_zero": False,
+        "measured_us": round(free, 1), "measured_pct": _pct(free, stage),
+        "floor_us": round(g_mid, 1), "floor_pct": _pct(g_mid, stage),
+        "recoverable_us": round(rec2_mid, 1), "recoverable_pct": _pct(rec2_mid, stage),
+        "recoverable_lo_us": round(rec2_lo, 1), "recoverable_hi_us": round(rec2_hi, 1),
+        "new_step_us": round(stage - rec2_mid, 1), "new_mfu": _mfu_at(stage - rec2_mid),
+        "floor_basis": "关 blocking + 图模式 + 固定 capacity 后，Free 通常落到 step 的 "
+                       "~{tgt:.0f}%（{lo:.0f}–{hi:.0f}%），无法归零。".format(
+                           tgt=REALISTIC_FREE_RESIDUAL * 100,
+                           lo=REALISTIC_FREE_RESIDUAL_BAND[0] * 100,
+                           hi=REALISTIC_FREE_RESIDUAL_BAND[1] * 100),
+        "methods": [
+            "关 ASCEND_LAUNCH_BLOCKING（最大且最廉价的一刀）",
+            "图模式 / ACL Graph 下沉、TASK_QUEUE_ENABLE 下发队列降 host 下发压力",
+            "固定 MoE capacity / padding，消除动态 shape 的 host 往返",
+            "减少 D2H；评估 --swap-optimizer 换入换出代价",
+        ],
+        "reasons": [
+            "数据依赖的 host 往返（MoE 路由需在 host 读 token 计数）无法完全消除",
+            "流水的填充/排空首尾各有一段空泡",
+            "跨流 / event 的真实同步点仍需保留",
+        ],
+        "caveats": free_caveats,
+    })
+
+    # ---- ③ 算子余量: NOT a '→0' lever — compute is useful work ----
+    if op_reclaim > 0:
+        levers.append({
+            "id": "op_ceiling", "title": "算子余量", "can_reach_zero": False,
+            "measured_us": round(op_reclaim, 1), "measured_pct": _pct(op_reclaim, stage),
+            "floor_us": round(computing - op_reclaim, 1),
+            "floor_pct": _pct(computing - op_reclaim, stage),
+            "recoverable_us": round(op_reclaim, 1), "recoverable_pct": _pct(op_reclaim, stage),
+            "recoverable_lo_us": round(op_reclaim, 1), "recoverable_hi_us": round(op_reclaim, 1),
+            "new_step_us": round(stage - op_reclaim, 1), "new_mfu": _mfu_at(stage - op_reclaim),
+            "floor_basis": "本项非「→0」：计算是有用功，可回收即各算子达 MFU 天花板后的 "
+                           "ceiling-relative 余量（已是现实值）。",
+            "methods": [
+                "将 matmul/FA/FAG 推到各自现实 MFU 天花板（已达标算子不再投入）",
+                "访存类（Cast/ZerosLike/TensorMove）靠算子融合 / 内存复用 / 去无谓 dtype 转换",
+            ],
+            "reasons": [
+                "计算是有用功，地板 = 有效 FLOPs / 峰值算力，永远 >0",
+                "matmul 已接近天花板，余量主要在 FA/FAG 与访存类尾部",
+            ],
+            "caveats": [],
+        })
+
+    # ---- combined realistic floor (sum of disjoint recoverables) ----
+    rec_total = sum(l["recoverable_us"] for l in levers)
+    rec_total_lo = sum(l["recoverable_lo_us"] for l in levers)   # conservative
+    rec_total_hi = sum(l["recoverable_hi_us"] for l in levers)   # optimistic
+    combined = {
+        "recoverable_us": round(rec_total, 1), "recoverable_pct": _pct(rec_total, stage),
+        "new_step_us": round(stage - rec_total, 1), "new_mfu": _mfu_at(stage - rec_total),
+        "new_step_lo_us": round(stage - rec_total_lo, 1),   # slower / less optimized
+        "new_step_hi_us": round(stage - rec_total_hi, 1),   # faster / more optimized
+        "new_mfu_lo": _mfu_at(stage - rec_total_lo),
+        "new_mfu_hi": _mfu_at(stage - rec_total_hi),
+        "basis": "各项现实地板之和；与上表「全部→0」物理上界的差，即不可消除部分。",
+    }
+    return {
+        "levers": levers,
+        "combined": combined,
+        "blocking": bool(blocking),
+        "single_card": bool(single_card),
+        "note": "现实地板 = 业界可达优化上限（重叠 80–90% / Free 残留 2–5% / 算子达 MFU 天花板）"
+                "作用于当前加载 profiling 的实测值，区别于上表「→0」的物理上界；"
+                "失真提示按本次采集的 blocking 与单卡状态自动判定。",
+    }
+
+
+# --------------------------------------------------------------------------- #
+def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
+                capture: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not ov.get("available"):
         return {"available": False}
     u = ov["us"]
@@ -531,11 +700,22 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]
                 "observed_peak_tflops": chipinfo.get("observed_peak_tflops"),
             }
 
+    # Realistic「能否减到 0 / 现实地板」analysis — derived from THIS profile's measured
+    # slices + capture state (blocking / single-card), not the static sample.
+    cap = capture or {}
+    blocking = (cap.get("env") or {}).get("ASCEND_LAUNCH_BLOCKING") == "1"
+    single_card = _single_card(prof)
+    realistic = _whatif_realistic(
+        stage, computing, comm_no, free,
+        u.get("communication", 0.0) or 0.0, u.get("overlapped", 0.0) or 0.0,
+        op_reclaim, step_mfu, blocking, single_card, cap.get("flags"))
+
     return {
         "available": True,
         "current_step_us": round(stage, 1),
         "whatif": whatif,
         "whatif_combined": whatif_combined,
+        "realistic": realistic,
         "compute_bound": compute_bound_note,
         "step_mfu": round(step_mfu, 4) if step_mfu else None,
         "note": "What-if 为基于 step 时间构成的上界估算，用于优化排序，非精确预测。芯片峰值为假设值。",

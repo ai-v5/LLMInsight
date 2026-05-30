@@ -283,6 +283,54 @@ def _sec_theoretical(theo: Dict) -> str:
     return _panel("理论上界 & What-if 收益", sub, tbl)
 
 
+def _sec_whatif_floor(theo: Dict) -> str:
+    """逐项「能否减到 0 / 现实地板」—— rendered from theo['realistic'], which is
+    derived from the loaded profile (not a static sample)."""
+    if not theo or not theo.get("available"):
+        return ""
+    r = theo.get("realistic") or {}
+    levers = r.get("levers") or []
+    if not levers:
+        return ""
+    items = []
+    for lv in levers:
+        zero = "可减到 0" if lv.get("can_reach_zero") else "不能减到 0（有不可消除下限）"
+        methods = "".join(f"<li>{_e(x)}</li>" for x in lv.get("methods") or [])
+        reasons = "".join(f"<li>{_e(x)}</li>" for x in lv.get("reasons") or [])
+        caveats = "".join(
+            f'<div class="banner" style="margin-top:8px">⚠️ {_e(c)}</div>'
+            for c in lv.get("caveats") or [])
+        line = (f'实测 <strong>{_us(lv.get("measured_us"))}</strong>'
+                f'（step {_pct(lv.get("measured_pct"))}）'
+                f' → 现实地板 ≈ <strong>{_us(lv.get("floor_us"))}</strong>'
+                f'（step {_pct(lv.get("floor_pct"))}）'
+                f' · 可回收 ≈ <strong>{_us(lv.get("recoverable_us"))}</strong>'
+                f'（区间 {_us(lv.get("recoverable_lo_us"))}–{_us(lv.get("recoverable_hi_us"))}）'
+                f' · 优化后 step {_us(lv.get("new_step_us"))} / 端到端 MFU {_mfu(lv.get("new_mfu"))}')
+        items.append(
+            '<div style="margin:13px 0;padding-top:11px;border-top:1px solid var(--line)">'
+            f'<div class="mini-h">{_e(lv.get("title"))} · 能减到 0？{zero}</div>'
+            f'<div class="p-sub" style="margin-bottom:7px">{_e(lv.get("floor_basis"))}</div>'
+            f'<div style="margin-bottom:9px">{line}</div>'
+            '<div class="two-col">'
+            f'<div><div class="mini-h">优化方法</div><ul>{methods}</ul></div>'
+            f'<div><div class="mini-h">为何不能到 0 / 下限来源</div><ul>{reasons}</ul></div>'
+            f'</div>{caveats}</div>')
+    comb = r.get("combined") or {}
+    comb_html = ""
+    if comb:
+        comb_html = (
+            '<div class="banner" style="margin-top:12px"><strong>综合现实地板</strong>：'
+            f'优化后 step ≈ <strong>{_us(comb.get("new_step_us"))}</strong>'
+            f'（区间 {_us(comb.get("new_step_hi_us"))}–{_us(comb.get("new_step_lo_us"))}），'
+            f'端到端 MFU ≈ <strong>{_mfu(comb.get("new_mfu"))}</strong>'
+            f'（{_mfu(comb.get("new_mfu_lo"))}–{_mfu(comb.get("new_mfu_hi"))}），'
+            f'省 ≈ <strong>{_pct(comb.get("recoverable_pct"))}</strong>。'
+            f'{_e(comb.get("basis"))}</div>')
+    return _panel("What-if 严谨性分析 · 能否减到 0 / 现实地板",
+                  _e(r.get("note", "")), "".join(items) + comb_html)
+
+
 def _sec_hotspots(hot: Dict) -> str:
     if not hot or not hot.get("available"):
         return ""
@@ -509,6 +557,7 @@ def build_report_html(metrics: Dict[str, Any],
         _sec_insights(cards),
         _sec_overview(overview),
         _sec_theoretical(theo),
+        _sec_whatif_floor(theo),
         _sec_hotspots(metrics.get("hotspots", {})),
         _sec_efficiency(eff),
         _sec_communication(metrics.get("communication", {})),

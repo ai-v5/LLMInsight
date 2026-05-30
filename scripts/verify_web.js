@@ -90,6 +90,24 @@ async function ensureLoaded() {
     }
   }
 
+  // ---- What-if 现实地板 panel must render inside 总览 (from theo.realistic) ----
+  try {
+    const root = fakeNode();
+    await LI.views.overview(root);
+    const h = root._html;
+    const okFloor = h.includes("现实地板");        // realistic-floor panel present
+    const okZero = h.includes("能减到 0");         // per-lever 能否减到0 verdict
+    const okComb = h.includes("综合现实地板");       // combined floor banner
+    const undefs = (h.match(/undefined/g) || []).length;
+    const ok = okFloor && okZero && okComb && undefs === 0;
+    if (!ok) fail++;
+    console.log(`  ${ok ? "OK  " : "FAIL"} ${"whatif-floor".padEnd(16)} floor=${okFloor} zero=${okZero} combined=${okComb}` +
+                (undefs ? `  ⚠ ${undefs}×"undefined"` : ""));
+  } catch (e) {
+    fail++;
+    console.log(`  FAIL ${"whatif-floor".padEnd(16)} ${e.stack.split("\n").slice(0,3).join("\n        ")}`);
+  }
+
   // ---- shareable report (H4): self-contained HTML served at /report.html ----
   try {
     const r = await global.fetch("/report.html");
