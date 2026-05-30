@@ -171,7 +171,7 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
                 f"芯片峰值假设偏低：实测 matmul 峰值 ≈ {observed:.0f} TFLOPS > 假设 {assumed:.0f} TFLOPS",
                 "存在 matmul 实测达成算力超过 ChipSpec 假设峰值（真实 kernel 不可能超过硅片峰值），"
                 "说明假设的 BF16 峰值偏低；已临时按实测上界校准，MFU 才不会出现 >100% 的非物理值。",
-                "在 config.ChipSpec 按实际 NPU SKU 设置 peak_bf16_flops / hbm_bandwidth，"
+                "在 configs/chips/<芯片>.yaml 按实际 NPU SKU 设置 fp16_tflops / memory_bandwidth，"
                 "用准确峰值替代实测校准，效率指标更可信。",
                 "校正后 MFU/MBU 可作真实优化排序基准。",
                 0.8,

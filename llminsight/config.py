@@ -1,15 +1,20 @@
 """Global configuration: chip peak specs, model config, dtype sizes, paths.
 
-IMPORTANT: the chip peak numbers below are *assumptions* for an Ascend 910B-class
-device. MFU/MBU/Roofline results scale directly off them, so they are surfaced in
-the UI as "assumed — adjust here". Override via environment variables or by editing
-this file.
+Chip peaks are loaded from YAML under configs/chips/<name>.yaml (llmperf field
+schema), carrying SEPARATE cube vs vector peaks so op-level MFU can route matmul/
+attention to the cube peak and vector ops to the vector peak. MFU/MBU/Roofline
+scale directly off these numbers and are surfaced in the UI ("assumed — adjust
+here" when ChipSpec.assumed). Pick the active chip via LLMINSIGHT_CHIP (YAML stem,
+e.g. Ascend_910B) and override the chip dir with LLMINSIGHT_CHIP_DIR.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, asdict
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import yaml
 
 
 # --------------------------------------------------------------------------- #
@@ -41,63 +46,165 @@ SCRIPT_PATH = _default_script_path()
 
 
 # --------------------------------------------------------------------------- #
-# Chip spec (ASSUMED — Ascend 910B class). Adjust to your device.
+# Chip spec. Peak numbers are loaded from configs/chips/<name>.yaml (llmperf
+# field schema). Crucially the spec carries SEPARATE cube vs vector peaks:
+#   - CUBE (matmul / tensor-core): drives MFU for MatMul / Gemm / FlashAttention.
+#   - VECTOR (AI Vector Core): drives efficiency for RMSNorm / SwiGlu / Cast / ...
+# On the Ascend 950DT cube bf16 (432 TFLOPS) is ~8x vector bf16 (54 TFLOPS), so a
+# single per-dtype peak would mis-measure every vector op. efficiency.py routes
+# each kernel to the right peak via peak_cube_flops() / peak_vector_flops().
+# The dataclass defaults below mirror the assumed Ascend 910B values so the app
+# still works if the YAML dir is missing.
 # --------------------------------------------------------------------------- #
 @dataclass
 class ChipSpec:
-    name: str = "Ascend 910B (assumed)"
-    # Peak dense matmul throughput, FLOP/s. 376 TFLOPS is a conservative public
-    # 910B figure; bins vary. The bundled DeepSeek-V3 sample sustains ~432 TFLOPS
-    # on clean GEMMs, so efficiency.py auto-calibrates the effective peak up to the
-    # observed ceiling (a real kernel can't beat silicon) and flags it in the UI.
-    # Set this to your real SKU's peak to replace calibration with an exact value.
-    peak_bf16_flops: float = 376.0e12
-    peak_fp16_flops: float = 376.0e12
-    peak_fp32_flops: float = 75.0e12
-    peak_int8_ops: float = 752.0e12
+    name: str = "Ascend_910B"
+    # CUBE (matmul / tensor-core) peaks, FLOP/s.
+    cube_fp16_flops: float = 376.0e12   # bf16 / fp16 cube peak
+    cube_fp8_flops: float = 0.0         # 0 -> fall back to cube_fp16
+    cube_fp4_flops: float = 0.0         # 0 -> fall back to cube_fp16
+    # VECTOR (AI Vector Core) peaks, FLOP/s.
+    vector_fp32_flops: float = 75.0e12
+    vector_bf16_flops: float = 150.0e12  # bf16 vector peak (default 2x fp32)
     # Peak HBM bandwidth, byte/s. 910B ~= 1.6 TB/s.
     hbm_bandwidth: float = 1.6e12
-    # HBM capacity, GiB (drives the memory view's "显存容量" / OOM headroom context).
-    hbm_capacity_gb: float = 64.0
-    assumed: bool = True
+    # HBM capacity, bytes (drives the memory view's "显存容量" / OOM headroom).
+    hbm_capacity_bytes: float = 64.0e9
+    # llmperf-parity fields (kept for fidelity; not yet consumed by metrics).
+    launch_overhead: float = 0.0
+    pcie_bandwidth: float = 0.0
+    dies_per_package: int = 1
+    intra_package_link: Optional[str] = None
+    assumed: bool = False
+
+    @property
+    def hbm_capacity_gb(self) -> float:
+        """Decimal GB (bytes / 1e9), matching llmperf's memory_capacity convention."""
+        return self.hbm_capacity_bytes / 1e9
+
+    def peak_cube_flops(self, dtype: str) -> float:
+        """CUBE peak for matmul-family / fused-attention kernels."""
+        d = (dtype or "").upper()
+        if "FP8" in d or "HIF8" in d or "FLOAT8" in d or "E4M3" in d or "E5M2" in d:
+            return self.cube_fp8_flops or self.cube_fp16_flops
+        if "FP4" in d or "FLOAT4" in d:
+            return self.cube_fp4_flops or self.cube_fp16_flops
+        # bf16 / fp16 / half / unknown -> cube bf16/fp16 peak
+        return self.cube_fp16_flops
+
+    def peak_vector_flops(self, dtype: str) -> float:
+        """VECTOR peak for AI Vector Core / MIX_AIV elementwise kernels."""
+        d = (dtype or "").upper()
+        if "FLOAT32" in d or "FP32" in d or d == "FLOAT":
+            return self.vector_fp32_flops
+        # bf16 / fp16 / half / unknown -> vector bf16 peak
+        return self.vector_bf16_flops
 
     def peak_flops_for(self, dtype: str) -> float:
+        """Back-compat: cube peak (matmul). fp32 has no cube unit -> vector fp32."""
         d = (dtype or "").upper()
-        if "BF16" in d or "BFLOAT" in d:
-            return self.peak_bf16_flops
-        if "FLOAT16" in d or "FP16" in d or d == "HALF":
-            return self.peak_fp16_flops
-        if "INT8" in d:
-            return self.peak_int8_ops
-        if "FLOAT" in d or "FP32" in d or d == "FLOAT32":
-            return self.peak_fp32_flops
-        return self.peak_bf16_flops
+        if "FLOAT32" in d or "FP32" in d or d == "FLOAT":
+            return self.vector_fp32_flops
+        return self.peak_cube_flops(dtype)
 
 
 # --------------------------------------------------------------------------- #
-# Switchable chip presets (UI dropdown). 910B is the conservative default and
-# matches the ChipSpec defaults above. 950DT numbers are Huawei's announced
-# specs (roadmap, GA ~2026 Q4): 1 PFLOPS FP16/BF16, 500 TFLOPS FP32/HF32,
-# 1 PFLOPS FP8(HiF8)/INT8, 2 PFLOPS FP4, and HiZQ 2.0 HBM at 4 TB/s, 96 GB.
-# Marked assumed=True because this captured run was NOT executed on a 950DT —
-# selecting it answers "where would this workload sit against a 950DT ceiling".
+# YAML chip loader (mirrors llmperf configs/_yaml_loader.py::load_gpu_spec).
+# Specs live in <repo>/configs/chips/<name>.yaml; override the dir with
+# LLMINSIGHT_CHIP_DIR. *_tflops fields are scaled x1e12 -> FLOP/s; memory_*
+# stay in bytes(/s). bf16_vector_tflops=null defaults to 2x fp32.
 # --------------------------------------------------------------------------- #
-CHIP_PRESETS: Dict[str, "ChipSpec"] = {
-    "910B": ChipSpec(),  # conservative Ascend 910B defaults (see ChipSpec above)
-    "950DT": ChipSpec(
-        name="Ascend 950DT",
-        peak_bf16_flops=1000.0e12,   # FP16/BF16 ≈ 1 PFLOPS
-        peak_fp16_flops=1000.0e12,
-        peak_fp32_flops=500.0e12,    # FP32/HF32 ≈ 500 TFLOPS
-        peak_int8_ops=1000.0e12,     # INT8 ≈ 1 POPS (HiF8/FP8 同量级)
-        hbm_bandwidth=4.0e12,        # HiZQ 2.0 HBM, 4 TB/s
-        hbm_capacity_gb=96.0,        # 96 GB HBM
-        assumed=True,
-    ),
-}
-DEFAULT_CHIP = os.environ.get("LLMINSIGHT_CHIP", "910B").strip()
-if DEFAULT_CHIP not in CHIP_PRESETS:
-    DEFAULT_CHIP = "910B"
+# Legacy key aliases (old LLMINSIGHT_CHIP / saved UI values -> YAML stems).
+_CHIP_ALIASES = {"910B": "Ascend_910B", "950DT": "Ascend_950DT"}
+
+
+def _chip_dir() -> Path:
+    env = os.environ.get("LLMINSIGHT_CHIP_DIR")
+    if env:
+        return Path(env)
+    # <repo>/configs/chips  (config.py lives at <repo>/llminsight/config.py)
+    return Path(__file__).resolve().parents[1] / "configs" / "chips"
+
+
+def _canonical_chip_key(name: str) -> str:
+    n = (name or "").strip()
+    return _CHIP_ALIASES.get(n, n)
+
+
+def load_chip_spec(name: str) -> ChipSpec:
+    """Load a ChipSpec from configs/chips/<name>.yaml. Raises FileNotFoundError
+    if the YAML is absent (callers that need a fallback should catch it)."""
+    key = _canonical_chip_key(name)
+    path = _chip_dir() / f"{key}.yaml"
+    with open(path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+
+    spec_name = str(data.get("name", key))
+
+    def _tf(field_name: str) -> Optional[float]:
+        v = data.get(field_name)
+        return float(v) * 1e12 if v is not None else None
+
+    fp16 = _tf("fp16_tflops") or 0.0
+    fp32 = _tf("fp32_tflops") or 0.0
+    bf16_vec = data.get("bf16_vector_tflops")
+    vector_bf16 = (float(bf16_vec) * 1e12) if bf16_vec is not None else (2.0 * fp32)
+
+    return ChipSpec(
+        name=spec_name,
+        cube_fp16_flops=fp16,
+        cube_fp8_flops=_tf("fp8_tflops") or 0.0,
+        cube_fp4_flops=_tf("fp4_tflops") or 0.0,
+        vector_fp32_flops=fp32,
+        vector_bf16_flops=vector_bf16,
+        hbm_bandwidth=float(data.get("memory_bandwidth", 0.0) or 0.0),
+        hbm_capacity_bytes=float(data.get("memory_capacity", 0.0) or 0.0),
+        launch_overhead=float(data.get("launch_overhead", 0.0) or 0.0),
+        pcie_bandwidth=float(data.get("pcie_bandwidth", 0.0) or 0.0),
+        dies_per_package=int(data.get("dies_per_package", 1) or 1),
+        intra_package_link=data.get("intra_package_link"),
+        assumed=bool(data.get("assumed", False)),
+    )
+
+
+def available_chips() -> List[str]:
+    """YAML stems available in the chip dir, sorted (drives the UI dropdown)."""
+    d = _chip_dir()
+    if not d.is_dir():
+        return []
+    return sorted(p.stem for p in d.glob("*.yaml"))
+
+
+# Default to the 950DT reference ceiling (overridable via LLMINSIGHT_CHIP).
+DEFAULT_CHIP = _canonical_chip_key(os.environ.get("LLMINSIGHT_CHIP", "Ascend_950DT"))
+if DEFAULT_CHIP not in available_chips():
+    DEFAULT_CHIP = "Ascend_950DT" if "Ascend_950DT" in available_chips() else "Ascend_910B"
+
+
+def _load_default_chip() -> ChipSpec:
+    try:
+        return load_chip_spec(DEFAULT_CHIP)
+    except Exception:
+        return ChipSpec()  # built-in assumed 910B-class defaults
+
+
+def _chip_dropdown() -> List[dict]:
+    """Lightweight per-chip summary for the UI dropdown, built from the YAML dir.
+    A malformed YAML is skipped rather than breaking the whole list."""
+    out: List[dict] = []
+    for stem in available_chips():
+        try:
+            spec = load_chip_spec(stem)
+        except Exception:
+            continue
+        out.append({
+            "key": stem,
+            "name": spec.name,
+            "peak_bf16_tflops": spec.cube_fp16_flops / 1e12,  # CUBE bf16 peak
+            "hbm_tbps": spec.hbm_bandwidth / 1e12,
+            "hbm_gb": spec.hbm_capacity_gb,
+        })
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -143,7 +250,7 @@ class ModelConfig:
 class Settings:
     data_dir: str = field(default_factory=_default_data_dir)
     script_path: str = field(default_factory=_default_script_path)
-    chip: ChipSpec = field(default_factory=lambda: CHIP_PRESETS[DEFAULT_CHIP])
+    chip: ChipSpec = field(default_factory=_load_default_chip)
     chip_key: str = DEFAULT_CHIP
     model: ModelConfig = field(default_factory=ModelConfig)
     # Cap how many trace events the timeline endpoint streams to the browser.
@@ -154,19 +261,12 @@ class Settings:
         return {
             "data_dir": self.data_dir,
             "script_path": self.script_path,
-            "chip": asdict(self.chip),
+            # asdict() omits the hbm_capacity_gb @property, so add it explicitly.
+            "chip": {**asdict(self.chip), "hbm_capacity_gb": self.chip.hbm_capacity_gb},
             "chip_key": self.chip_key,
-            # presets for the UI dropdown (no secrets; lightweight peak summary)
-            "chips": [
-                {
-                    "key": k,
-                    "name": v.name,
-                    "peak_bf16_tflops": v.peak_bf16_flops / 1e12,
-                    "hbm_tbps": v.hbm_bandwidth / 1e12,
-                    "hbm_gb": v.hbm_capacity_gb,
-                }
-                for k, v in CHIP_PRESETS.items()
-            ],
+            # YAML-backed presets for the UI dropdown (no secrets; peak summary).
+            # peak_bf16_tflops is the CUBE bf16 peak (the matmul-MFU denominator).
+            "chips": _chip_dropdown(),
             "model": asdict(self.model),
         }
 
@@ -194,15 +294,16 @@ SETTINGS = Settings()
 
 
 def set_chip(key: str) -> bool:
-    """Switch the active chip preset (driven by the UI dropdown).
+    """Switch the active chip by YAML stem (driven by the UI dropdown).
 
-    Returns False for an unknown key. Only ever *reassigns* SETTINGS.chip to a
-    shared preset instance — never mutates a preset's fields in place — so the
-    presets stay pristine and metric recomputation is deterministic.
+    Returns False for an unknown / unloadable chip. Reassigns SETTINGS.chip to a
+    freshly loaded spec (never mutates in place) so metric recomputation is
+    deterministic. Accepts legacy keys ('910B' / '950DT') via the alias map.
     """
-    spec = CHIP_PRESETS.get(key)
-    if spec is None:
+    try:
+        spec = load_chip_spec(key)
+    except Exception:
         return False
     SETTINGS.chip = spec
-    SETTINGS.chip_key = key
+    SETTINGS.chip_key = _canonical_chip_key(key)
     return True

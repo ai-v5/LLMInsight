@@ -157,14 +157,19 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         f = _estimate_matmul_flops(parse_shapes(in_sh[i]))
         if f:
             observed_peak = max(observed_peak, f / (float(dur[i]) * 1e-6))
-    configured_peak = chip.peak_bf16_flops
+    # Calibrate against the CUBE bf16 peak — GEMM runs on the cube unit.
+    configured_peak = chip.peak_cube_flops("BF16")
     calibrated = observed_peak > configured_peak
     effective_peak = min(observed_peak * 1.02, configured_peak * 2.0) if calibrated else configured_peak
-    peak_scale = effective_peak / configured_peak  # >= 1.0
+    peak_scale = effective_peak / configured_peak if configured_peak else 1.0  # >= 1.0 (cube only)
 
-    def eff_peak_for(dtype: str) -> float:
-        # cube-clock calibration: scale every cube-dtype peak by the same factor.
-        return chip.peak_flops_for(dtype) * peak_scale
+    def peak_for(dtype: str, use_cube: bool) -> float:
+        # Cube peak gets the observed-ceiling calibration (scale >= 1.0); the
+        # vector peak is used as configured — there's no vector flop model yet to
+        # calibrate against, so scaling it would be unfounded.
+        if use_cube:
+            return chip.peak_cube_flops(dtype) * peak_scale
+        return chip.peak_vector_flops(dtype)
 
     rows: List[Dict[str, Any]] = []
     scatter: List[Dict[str, Any]] = []
@@ -196,22 +201,31 @@ def compute_efficiency(prof) -> Dict[str, Any]:
             dt = dt_out[j] if j < len(dt_out) else (dt_out[-1] if dt_out else dtype)
             b_bytes += numel(sh) * dtype_bytes(dt)
 
-        if types[i] in MATMUL_TYPES:
+        is_matmul = types[i] in MATMUL_TYPES
+        is_attention = types[i] in ATTENTION_TYPES
+        if is_matmul:
             flops = _estimate_matmul_flops(shapes_in)
-        elif types[i] in ATTENTION_TYPES:
+        elif is_attention:
             flops = _estimate_attention_flops(
                 shapes_in, shapes_out, types[i] in ATTENTION_GRAD_TYPES)
         else:
             flops = None
 
-        peak_flops = eff_peak_for(dtype)
+        core_u = str(core[i]).upper()
+        is_vector = "VECTOR" in core_u or "AIV" in core_u
+        # Peak routing: matmul / fused-attention kernels run on the CUBE unit;
+        # pure vector-core ops (AI_VECTOR_CORE / MIX_AIV: RMSNorm/SwiGlu/Cast/...)
+        # run on the VECTOR unit; any other AI_CORE / MIX_AIC op defaults to cube.
+        # On the 950DT cube bf16 (432T) is ~8x vector bf16 (54T), so picking the
+        # right unit's peak is what makes per-op MFU/waste physically meaningful.
+        use_cube = is_matmul or is_attention or (not is_vector)
+        peak_flops = peak_for(dtype, use_cube)
+
         achieved_flops = (flops / d_s) if flops else None
         achieved_bw = (b_bytes / d_s) if b_bytes else 0.0
         mfu = (achieved_flops / peak_flops) if achieved_flops else None
         mbu = (achieved_bw / chip.hbm_bandwidth) if achieved_bw else None
 
-        core_u = str(core[i]).upper()
-        is_vector = "VECTOR" in core_u or "AIV" in core_u
         # We can only credibly model "ideal time" (and thus wasted time) when we
         # have a FLOP estimate (matmul / fused attention) OR the kernel is a
         # vector-core memory op. Other cube/MIX ops without a FLOP model would
@@ -318,8 +332,10 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         "available": True,
         "chip": {
             "name": chip.name,
-            "peak_bf16_tflops": chip.peak_bf16_flops / 1e12,          # assumed (datasheet)
-            "effective_peak_tflops": effective_peak / 1e12,           # used for MFU
+            "peak_bf16_tflops": chip.cube_fp16_flops / 1e12,          # CUBE bf16 (matmul-MFU denom)
+            "cube_bf16_tflops": chip.cube_fp16_flops / 1e12,          # cube/vector split surfaced
+            "vector_bf16_tflops": chip.vector_bf16_flops / 1e12,      # ~8x lower on 950DT
+            "effective_peak_tflops": effective_peak / 1e12,           # calibrated cube, used for MFU
             "observed_peak_tflops": round(observed_peak / 1e12, 1),   # measured ceiling
             "calibrated": calibrated,
             "hbm_tbps": chip.hbm_bandwidth / 1e12,

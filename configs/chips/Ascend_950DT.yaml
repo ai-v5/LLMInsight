@@ -1,0 +1,24 @@
+# Ascend 950DT — the device this profiling sample was ACTUALLY captured on, so its
+# datasheet peaks are the real ceiling and `assumed` stays false (no projection
+# caveat). Peak specs reused verbatim from llmperf
+# (LLM_Model_Performance_Estimation/llmperf/configs/yaml/gpu_specs/Ascend_950DT.yaml).
+# Field names mirror llmperf's GPUSpec schema exactly. Units: *_tflops = TFLOPS
+# (loader x1e12 -> FLOP/s); memory_* = bytes (/s). The CUBE vs VECTOR distinction:
+#   fp16_tflops        -> CUBE bf16/fp16 peak (matmul / tensor-core, FlashAttention)
+#   bf16_vector_tflops -> VECTOR bf16 peak (AI Vector Core: RMSNorm/SwiGlu/Cast/...)
+# 950DT's cube bf16 (432) is ~8x its vector bf16 (54), so op-level MFU must route
+# matmul/attention to cube and vector ops to vector — see metrics/efficiency.py.
+# name carries a space for display ("Ascend 950DT"); the YAML stem stays the llmperf
+# filename "Ascend_950DT" and is the key used for switching.
+name: Ascend 950DT
+fp4_tflops: 1728.0
+fp8_tflops: 864.0
+fp16_tflops: 432.0          # CUBE bf16/fp16 peak
+fp32_tflops: 27.0           # VECTOR fp32 peak
+bf16_vector_tflops: 54.0    # VECTOR bf16 peak (null -> 2x fp32)
+memory_bandwidth: 4000000000000.0   # 4 TB/s
+memory_capacity: 96000000000.0      # 96 GB
+launch_overhead: 6.0e-06
+pcie_bandwidth: 64000000000.0
+dies_per_package: 1
+intra_package_link: null

@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict
 from urllib.parse import urlparse
 
-from ..config import SETTINGS, CHIP_PRESETS, set_chip
+from ..config import SETTINGS, set_chip
 from ..parser import load_profile
 from ..metrics import compute_all
 from ..metrics import core as metrics_core
@@ -79,11 +79,10 @@ class AppState:
         chip-independent and are left untouched. Serialized by a lock so two
         concurrent switches can't interleave."""
         with self.lock:
-            if key not in CHIP_PRESETS:
-                return {"ok": False, "error": f"unknown chip '{key}'"}
             if not self.ready or self.prof is None:
                 return {"ok": False, "error": "profile not loaded yet"}
-            set_chip(key)
+            if not set_chip(key):  # loads configs/chips/<key>.yaml (alias-aware)
+                return {"ok": False, "error": f"unknown chip '{key}'"}
             eff = compute_efficiency(self.prof)
             self.metrics["efficiency"] = eff
             self.metrics["theoretical"] = metrics_core.theoretical(
@@ -93,7 +92,7 @@ class AppState:
             self.cards = run_rules(self.metrics, self.capture)
             return {
                 "ok": True,
-                "chip_key": key,
+                "chip_key": SETTINGS.chip_key,  # canonical YAML stem (alias-resolved)
                 "chip": eff.get("chip"),
                 "efficiency": eff,
                 "theoretical": self.metrics["theoretical"],
