@@ -144,8 +144,14 @@ def _chip_dir() -> Path:
     env = os.environ.get("LLMINSIGHT_CHIP_DIR")
     if env:
         return Path(env)
-    # <repo>/configs/chips  (config.py lives at <repo>/llminsight/config.py)
-    return Path(__file__).resolve().parents[1] / "configs" / "chips"
+    # Installed wheel ships configs INSIDE the package (llminsight/configs/chips);
+    # a dev checkout keeps them at the repo root (<repo>/configs/chips).
+    pkg = Path(__file__).resolve().parent  # <...>/llminsight
+    for cand in (pkg / "configs" / "chips",          # installed wheel
+                 pkg.parent / "configs" / "chips"):  # dev checkout
+        if cand.is_dir():
+            return cand
+    return pkg.parent / "configs" / "chips"
 
 
 def _canonical_chip_key(name: str) -> str:

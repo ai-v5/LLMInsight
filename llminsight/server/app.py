@@ -31,8 +31,22 @@ from ..rules import run_rules, read_capture_config
 from ..insight import generate_insights, get_provider
 from ..report import build_report_html
 
-WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__)))), "web")
+def _resolve_web_dir() -> str:
+    """Locate the static web/ dir. In an installed wheel it ships INSIDE the
+    package (llminsight/web); in a dev checkout it sits at the repo root
+    (<repo>/web). LLMINSIGHT_WEB_DIR overrides both."""
+    env = os.environ.get("LLMINSIGHT_WEB_DIR")
+    if env:
+        return env
+    pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # <...>/llminsight
+    for cand in (os.path.join(pkg, "web"),                       # installed wheel
+                 os.path.join(os.path.dirname(pkg), "web")):     # dev checkout (<repo>/web)
+        if os.path.isdir(cand):
+            return cand
+    return os.path.join(os.path.dirname(pkg), "web")
+
+
+WEB_DIR = _resolve_web_dir()
 
 _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
