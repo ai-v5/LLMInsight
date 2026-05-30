@@ -298,12 +298,12 @@ def _sec_overview(overview: Dict) -> str:
 
 
 def _sec_theoretical(theo: Dict) -> str:
-    """What-if section — mirrors the live 总览 page's '理论上界 & What-if 收益模拟'
-    exactly: a dim base row, per-lever 单独节省(s)/(%) shown as negatives, the
-    端到端 MFU column shown as a gain (+x.x%) per lever, and a ruled-off combined
-    row whose MFU is the absolute reached value plus the gain (e.g. 76.7%（+35.8%）).
-    The export is a snapshot with every lever enabled, so the combined row equals
-    the page's default 已启用组合 (n/n)."""
+    """What-if section — mirrors the live 总览 page's 'What-if 收益模拟 · 现实可达地板'
+    exactly: it renders the REALISTIC floor levers (theo['realistic']), each labelled
+    实测%→地板%, with per-lever 单独节省(s)/(%) (= recoverable) shown as negatives and the
+    端到端 MFU column as a gain (+x.x%). A ruled-off combined row sums the disjoint
+    recoverables; its MFU is the absolute reached value plus the gain. The physical
+    →0 upper bound (theo['whatif_combined']) is kept only as a one-line reference."""
     if not theo or not theo.get("available"):
         return ""
     smfu = theo.get("step_mfu")  # base end-to-end MFU, 0–1
@@ -327,25 +327,26 @@ def _sec_theoretical(theo: Dict) -> str:
         d = (nv - smfu)
         return ("+" if d >= 0 else "-") + f"{abs(d) * 100:.1f}%"
 
-    levers = theo.get("whatif", []) or []
+    r = theo.get("realistic") or {}
+    levers = r.get("levers") or []
     rows = [["当前（base）", "—", "—", _mfu(smfu)]]          # dim anchor row
     row_cls = ["dim-row"]
     for w in levers:
         rows.append([
             _e(w.get("scenario", "")),
-            f'<span class="pos">{saved_s(w.get("save_us"))}</span>',
-            f'<span class="pos">{saved_pct(w.get("save_pct"))}</span>',
+            f'<span class="pos">{saved_s(w.get("recoverable_us"))}</span>',
+            f'<span class="pos">{saved_pct(w.get("recoverable_pct"))}</span>',
             f'<span class="gain">{dmfu(w.get("new_mfu"))}</span>',
         ])
         row_cls.append("")
-    comb = theo.get("whatif_combined") or {}
+    comb = r.get("combined") or {}
     if comb:
         nv = comb.get("new_mfu")
         mfu_cell = "—" if nv is None else f'{_mfu(nv)}（{dmfu(nv)}）'
         rows.append([
             f"已启用组合 ({len(levers)}/{len(levers)})",
-            f'<span class="pos">{saved_s(comb.get("save_us"))}</span>',
-            f'<span class="pos">{saved_pct(comb.get("save_pct"))}</span>',
+            f'<span class="pos">{saved_s(comb.get("recoverable_us"))}</span>',
+            f'<span class="pos">{saved_pct(comb.get("recoverable_pct"))}</span>',
             f'<span class="gain">{mfu_cell}</span>',
         ])
         row_cls.append("sum-row")
@@ -372,18 +373,23 @@ def _sec_theoretical(theo: Dict) -> str:
                        f'算子达天花板后计算 {_us(cb.get("ideal_matmul_us"))}，'
                        f'可回收 {_us(cb.get("headroom_us"))}。{calib}</div>')
 
-    tip = ('<div class="note">💡 优化优先级：「通信完全掩盖」通常是最大单项 → '
-           '先做计算-通信重叠（--moe-fb-overlap / 异步通信），再压同步空泡。'
-           '「算子极致优化」按各算子 MFU 天花板（matmul 95% / FA 85% / FAG 70%）'
-           '收口，已达标算子不再投入——单项收益小而精，而非冲到 100% 的虚高。'
-           '底部「已启用组合」为各项叠加后的 step 与端到端 MFU（导出为全部启用快照）。'
-           '　⚠️ 「通信完全掩盖」与算子页 <strong>HcclLaunchAicpuKernel</strong> '
+    ub = theo.get("whatif_combined") or {}   # physical →0 upper bound, reference only
+    ub_ref = ""
+    if ub.get("new_mfu") is not None:
+        ub_ref = (f' 📐 物理上界（全部 →0，理论不可达）参考：step {_us(ub.get("new_step_us"))} / '
+                  f'端到端 MFU {_mfu(ub.get("new_mfu"))} / 省 {_pct(ub.get("save_pct"))}。')
+    tip = ('<div class="note">💡 此表为<strong>现实可达地板</strong>（非「→0」物理上界）：'
+           '通信重叠至 80–90% 留残留、Free 留 step 2–5%、算子按各自 MFU 天花板'
+           '（matmul 95% / FA 85% / FAG 70%）收口——单项收益小而精，而非冲到 100% 的虚高。'
+           '优先级：先做计算-通信重叠（--moe-fb-overlap / 异步通信），再压同步空泡。'
+           + ub_ref +
+           '　⚠️ 「未掩盖通信」与算子页 <strong>HcclLaunchAicpuKernel</strong> '
            '是同一段集合通信（单卡几乎全是 Wait，非下发延迟），勿重复计入。</div>')
 
     note = (f'<div class="note">{_e(theo.get("note"))}</div>'
             if theo.get("note") else "")
-    sub = "每项为单独启用的收益；底部「已启用组合」为三项叠加（导出为全部启用快照）"
-    return _panel("理论上界 & What-if 收益模拟", sub,
+    sub = "每项为达现实地板（业界可达上限）时单独可回收的收益（实测%→地板%）；底部「已启用组合」为三项叠加（导出快照）"
+    return _panel("What-if 收益模拟 · 现实可达地板", sub,
                   tbl + cb_note + tip + note)
 
 

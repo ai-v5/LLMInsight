@@ -477,6 +477,8 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
     overlap_now = _pct(overlapped, comm_total)
     levers.append({
         "id": "comm_overlap", "title": "未掩盖通信", "can_reach_zero": False,
+        "scenario": "未掩盖通信 {m:.1f}%→{f:.1f}%".format(
+            m=_pct(comm_no, stage), f=_pct(f_mid, stage)),
         "measured_us": round(comm_no, 1), "measured_pct": _pct(comm_no, stage),
         "floor_us": round(f_mid, 1), "floor_pct": _pct(f_mid, stage),
         "recoverable_us": round(rec_mid, 1), "recoverable_pct": _pct(rec_mid, stage),
@@ -514,6 +516,8 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
         free_caveats.append("采集未开 blocking：Free 多为真实下发/同步气泡，按上述方法逐项压缩。")
     levers.append({
         "id": "free_zero", "title": "空泡 Free", "can_reach_zero": False,
+        "scenario": "空泡 Free {m:.1f}%→{f:.1f}%".format(
+            m=_pct(free, stage), f=_pct(g_mid, stage)),
         "measured_us": round(free, 1), "measured_pct": _pct(free, stage),
         "floor_us": round(g_mid, 1), "floor_pct": _pct(g_mid, stage),
         "recoverable_us": round(rec2_mid, 1), "recoverable_pct": _pct(rec2_mid, stage),
@@ -542,6 +546,7 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
     if op_reclaim > 0:
         levers.append({
             "id": "op_ceiling", "title": "算子余量", "can_reach_zero": False,
+            "scenario": "算子极致优化（达 MFU 天花板）",
             "measured_us": round(op_reclaim, 1), "measured_pct": _pct(op_reclaim, stage),
             "floor_us": round(computing - op_reclaim, 1),
             "floor_pct": _pct(computing - op_reclaim, stage),
@@ -572,7 +577,7 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
         "new_step_hi_us": round(stage - rec_total_hi, 1),   # faster / more optimized
         "new_mfu_lo": _mfu_at(stage - rec_total_lo),
         "new_mfu_hi": _mfu_at(stage - rec_total_hi),
-        "basis": "各项现实地板之和；与上表「全部→0」物理上界的差，即不可消除部分。",
+        "basis": "各项现实地板之和；与物理上界（全部 →0，不可达）的差，即不可消除部分。",
     }
     return {
         "levers": levers,
@@ -580,7 +585,7 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
         "blocking": bool(blocking),
         "single_card": bool(single_card),
         "note": "现实地板 = 业界可达优化上限（重叠 80–90% / Free 残留 2–5% / 算子达 MFU 天花板）"
-                "作用于当前加载 profiling 的实测值，区别于上表「→0」的物理上界；"
+                "作用于当前加载 profiling 的实测值；与物理上界（全部 →0，不可达）的差即不可消除部分；"
                 "失真提示按本次采集的 blocking 与单卡状态自动判定。",
     }
 
