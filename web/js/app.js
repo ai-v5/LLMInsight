@@ -3,8 +3,8 @@
   const { api, apiPost, clearCache, fmt, esc } = LI;
 
   const NAV = [
-    { id: "smart_timeline",  label: "智能时间线",  ico: "🎞️", star: true, sub: "算子泳道 Gantt · MFU/MBU 悬停 · 利用率泳道" },
     { id: "overview",        label: "总览",        ico: "📊", sub: "Step 时间构成 · 关键比率 · 理论上界" },
+    { id: "smart_timeline",  label: "智能时间线",  ico: "🎞️", star: true, sub: "算子泳道 Gantt · MFU/MBU 悬停 · 利用率泳道" },
     { id: "hotspots",        label: "算子热点",    ico: "🔥", sub: "Top 算子 · 按 Core 类型聚合" },
     { id: "efficiency",      label: "算子效率",    ico: "🎯", sub: "MFU / MBU / Roofline · 优化余量" },
     { id: "communication",   label: "通信分析",    ico: "🔗", sub: "集合通信 · 等待占比 · 带宽" },
