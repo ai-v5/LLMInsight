@@ -5,8 +5,8 @@
   const NAV = [
     { id: "overview",        label: "总览",        ico: "📊", star: true, sub: "Step 时间构成 · 关键比率 · 理论上界" },
     { id: "smart_timeline",  label: "智能时间线",  ico: "🎞️", star: true, sub: "算子泳道 Gantt · MFU/MBU 悬停 · 利用率泳道" },
-    { id: "hotspots",        label: "算子热点",    ico: "🔥", sub: "Top 算子 · 按 Core 类型聚合" },
     { id: "efficiency",      label: "算子效率",    ico: "🎯", star: true, sub: "MFU / MBU / Roofline · 优化余量" },
+    { id: "hotspots",        label: "算子热点",    ico: "🔥", sub: "Top 算子 · 按 Core 类型聚合" },
     { id: "communication",   label: "通信分析",    ico: "🔗", sub: "集合通信 · 等待占比 · 带宽" },
     { id: "hidden_overhead", label: "隐性开销",    ico: "🫥", sub: "下发 / 等待 / 空泡 / 动态shape 总账" },
     { id: "attribution",     label: "结构归因",    ico: "🧩", sub: "MLA / MoE / Norm / Optimizer" },
