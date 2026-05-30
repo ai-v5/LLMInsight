@@ -252,6 +252,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
                 "dtype": dtype,
                 "flops": flops,
                 "bytes": b_bytes,
+                "peak_flops": peak_flops,
                 "mfu": mfu,
                 "mbu": mbu,
                 "efficiency": efficiency,
@@ -265,41 +266,58 @@ def compute_efficiency(prof) -> Dict[str, Any]:
             }
         )
         if flops and b_bytes:
+            ai = flops / b_bytes
+            # Double-normalize each point against its OWN routed peak (cube vs
+            # vector, dtype-aware): x_norm = AI / ridge = AI·BW / peak, y = MFU.
+            # Every dtype/unit then collapses onto one universal roof y=min(x,1).
             scatter.append(
                 {
                     "name": names[i],
                     "type": types[i],
-                    "ai": flops / b_bytes,
+                    "ai": ai,
                     "tflops": achieved_flops / 1e12,
                     "dur_us": d_us,
                     "bound": bound,
+                    "dtype": dtype,
+                    "peak_tflops": peak_flops / 1e12,
+                    "mfu": mfu,
+                    "x_norm": ai * chip.hbm_bandwidth / peak_flops,
                 }
             )
 
     # ---- aggregates -------------------------------------------------------
-    by_type: Dict[str, Dict[str, float]] = {}
+    by_type: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         t = by_type.setdefault(
             r["type"],
             {"type": r["type"], "count": 0, "dur_us": 0.0, "flops": 0.0,
-             "bytes": 0.0, "wasted_us": 0.0, "mfu_w": 0.0, "mbu_w": 0.0},
+             "bytes": 0.0, "wasted_us": 0.0, "peak_time": 0.0, "dt_dur": {}},
         )
         t["count"] += 1
         t["dur_us"] += r["dur_us"]
         t["flops"] += r["flops"] or 0.0
         t["bytes"] += r["bytes"] or 0.0
         t["wasted_us"] += r["wasted_us"]
+        # Aggregate-MFU denominator consistent with per-kernel routing: sum each
+        # kernel's OWN routed-peak × time, so type MFU = Σflops / Σ(peak·t) rather
+        # than dividing everything by the single cube-bf16 peak (which under-reads
+        # vector-heavy types). dt_dur tracks the duration-dominant dtype.
+        if r["flops"]:
+            t["peak_time"] += r["peak_flops"] * (r["dur_us"] * 1e-6)
+        t["dt_dur"][r["dtype"]] = t["dt_dur"].get(r["dtype"], 0.0) + r["dur_us"]
 
     type_rows = []
     for t in by_type.values():
         d_s = t["dur_us"] * 1e-6
-        mfu = (t["flops"] / d_s / effective_peak) if (d_s and t["flops"]) else None
+        mfu = (t["flops"] / t["peak_time"]) if t["peak_time"] else None
         mbu = (t["bytes"] / d_s / SETTINGS.chip.hbm_bandwidth) if (d_s and t["bytes"]) else None
+        dom_dtype = max(t["dt_dur"].items(), key=lambda kv: kv[1])[0] if t["dt_dur"] else None
         type_rows.append(
             {
                 "type": t["type"],
                 "count": t["count"],
                 "dur_us": round(t["dur_us"], 1),
+                "dtype": dom_dtype,
                 "mfu": round(mfu, 4) if mfu is not None else None,
                 "mbu": round(mbu, 4) if mbu is not None else None,
                 "wasted_us": round(t["wasted_us"], 1),
