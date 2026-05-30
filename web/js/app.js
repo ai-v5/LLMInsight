@@ -18,6 +18,11 @@
 
   const rendered = {};
   let current = null;
+  let currentMeta = null;                 // set once a profile is loaded (ready)
+  // directory-picker scratch state (rebuilt each time the picker is shown)
+  let pickerInput, pickerCrumbs, pickerList, pickerPath = "";
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   function buildNav() {
     const nav = document.getElementById("nav");
@@ -41,6 +46,7 @@
   }
 
   async function go(id) {
+    if (!currentMeta) return;            // no profile loaded yet — picker is showing
     if (current === id) return;
     current = id;
     location.hash = id;
@@ -101,12 +107,34 @@
     buildNav();
     let meta;
     try {
-      meta = await waitReady();
+      meta = await fetchMeta();
     } catch (e) {
-      document.getElementById("loading-text").textContent = "加载失败：" + e.message;
+      showFatal("无法连接服务：" + e.message);
       return;
     }
-    // badges
+    route(meta);
+  }
+
+  // Decide what to show based on backend status. Lazy-by-default: an idle/error
+  // server shows the directory picker; a loading server shows the spinner+poll;
+  // a ready server boots straight into the views.
+  function route(meta) {
+    if (meta.status === "ready" || meta.ready) { finishBoot(meta); return; }
+    if (meta.status === "loading") { pollUntilReady(); return; }
+    showPicker({ error: meta.status === "error" ? meta.error : null,
+                 start: meta.suggested_dir || meta.data_dir || "" });
+  }
+
+  async function fetchMeta() {
+    LI.clearCache("/api/meta");
+    const m = await api("/api/meta");
+    LI.clearCache("/api/meta");           // /api/meta must never be cached
+    return m;
+  }
+
+  // -- ready: wire badges/pill/footer/buttons, then open the first view -------
+  function finishBoot(meta) {
+    currentMeta = meta;
     const m = meta.meta || {}, settings = (m.settings || {});
     const model = settings.model || {}, chip = settings.chip || {};
     const chips = settings.chips || [];
@@ -131,33 +159,193 @@
     document.getElementById("foot-data").textContent = (meta.data_dir || "").replace(/^.*[\\/]secret[\\/]/, "secret/");
     document.getElementById("chip-note").textContent = chipNote(chip);
 
-    // shareable-report export: now that STATE is ready, enable the topbar button.
+    // Topbar buttons. Use .onclick (not addEventListener) so re-loads don't stack
+    // duplicate handlers on these static elements.
     const exportBtn = document.getElementById("export-report");
-    if (exportBtn) {
-      exportBtn.disabled = false;
-      exportBtn.addEventListener("click", () => window.open("/report.html", "_blank", "noopener"));
-    }
+    if (exportBtn) { exportBtn.disabled = false; exportBtn.onclick = () => window.open("/report.html", "_blank", "noopener"); }
+    const changeBtn = document.getElementById("change-data");
+    if (changeBtn) { changeBtn.disabled = false; changeBtn.onclick = reopenPicker; }
 
+    document.getElementById("views").style.display = "";
     document.getElementById("loading").style.display = "none";
     const start = (location.hash || "").replace("#", "");
+    current = null;                       // ensure go() actually renders
     go(NAV.find(n => n.id === start) ? start : "overview");
   }
 
-  async function waitReady() {
-    for (let i = 0; i < 120; i++) {
-      const meta = await api("/api/meta");
-      LI.clearCache("/api/meta");
-      if (meta.ready) return meta;
-      if (meta.error) throw new Error(meta.error);
-      document.getElementById("loading-text").textContent = "正在解析 profiling 数据…（" + (i + 1) + "）";
-      await new Promise(r => setTimeout(r, 1000));
+  // -- loading spinner + poll -------------------------------------------------
+  function showLoading(text) {
+    document.getElementById("views").style.display = "none";
+    const l = document.getElementById("loading");
+    l.style.display = "";
+    l.innerHTML = `<div class="spinner"></div><div id="loading-text"></div>`;
+    l.querySelector("#loading-text").textContent = text || "正在解析 profiling 数据…";
+  }
+
+  async function pollUntilReady() {
+    showLoading();
+    for (let i = 0; i < 300; i++) {       // up to 5 min (cold 104MB trace parse)
+      let m;
+      try { m = await fetchMeta(); } catch (e) { await sleep(1000); continue; }
+      if (m.status === "ready" || m.ready) { finishBoot(m); return; }
+      if (m.status === "error") {
+        showPicker({ error: m.error || "加载失败", start: m.data_dir || m.suggested_dir || "" });
+        return;
+      }
+      const lt = document.getElementById("loading-text");
+      if (lt) lt.textContent = "正在解析 profiling 数据…（" + (i + 1) + "）";
+      await sleep(1000);
     }
-    throw new Error("加载超时");
+    showPicker({ error: "加载超时", start: pickerPath });
+  }
+
+  function showFatal(msg) {
+    const l = document.getElementById("loading");
+    l.style.display = "";
+    l.innerHTML = `<div class="banner bad"><span class="bi">⚠️</span><div>${esc(msg)}</div></div>`;
+  }
+
+  // -- directory picker -------------------------------------------------------
+  function showPicker(opts) {
+    opts = opts || {};
+    document.getElementById("views").style.display = "none";
+    const l = document.getElementById("loading");
+    l.style.display = "";
+    l.innerHTML = "";
+    const host = LI.el("div", { class: "picker" });
+    l.appendChild(host);
+
+    if (opts.error) host.appendChild(LI.el("div", { class: "picker-err", html: "⚠️ " + esc(opts.error) }));
+    host.appendChild(LI.el("div", { class: "picker-head" }, [
+      LI.el("div", { class: "picker-title" }, "选择 profiling 目录"),
+      LI.el("div", { class: "picker-sub" },
+        "进入包含 kernel_details.csv / trace_view.json / step_trace_time.csv 等文件的目录，点「加载此目录」开始分析。"),
+    ]));
+
+    // path input row (paste an absolute path, or browse below)
+    pickerInput = LI.el("input", { class: "picker-input", type: "text",
+      placeholder: "粘贴 profiling 目录的绝对路径，或在下方浏览…", value: opts.start || "" });
+    pickerInput.addEventListener("keydown", e => { if (e.key === "Enter") browse(pickerInput.value); });
+    const goBtn = LI.el("button", { class: "picker-btn ghost", on: { click: () => browse(pickerInput.value) } }, "前往");
+    const loadBtn = LI.el("button", { class: "picker-btn primary", on: { click: () => loadDir(pickerInput.value) } }, "加载此目录");
+    const cancel = opts.canCancel
+      ? LI.el("button", { class: "picker-btn ghost", on: { click: cancelPicker } }, "取消")
+      : null;
+    host.appendChild(LI.el("div", { class: "picker-row" }, [pickerInput, goBtn, loadBtn, cancel]));
+
+    pickerCrumbs = LI.el("div", { class: "picker-crumbs" });
+    pickerList = LI.el("div", { class: "picker-list" });
+    host.appendChild(pickerCrumbs);
+    host.appendChild(pickerList);
+    browse(opts.start || "");
+  }
+
+  async function browse(path) {
+    if (pickerList) pickerList.innerHTML = `<div class="picker-empty">列目录中…</div>`;
+    let data;
+    try {
+      const r = await fetch("/api/browse?path=" + encodeURIComponent(path || ""));
+      data = await r.json();
+    } catch (e) {
+      if (pickerList) pickerList.innerHTML = `<div class="picker-err">⚠️ 请求失败：${esc(e.message)}</div>`;
+      return;
+    }
+    if (!data.ok) {
+      if (pickerList) pickerList.innerHTML = `<div class="picker-err">⚠️ ${esc(data.error || "读取失败")}</div>`;
+      return;
+    }
+    pickerPath = data.path;
+    if (pickerInput) pickerInput.value = data.path;
+    renderCrumbs(data);
+    renderList(data);
+  }
+
+  function renderCrumbs(data) {
+    pickerCrumbs.innerHTML = "";
+    const sep = data.sep || "/";
+    (data.drives || []).forEach(d => {
+      const on = data.path.toLowerCase().indexOf(d.toLowerCase()) === 0;
+      pickerCrumbs.appendChild(LI.el("span", { class: "crumb-chip" + (on ? " on" : ""), on: { click: () => browse(d) } }, d));
+    });
+    const startsSep = data.path.startsWith(sep);
+    const parts = data.path.split(sep).filter(Boolean);
+    let acc = "";
+    parts.forEach((p, i) => {
+      acc = i === 0 ? (/^[A-Za-z]:$/.test(p) ? p + sep : (startsSep ? sep + p : p)) : acc + sep + p;
+      const full = acc;
+      pickerCrumbs.appendChild(LI.el("span", { class: "crumb-seg", on: { click: () => browse(full) } }, p));
+      if (i < parts.length - 1) pickerCrumbs.appendChild(LI.el("span", { class: "crumb-sl" }, sep));
+    });
+  }
+
+  function pickerRow(icon, name, onOpen, onLoad, isProfile) {
+    const left = LI.el("div", { class: "picker-item-name", on: { click: onOpen } }, [
+      LI.el("span", { class: "picker-ico" }, icon),
+      LI.el("span", { class: "picker-item-label" }, name),
+      isProfile ? LI.el("span", { class: "tag-profile" }, "profiling") : null,
+    ]);
+    const kids = [left];
+    if (onLoad) kids.push(LI.el("button", { class: "picker-btn primary sm", on: { click: onLoad } }, "加载"));
+    return LI.el("div", { class: "picker-item" + (isProfile ? " is-profile" : "") }, kids);
+  }
+
+  function renderList(data) {
+    pickerList.innerHTML = "";
+    if (data.is_profile_dir) {
+      pickerList.appendChild(LI.el("div", { class: "picker-cur" }, [
+        LI.el("span", {}, "✓ 当前目录就是一个 profiling 目录"),
+        LI.el("button", { class: "picker-btn primary sm", on: { click: () => loadDir(data.path) } }, "加载此目录"),
+      ]));
+    }
+    if (data.parent) {
+      pickerList.appendChild(pickerRow("⬆️", "..", () => browse(data.parent), null, false));
+    }
+    if (!data.dirs.length && !data.is_profile_dir) {
+      pickerList.appendChild(LI.el("div", { class: "picker-empty" }, "（无子目录）"));
+    }
+    data.dirs.forEach(d => {
+      pickerList.appendChild(pickerRow(d.is_profile ? "📊" : "📁", d.name,
+        () => browse(d.path), d.is_profile ? () => loadDir(d.path) : null, d.is_profile));
+    });
+  }
+
+  async function loadDir(path) {
+    // keep a 取消 button while a profile is still loaded, so a bad path can't trap
+    // the user in the picker with no way back to the data they already had.
+    const back = !!currentMeta;
+    path = (path || "").trim();
+    if (!path) { showPicker({ error: "请先选择或输入一个目录", start: pickerPath, canCancel: back }); return; }
+    pickerPath = path;
+    showLoading("正在请求加载：" + path);
+    let res;
+    try { res = await apiPost("/api/load", { dir: path }); }
+    catch (e) { showPicker({ error: "请求失败：" + e.message, start: path, canCancel: back }); return; }
+    if (!res || !res.ok) { showPicker({ error: (res && res.error) || "加载失败", start: path, canCancel: back }); return; }
+    resetViews();                         // drop any previously-rendered views/cache
+    await pollUntilReady();
+  }
+
+  function resetViews() {
+    Object.keys(rendered).forEach(k => delete rendered[k]);
+    current = null;
+    currentMeta = null;
+    LI.clearCache();                      // drop all client-side API cache
+    document.getElementById("views").innerHTML = "";  // remove stale view containers
+  }
+
+  function reopenPicker() {
+    showPicker({ canCancel: true, start: (currentMeta && currentMeta.data_dir) || pickerPath || "" });
+  }
+
+  function cancelPicker() {
+    if (!currentMeta) return;             // nothing loaded to fall back to
+    document.getElementById("loading").style.display = "none";
+    document.getElementById("views").style.display = "";
   }
 
   window.addEventListener("hashchange", () => {
     const id = (location.hash || "").replace("#", "");
-    if (id && id !== current && NAV.find(n => n.id === id)) go(id);
+    if (currentMeta && id && id !== current && NAV.find(n => n.id === id)) go(id);
   });
 
   boot();
