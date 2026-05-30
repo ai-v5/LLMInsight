@@ -24,7 +24,12 @@
       metric("端到端 MFU", fmt.mfu(smfu), { tone: smfu == null ? undefined : (smfu >= 0.5 ? "good" : smfu >= 0.3 ? "warn" : "bad"), foot: "有效FLOPs /(峰值×step)", barPct: smfu != null ? smfu * 100 : undefined }),
       metric("Step 时间", r.step_time_s + " s", { foot: "Stage = " + fmt.us(u.stage) }),
     ];
-    const levers = theo.available ? theo.whatif : [];
+    // Upper table renders the REALISTIC floor (业界可达上限), not the physical →0 bound:
+    // labels read 实测%→地板% and savings/MFU/combined all follow the floor. The →0 bound
+    // is kept as a one-line reference (ub). This is the same payload the lower 严谨性 panel
+    // and the shareable report render, so all three stay in lockstep.
+    const levers = (theo.available && theo.realistic) ? (theo.realistic.levers || []) : [];
+    const ub = theo.available ? (theo.whatif_combined || {}) : {};  // physical →0 upper bound (reference only)
     const baseStep = theo.available ? theo.current_step_us : 0;
     // MFU column shows the gain vs base (step_mfu); the base row stays the absolute anchor.
     const dmfu = (nv) => (smfu == null || nv == null) ? "—" : (nv - smfu >= 0 ? "+" : "-") + fmt.mfu(Math.abs(nv - smfu));
@@ -37,9 +42,9 @@
       ? `<tr style="color:var(--text-dim)"><td></td><td>当前（base）</td><td>—</td><td>—</td><td>${fmt.mfu(smfu)}</td></tr>`
       : "";
     const leverRows = levers.map(w =>
-      `<tr><td style="text-align:center"><input type="checkbox" class="wi-lever" style="accent-color:#5ee0b8;cursor:pointer" data-save="${w.save_us}" checked></td>`
-      + `<td>${esc(w.scenario)}</td><td style="color:var(--accent-2)">${saved(w.save_us)}</td>`
-      + `<td style="color:var(--accent-2)">-${fmt.pct(w.save_pct)}</td>`
+      `<tr><td style="text-align:center"><input type="checkbox" class="wi-lever" style="accent-color:#5ee0b8;cursor:pointer" data-save="${w.recoverable_us}" checked></td>`
+      + `<td>${esc(w.scenario)}</td><td style="color:var(--accent-2)">${saved(w.recoverable_us)}</td>`
+      + `<td style="color:var(--accent-2)">-${fmt.pct(w.recoverable_pct)}</td>`
       + `<td style="color:var(--accent)">${dmfu(w.new_mfu)}</td></tr>`).join("");
     const cb = theo.available && theo.compute_bound;
     // "已启用组合" row recomputed from whichever levers are ticked. 未掩盖通信 and Free
@@ -62,13 +67,13 @@
       <div class="grid cols-6">${cards.join("")}</div>
       <div class="grid cols-2" style="margin-top:16px">
         ${panel("Step 时间构成", "Computing / 未掩盖通信 / Free（单位 us）", `<div id="ov-donut" class="chart"></div>`)}
-        ${panel("理论上界 & What-if 收益模拟", "每项为单独启用的收益；勾选后底部「已启用组合」实时显示叠加效果",
+        ${panel("What-if 收益模拟 · 现实可达地板", "每项为达现实地板（业界可达上限）时单独可回收的收益（实测%→地板%）；勾选后底部「已启用组合」实时叠加",
           `<table class="tbl"><thead><tr><th style="width:38px">启用</th><th>优化项</th><th>单独节省(s)</th><th>单独节省(%)</th><th>端到端 MFU</th></tr></thead>`
           + `<tbody>${theo.available ? (baseRow + leverRows + `<tr id="wi-combined" style="border-top:2px solid rgba(94,224,184,.35)"></tr>`) : `<tr><td colspan=5 class="empty">—</td></tr>`}</tbody></table>
            ${cb ? (cb.peak_underestimated
              ? banner("warn","⚠️", `matmul 实测 MFU <strong>${cb.matmul_mfu_pct}%</strong> &gt; 100% → 假设芯片峰值偏低，请在 config.ChipSpec 校正。`)
              : `<div class="note">matmul MFU ≈ <strong>${cb.matmul_mfu_pct}%</strong>${cb.ceiling_based ? "（≈ 天花板）" : ""}；算子达天花板后计算 ${fmt.us(cb.ideal_matmul_us)}，可回收 ${fmt.us(cb.headroom_us)}。${cb.calibrated ? `（芯片峰值按实测 ${cb.observed_peak_tflops} TFLOPS 校准，假设 ${cb.assumed_peak_tflops != null ? cb.assumed_peak_tflops.toFixed(0) : "—"}）` : ""}</div>`) : ""}
-           <div class="note" style="font-size:11px;line-height:1.55;margin-top:8px;border-top:1px solid rgba(255,255,255,.06);padding-top:6px">💡 优化优先级：「通信完全掩盖」通常是最大单项 → 先做计算-通信重叠（--moe-fb-overlap / 异步通信），再压同步空泡。「算子极致优化」按各算子 MFU 天花板（matmul 95% / FA 85% / FAG 70%）收口，已达标算子不再投入——单项收益小而精，而非冲到 100% 的虚高。底部「已启用组合」随勾选实时计算叠加后的 step 与端到端 MFU。　⚠️ 「通信完全掩盖」与算子页 <strong>HcclLaunchAicpuKernel</strong> 是同一段集合通信（单卡几乎全是 Wait，非下发延迟），勿重复计入。</div>`)}
+           <div class="note" style="font-size:11px;line-height:1.55;margin-top:8px;border-top:1px solid rgba(255,255,255,.06);padding-top:6px">💡 此表为<strong>现实可达地板</strong>（非「→0」物理上界）：通信重叠至 80–90% 留残留、Free 留 step 2–5%、算子按各自 MFU 天花板（matmul 95% / FA 85% / FAG 70%）收口——单项收益小而精，而非冲到 100% 的虚高。优先级：先做计算-通信重叠（--moe-fb-overlap / 异步通信），再压同步空泡；底部「已启用组合」随勾选实时叠加。${ub.new_mfu != null ? ` <span style="color:var(--text-dim)">📐 物理上界（全部 →0，理论不可达）参考：step ${fmt.us(ub.new_step_us)} / 端到端 MFU ${fmt.mfu(ub.new_mfu)} / 省 ${fmt.pct(ub.save_pct)}。</span>` : ""}　⚠️ 「未掩盖通信」与算子页 <strong>HcclLaunchAicpuKernel</strong> 是同一段集合通信（单卡几乎全是 Wait，非下发延迟），勿重复计入。</div>`)}
       </div>
       ${theo.available ? `<div style="margin-top:16px">${whatifFloor(theo)}</div>` : ""}
       <div class="note">${esc(theo.available ? theo.note : "")}</div>`;

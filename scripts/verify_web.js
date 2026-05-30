@@ -5,7 +5,10 @@ const fs = require("fs");
 const vm = require("vm");
 const path = require("path");
 
-const BASE = "http://127.0.0.1:8765";
+// Default to :8765, but honor LLMINSIGHT_PORT/LLMINSIGHT_BASE so the harness can target
+// a fresh server on another port when 8765 is held by a stale process.
+const BASE = process.env.LLMINSIGHT_BASE
+  || `http://127.0.0.1:${process.env.LLMINSIGHT_PORT || 8765}`;
 const WEB = path.join(__dirname, "..", "web", "js");
 
 // ---- stub browser globals ----
@@ -98,10 +101,11 @@ async function ensureLoaded() {
     const okFloor = h.includes("现实地板");        // realistic-floor panel present
     const okZero = h.includes("能减到 0");         // per-lever 能否减到0 verdict
     const okComb = h.includes("综合现实地板");       // combined floor banner
+    const okSync = h.includes("%→");               // upper What-if table synced to floor (实测%→地板%)
     const undefs = (h.match(/undefined/g) || []).length;
-    const ok = okFloor && okZero && okComb && undefs === 0;
+    const ok = okFloor && okZero && okComb && okSync && undefs === 0;
     if (!ok) fail++;
-    console.log(`  ${ok ? "OK  " : "FAIL"} ${"whatif-floor".padEnd(16)} floor=${okFloor} zero=${okZero} combined=${okComb}` +
+    console.log(`  ${ok ? "OK  " : "FAIL"} ${"whatif-floor".padEnd(16)} floor=${okFloor} zero=${okZero} combined=${okComb} sync=${okSync}` +
                 (undefs ? `  ⚠ ${undefs}×"undefined"` : ""));
   } catch (e) {
     fail++;

@@ -175,6 +175,20 @@ def main():
              op_rl is not None
              and abs((op_rl.get("recoverable_us") or 0) - (oco.get("total_reclaim_us") or 0)) <= 1.0,
              f"(lever={op_rl.get('recoverable_us') if op_rl else None} reclaim={oco.get('total_reclaim_us')})")
+    # scenario labels carry the realistic floor UP into the upper What-if table (web +
+    # report): comm/free read 实测%→地板% (e.g. "未掩盖通信 26.1%→4.5%"), op is descriptive.
+    # This is what the user asked for: replace the unachievable "→0" labels with the floor.
+    chk_true("every realistic lever has a non-empty scenario label",
+             bool(rlevers) and all((l.get("scenario") or "").strip() for l in rlevers),
+             f"(scenarios={[l.get('scenario') for l in rlevers]})")
+    for lid in ("comm_overlap", "free_zero"):
+        lv = rl_by.get(lid) or {}
+        sc = lv.get("scenario") or ""
+        chk_true(f"{lid}: scenario is 实测%→地板% (measured→floor, not →0)",
+                 "%→" in sc
+                 and f"{lv.get('measured_pct'):.1f}" in sc
+                 and f"{lv.get('floor_pct'):.1f}" in sc,
+                 f"(scenario={sc!r} measured_pct={lv.get('measured_pct')} floor_pct={lv.get('floor_pct')})")
     # 失真 caveats are CONDITIONED on this capture (single-card + blocking both on here).
     chk_true("realistic flags track capture (single_card & blocking on)",
              rz.get("single_card") is True and rz.get("blocking") is True,
