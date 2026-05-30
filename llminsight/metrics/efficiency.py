@@ -1,0 +1,339 @@
+"""Per-kernel efficiency: MFU / MBU / Roofline + optimization-room ranking.
+
+For every device kernel we estimate FLOPs (matmul family) and moved bytes (from
+shapes+dtypes), then compare achieved vs the chip roofline to rank kernels by
+"wasted time" (duration that an ideal roofline execution would not have spent).
+Chip peaks come from config.ChipSpec and are ASSUMED — surfaced in the UI.
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from ..config import SETTINGS, dtype_bytes
+from ..parser.profile import num
+from ..parser.shapes import parse_shapes, parse_dtypes, numel
+
+MATMUL_TYPES = {
+    "MatMulV3", "MatMul", "GroupedMatmul", "GemmV3", "Gemm",
+    "BatchMatMul", "BatchMatMulV2",
+}
+
+# Fused attention kernels are matmul-dominated (QK^T + softmax·V on the cube), so
+# their useful FLOPs should count toward MFU even though the op isn't a plain GEMM.
+ATTENTION_FWD_TYPES = {
+    "FlashAttentionScore", "PromptFlashAttention",
+    "FusedInferAttentionScore", "IncreFlashAttention",
+}
+ATTENTION_GRAD_TYPES = {"FlashAttentionScoreGrad"}
+ATTENTION_TYPES = ATTENTION_FWD_TYPES | ATTENTION_GRAD_TYPES
+# DeepSeek-V3 attention is causal: FlashAttention skips the masked (upper-triangle)
+# blocks, so it does ~half the dense QK^T+PV work. Without this 0.5 the achieved
+# rate would exceed silicon peak — i.e. the factor is physically required, not a
+# convenience. The backward pass recomputes ~2.5x the forward matmul FLOPs.
+_ATTN_CAUSAL_FACTOR = 0.5
+_ATTN_BWD_FWD_RATIO = 2.5
+
+
+def _estimate_matmul_flops(shapes: List[List[int]]) -> Optional[float]:
+    mats = [s for s in shapes if len(s) >= 2]
+    if len(mats) < 2:
+        return None
+    a, b = mats[0], mats[1]
+
+    def mk(s):
+        if len(s) == 2:
+            return s[0], s[1], 1
+        batch = 1
+        for d in s[:-2]:
+            batch *= d
+        return s[-2], s[-1], batch
+
+    M, K, abz = mk(a)
+    br, bc, bbz = mk(b)
+    if br == K:
+        N = bc
+    elif bc == K:
+        N = br
+    else:
+        N = bc
+    # Batch comes from the activation side only. For GroupedMatmul the weight is
+    # a 3-D [E,K,N] tensor but each token visits exactly one expert, so the token
+    # dimension already totals the work — multiplying by E would over-count.
+    batch = abz
+    if min(M, N, K) <= 0:
+        return None
+    return 2.0 * M * N * K * batch
+
+
+def _estimate_attention_flops(shapes_in, shapes_out, is_grad: bool) -> Optional[float]:
+    """FLOPs for a fused FlashAttention kernel = 2·B·N·S²·(d_qk + d_v)·causal.
+
+    Layout-agnostic: B, N, S are read from the softmax max/sum tensor ([B,N,S,k]
+    with a small trailing dim — present as an output of the fwd op and an input of
+    the grad op). Head dims come from the leading Q/K/V tensors via
+    head_dim = numel / (B·N·S), so MLA's split d_qk(192)/d_v(128) is captured.
+    """
+    shapes = list(shapes_in) + list(shapes_out)
+    bns = None
+    for s in shapes:
+        if len(s) == 4 and 0 < s[3] <= 16 and s[1] >= 1 and s[2] >= 8:
+            bns = (s[0], s[1], s[2])
+            break
+    if not bns:
+        return None
+    B, N, S = bns
+    base = B * N * S
+    if base <= 0:
+        return None
+    head_dims: List[int] = []
+    for s in shapes_in:
+        if len(s) < 2:
+            continue
+        nl = numel(s)
+        if nl <= 0 or nl % base != 0:
+            continue
+        hd = nl // base
+        if 16 <= hd <= 4096:       # excludes the mask / softmax stats tensors
+            head_dims.append(hd)
+    if not head_dims:
+        return None
+    d_qk = head_dims[0]                                  # query is always first
+    d_v = next((h for h in head_dims if h != d_qk), d_qk)  # MLA: differs; MHA: ==
+    fwd = 2.0 * B * N * (S ** 2) * (d_qk + d_v) * _ATTN_CAUSAL_FACTOR
+    return fwd * (_ATTN_BWD_FWD_RATIO if is_grad else 1.0)
+
+
+def _bound_from_ratios(mac, mte2, vec) -> str:
+    mac = mac or 0.0
+    mte2 = mte2 or 0.0
+    vec = vec or 0.0
+    if mac >= 0.30 and mac >= mte2:
+        return "compute"
+    if mte2 >= 0.30 and mte2 > mac:
+        return "memory"
+    if vec >= 0.30:
+        return "vector"
+    return "other"
+
+
+def compute_efficiency(prof) -> Dict[str, Any]:
+    kd = prof.kernel_details
+    chip = SETTINGS.chip
+    if kd.empty:
+        return {"available": False, "reason": "kernel_details.csv missing"}
+
+    cols = kd.columns
+    dur = num(kd["Duration(us)"]).fillna(0.0).to_numpy()
+    types = kd["Type"].astype(str).to_numpy()
+    names = kd["Name"].astype(str).to_numpy()
+    core = kd["Accelerator Core"].astype(str).to_numpy() if "Accelerator Core" in cols else [""] * len(kd)
+    in_sh = kd["Input Shapes"].to_numpy() if "Input Shapes" in cols else [None] * len(kd)
+    in_dt = kd["Input Data Types"].to_numpy() if "Input Data Types" in cols else [None] * len(kd)
+    out_sh = kd["Output Shapes"].to_numpy() if "Output Shapes" in cols else [None] * len(kd)
+    out_dt = kd["Output Data Types"].to_numpy() if "Output Data Types" in cols else [None] * len(kd)
+
+    def colf(name):
+        return num(kd[name]).fillna(0.0).to_numpy() if name in cols else [0.0] * len(kd)
+
+    mac_r = colf("aic_mac_ratio")
+    mte2_r = colf("aic_mte2_ratio")
+    mte3_r = colf("aic_mte3_ratio")
+    vec_r = colf("aiv_vec_ratio")
+    cube_u = colf("cube_utilization(%)")
+
+    # ---- pre-pass: observed BF16 ceiling -> calibrate the assumed peak --------
+    # A real kernel cannot exceed silicon peak. If the best clean matmul's achieved
+    # throughput exceeds the assumed ChipSpec peak, the assumption is simply too low
+    # for this SKU (910B bins vary), so reporting MFU > 100% would be nonsense.
+    # Calibrate the effective peak up to the observed ceiling (+2% headroom so the
+    # ceiling kernel reads ~98%, not a suspicious flat 100%), bounded at 2x the
+    # assumption so a stray shape mis-parse can't masquerade as a giant peak bump.
+    # Both assumed and observed peaks are surfaced in the UI; setting the real SKU
+    # peak in ChipSpec overrides this. Calibration only ever raises the peak.
+    observed_peak = 0.0
+    for i in range(len(kd)):
+        if types[i] not in MATMUL_TYPES or float(dur[i]) <= 0:
+            continue
+        f = _estimate_matmul_flops(parse_shapes(in_sh[i]))
+        if f:
+            observed_peak = max(observed_peak, f / (float(dur[i]) * 1e-6))
+    configured_peak = chip.peak_bf16_flops
+    calibrated = observed_peak > configured_peak
+    effective_peak = min(observed_peak * 1.02, configured_peak * 2.0) if calibrated else configured_peak
+    peak_scale = effective_peak / configured_peak  # >= 1.0
+
+    def eff_peak_for(dtype: str) -> float:
+        # cube-clock calibration: scale every cube-dtype peak by the same factor.
+        return chip.peak_flops_for(dtype) * peak_scale
+
+    rows: List[Dict[str, Any]] = []
+    scatter: List[Dict[str, Any]] = []
+
+    skipped_comm = 0
+    for i in range(len(kd)):
+        d_us = float(dur[i])
+        if d_us <= 0:
+            continue
+        # Communication-dispatch "kernels" (AI_CPU / HCCL) have no compute or
+        # memory footprint we can model — they belong to the communication and
+        # hidden-overhead views, not the compute-efficiency ranking.
+        if str(core[i]).upper() == "AI_CPU" or str(types[i]).lower().startswith(("hccl", "hcom")):
+            skipped_comm += 1
+            continue
+        d_s = d_us * 1e-6
+        shapes_in = parse_shapes(in_sh[i])
+        shapes_out = parse_shapes(out_sh[i])
+        dt_in = parse_dtypes(in_dt[i])
+        dt_out = parse_dtypes(out_dt[i])
+        dtype = dt_in[0] if dt_in else (dt_out[0] if dt_out else "BF16")
+
+        # bytes moved (read inputs + write outputs)
+        b_bytes = 0
+        for j, sh in enumerate(shapes_in):
+            dt = dt_in[j] if j < len(dt_in) else (dt_in[-1] if dt_in else dtype)
+            b_bytes += numel(sh) * dtype_bytes(dt)
+        for j, sh in enumerate(shapes_out):
+            dt = dt_out[j] if j < len(dt_out) else (dt_out[-1] if dt_out else dtype)
+            b_bytes += numel(sh) * dtype_bytes(dt)
+
+        if types[i] in MATMUL_TYPES:
+            flops = _estimate_matmul_flops(shapes_in)
+        elif types[i] in ATTENTION_TYPES:
+            flops = _estimate_attention_flops(
+                shapes_in, shapes_out, types[i] in ATTENTION_GRAD_TYPES)
+        else:
+            flops = None
+
+        peak_flops = eff_peak_for(dtype)
+        achieved_flops = (flops / d_s) if flops else None
+        achieved_bw = (b_bytes / d_s) if b_bytes else 0.0
+        mfu = (achieved_flops / peak_flops) if achieved_flops else None
+        mbu = (achieved_bw / chip.hbm_bandwidth) if achieved_bw else None
+
+        core_u = str(core[i]).upper()
+        is_vector = "VECTOR" in core_u or "AIV" in core_u
+        # We can only credibly model "ideal time" (and thus wasted time) when we
+        # have a FLOP estimate (matmul / fused attention) OR the kernel is a
+        # vector-core memory op. Other cube/MIX ops without a FLOP model would
+        # look 100% wasted under a memory-only roofline — so we leave them unscored.
+        modeled = (flops is not None) or (is_vector and b_bytes > 0)
+        t_compute = (flops / peak_flops) if flops else 0.0
+        t_mem = (b_bytes / chip.hbm_bandwidth) if b_bytes else 0.0
+        if modeled:
+            ideal_us = max(t_compute, t_mem) * 1e6
+            efficiency = max(0.0, min(ideal_us / d_us, 1.0)) if d_us > 0 else 0.0
+            wasted_us = max(0.0, d_us - ideal_us)
+            bound = ("compute" if t_compute >= t_mem else "memory") if flops is not None else "memory"
+        else:
+            efficiency = None
+            wasted_us = 0.0
+            bound = _bound_from_ratios(mac_r[i], mte2_r[i], vec_r[i])
+
+        rows.append(
+            {
+                "name": names[i],
+                "type": types[i],
+                "core": core[i],
+                "dur_us": d_us,
+                "dtype": dtype,
+                "flops": flops,
+                "bytes": b_bytes,
+                "mfu": mfu,
+                "mbu": mbu,
+                "efficiency": efficiency,
+                "wasted_us": wasted_us,
+                "bound": bound,
+                "ai": (flops / b_bytes) if (flops and b_bytes) else None,
+                "achieved_tflops": (achieved_flops / 1e12) if achieved_flops else None,
+                "mac_ratio": float(mac_r[i]),
+                "mte2_ratio": float(mte2_r[i]),
+                "cube_util": float(cube_u[i]),
+            }
+        )
+        if flops and b_bytes:
+            scatter.append(
+                {
+                    "name": names[i],
+                    "type": types[i],
+                    "ai": flops / b_bytes,
+                    "tflops": achieved_flops / 1e12,
+                    "dur_us": d_us,
+                    "bound": bound,
+                }
+            )
+
+    # ---- aggregates -------------------------------------------------------
+    by_type: Dict[str, Dict[str, float]] = {}
+    for r in rows:
+        t = by_type.setdefault(
+            r["type"],
+            {"type": r["type"], "count": 0, "dur_us": 0.0, "flops": 0.0,
+             "bytes": 0.0, "wasted_us": 0.0, "mfu_w": 0.0, "mbu_w": 0.0},
+        )
+        t["count"] += 1
+        t["dur_us"] += r["dur_us"]
+        t["flops"] += r["flops"] or 0.0
+        t["bytes"] += r["bytes"] or 0.0
+        t["wasted_us"] += r["wasted_us"]
+
+    type_rows = []
+    for t in by_type.values():
+        d_s = t["dur_us"] * 1e-6
+        mfu = (t["flops"] / d_s / effective_peak) if (d_s and t["flops"]) else None
+        mbu = (t["bytes"] / d_s / SETTINGS.chip.hbm_bandwidth) if (d_s and t["bytes"]) else None
+        type_rows.append(
+            {
+                "type": t["type"],
+                "count": t["count"],
+                "dur_us": round(t["dur_us"], 1),
+                "mfu": round(mfu, 4) if mfu is not None else None,
+                "mbu": round(mbu, 4) if mbu is not None else None,
+                "wasted_us": round(t["wasted_us"], 1),
+            }
+        )
+    type_rows.sort(key=lambda x: x["dur_us"], reverse=True)
+
+    top_opt = sorted(rows, key=lambda r: r["wasted_us"], reverse=True)[:25]
+    for r in top_opt:
+        for k in ("flops", "bytes", "mfu", "mbu", "ai", "achieved_tflops"):
+            if isinstance(r.get(k), float):
+                r[k] = round(r[k], 4) if r[k] and r[k] < 1 else (round(r[k], 1) if r[k] else r[k])
+
+    # Headline matmul MFU stays *pure GEMM* (the calibration anchor); fused
+    # attention has its own per-type MFU row and is excluded here so the headline
+    # keeps its meaning. `flops_rows` (incl. attention) drives the modeled-kernel
+    # count and the Roofline scatter.
+    flops_rows = [r for r in rows if r["flops"]]
+    mm = [r for r in flops_rows if r["type"] in MATMUL_TYPES]
+    mm_time_s = sum(r["dur_us"] for r in mm) * 1e-6
+    mm_flops = sum(r["flops"] for r in mm)
+    matmul_mfu = (mm_flops / mm_time_s / effective_peak) if mm_time_s else None
+    # the same number against the *assumed* peak (>1 is what triggered calibration)
+    matmul_mfu_assumed = (mm_flops / mm_time_s / configured_peak) if mm_time_s else None
+
+    scatter.sort(key=lambda s: s["dur_us"], reverse=True)
+    scatter = scatter[:1500]
+
+    return {
+        "available": True,
+        "chip": {
+            "name": chip.name,
+            "peak_bf16_tflops": chip.peak_bf16_flops / 1e12,          # assumed (datasheet)
+            "effective_peak_tflops": effective_peak / 1e12,           # used for MFU
+            "observed_peak_tflops": round(observed_peak / 1e12, 1),   # measured ceiling
+            "calibrated": calibrated,
+            "hbm_tbps": chip.hbm_bandwidth / 1e12,
+            "hbm_capacity_gb": chip.hbm_capacity_gb,
+            "assumed": chip.assumed,
+        },
+        "roofline_ridge_ai": effective_peak / SETTINGS.chip.hbm_bandwidth,
+        "matmul_mfu": round(matmul_mfu, 4) if matmul_mfu else None,
+        "matmul_mfu_assumed": round(matmul_mfu_assumed, 4) if matmul_mfu_assumed else None,
+        "peak_underestimated": calibrated,
+        "by_type": type_rows[:40],
+        "top_optimization": top_opt,
+        "scatter": scatter,
+        "kernels_with_flops": len(flops_rows),
+        "kernels_total": len(rows),
+        "comm_kernels_excluded": skipped_comm,
+    }

@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLMInsight · 昇腾大模型训练 Profiling 洞察</title>
+<link rel="stylesheet" href="css/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📊</text></svg>">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="brand-mark">LLM<span>Insight</span></div>
+      <div class="brand-sub">昇腾 NPU 训练性能洞察</div>
+    </div>
+    <nav id="nav"></nav>
+    <div class="side-foot">
+      <div id="llm-pill" class="pill pill-off" title="LLM 洞察状态">LLM: …</div>
+      <div class="side-note" id="chip-note">芯片峰值为假设值</div>
+    </div>
+  </aside>
+
+  <main id="main">
+    <header id="topbar">
+      <div class="crumb">
+        <span id="view-title">总览</span>
+        <span class="crumb-sub" id="view-sub"></span>
+      </div>
+      <div class="badges" id="badges"></div>
+    </header>
+
+    <div id="loading" class="loading">
+      <div class="spinner"></div>
+      <div id="loading-text">正在解析 profiling 数据…</div>
+    </div>
+
+    <div id="views"></div>
+
+    <footer id="footer">
+      <span>LLMInsight · 单卡单 step 演示</span>
+      <span class="sep">·</span>
+      <span id="foot-data"></span>
+      <span class="sep">·</span>
+      <span>MFU/MBU/Roofline 基于<strong>参考</strong>芯片峰值，可在右上角<strong>切换芯片</strong>或 config.ChipSpec 校正</span>
+    </footer>
+  </main>
+</div>
+
+<!-- vendored offline (no CDN dependency); falls back to CDN if missing -->
+<script src="vendor/echarts.min.js"></script>
+<script>
+  if (typeof echarts === "undefined") {
+    document.write('<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"><\/script>');
+  }
+</script>
+<script src="js/util.js"></script>
+<script src="js/views.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
