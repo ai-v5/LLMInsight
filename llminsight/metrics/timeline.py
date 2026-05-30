@@ -5,6 +5,7 @@ on disk keyed by the trace file signature so server restarts are instant.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List
 
 from ..cache import cached_json, file_signature
@@ -19,6 +20,12 @@ LANE_LABELS = {
     "Python": "Framework (Python)",
 }
 OVERLAP_LANE = "Overlap Analysis"
+
+# The top-slice table should surface real compute kernels, not host/device sync
+# barriers. DAVID_EVENT_WAIT / NOTIFY_WAIT / *_RECORD / stream-sync ops dominate raw
+# duration but carry no optimization signal — drop them so matmul/FlashAttention/comm
+# kernels (previously crowded out of the top 60) rise to the top.
+_SYNC_RE = re.compile(r"WAIT|NOTIFY|EVENT_RECORD|BARRIER|STREAM", re.I)
 
 
 def _build(prof) -> Dict[str, Any]:
@@ -61,7 +68,7 @@ def _build(prof) -> Dict[str, Any]:
     pid_to_label = {pid: lbl for lbl, pid in lane_pids.items() if pid is not None}
 
     overlap_tracks = ("Computing", "Communication", "Communication(Not Overlapped)", "Free")
-    overlap_segments: List[Dict[str, Any]] = []
+    overlap_occ: Dict[str, List[float]] = {t: [0.0] * bins for t in overlap_tracks}
     top_slices: List[Dict[str, Any]] = []
     freq: List[Dict[str, Any]] = []
 
@@ -94,30 +101,44 @@ def _build(prof) -> Dict[str, Any]:
             if label and ts and dur > 0:
                 add_occ(lane_occ[label], ts, ts + dur)
                 if label.startswith("Device") and dur > 1500:
-                    top_slices.append(
-                        {"name": str(ev.get("name"))[:60], "lane": "Device",
-                         "start_us": round(ts - t0, 1), "dur_us": round(dur, 1)}
-                    )
+                    nm = str(ev.get("name"))
+                    if not _SYNC_RE.search(nm):
+                        top_slices.append(
+                            {"name": nm[:60], "lane": "Device",
+                             "start_us": round(ts - t0, 1), "dur_us": round(dur, 1)}
+                        )
             if pid == overlap_pid:
                 track = tid_name.get((pid, ev.get("tid")), "")
-                if track in overlap_tracks and dur > 0:
-                    overlap_segments.append(
-                        {"track": track, "start_us": round(ts - t0, 1),
-                         "dur_us": round(dur, 1)}
-                    )
+                if track in overlap_tracks and ts and dur > 0:
+                    add_occ(overlap_occ[track], ts, ts + dur)
         elif ph == "C":
             nm = ev.get("name") or ""
             if "Freq" in nm and "Die 0" in nm:
                 args = ev.get("args", {}) or {}
-                freq.append({"t_us": round(event_ts_us(ev) - t0, 1),
-                             "mhz": args.get("MHz", 0)})
+                t_us = event_ts_us(ev) - t0
+                # counter samples often predate the first ph="X" kernel (negative
+                # t_us) and were stretching the value-axis to a symmetric [-4,4]s.
+                # Keep only samples inside the kernel span so the axis can pin to it.
+                if 0 <= t_us <= span_us:
+                    freq.append({"t_us": round(t_us, 1), "mhz": args.get("MHz", 0)})
 
-    # normalize occupancy to [0,1]
+    # normalize occupancy to [0,1] (per-bin busy fraction; multi-stream overlap clamps)
     for lbl in lane_occ:
         lane_occ[lbl] = [round(min(v / bin_us, 1.0), 3) for v in lane_occ[lbl]]
+    # The four Overlap tracks are NOT mutually exclusive: "Communication" (total) runs
+    # concurrently with "Computing" when comm is hidden, so all four sum to ~1.3-2.0.
+    # The three that DO partition the step are Computing + Communication(Not Overlapped)
+    # + Free (sum ~1) — that triple is what the frontend stacks as a true 100% band.
+    for trk in overlap_occ:
+        overlap_occ[trk] = [round(min(v / bin_us, 1.0), 3) for v in overlap_occ[trk]]
 
-    overlap_segments.sort(key=lambda s: s["dur_us"], reverse=True)
-    overlap_segments = overlap_segments[:1500]
+    def _avg_pct(arr: List[float]) -> float:
+        return round(100.0 * sum(arr) / len(arr), 1) if arr else 0.0
+
+    computing_pct = _avg_pct(overlap_occ["Computing"])
+    not_overlapped_pct = _avg_pct(overlap_occ["Communication(Not Overlapped)"])
+    free_pct = _avg_pct(overlap_occ["Free"])
+
     top_slices.sort(key=lambda s: s["dur_us"], reverse=True)
     top_slices = top_slices[:60]
     if len(freq) > 240:
@@ -132,10 +153,13 @@ def _build(prof) -> Dict[str, Any]:
         "bins": bins,
         "bin_us": round(bin_us, 1),
         "lanes": [{"label": lbl, "occupancy": lane_occ[lbl]} for lbl in lane_occ],
-        "overlap_segments": overlap_segments,
+        "overlap_bins": [{"track": t, "occupancy": overlap_occ[t]} for t in overlap_tracks],
+        "computing_pct": computing_pct,
+        "not_overlapped_pct": not_overlapped_pct,
+        "free_pct": free_pct,
         "top_slices": top_slices,
         "ai_core_freq": freq,
-        "note": "占用率为每个时间桶内事件覆盖比例（多流叠加已截断到 1.0）。Overlap 段来自 profiler 的 Overlap Analysis 泳道。",
+        "note": "热力图：绿=满载（主机流常驻属正常），暖色/红=占用骤降的空泡（可优化）。Overlap 时间条把每个时间桶按 有效计算(Computing)/未掩盖通信/Free 三段拆分（三者合计=步长 100%）——红=未掩盖通信、琥珀=Free 空泡，越多越值得优化；已掩盖通信隐含在 Computing 墙钟内，单独见上方 Communication 泳道。三图共享同一时间轴可纵向对照。切片表已过滤同步等待项（WAIT/NOTIFY/…），仅保留真实计算 kernel。",
     }
 
 
@@ -143,5 +167,9 @@ def compute_timeline(prof) -> Dict[str, Any]:
     if not prof.trace_path:
         return {"available": False, "reason": "trace_view.json missing"}
     sig = file_signature(prof.trace_path)
-    key = f"timeline:{sig}:{SETTINGS.timeline_bins}"
+    # v3 schema: overlap_bins + computing/not-overlapped/free pcts (the 3 step-
+    # partitioning tracks), dropped overlap_segments, freq filtered to span, sync
+    # kernels filtered from top_slices. Bump the key on any shape change so a cache
+    # written under an older schema is never served.
+    key = f"timeline:v3:{sig}:{SETTINGS.timeline_bins}"
     return cached_json(key, lambda: _build(prof))

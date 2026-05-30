@@ -280,52 +280,127 @@
   V.timeline = async function (root) {
     const tl = await api("/api/timeline");
     if (!tl.available) { root.innerHTML = `<div class="empty">无 trace_view.json：${esc(tl.reason || "")}</div>`; return; }
-    const sliceRows = tl.top_slices.slice(0, 40).map(s =>
-      `<tr><td class="mono">${esc(s.name)}</td><td>${(s.start_us/1e3).toFixed(1)} ms</td><td>${fmt.us(s.dur_us)}</td></tr>`).join("");
+    const comp = tl.computing_pct || 0, notov = tl.not_overlapped_pct || 0, free = tl.free_pct || 0;
+    const maxDur = tl.top_slices.length ? tl.top_slices[0].dur_us : 1;
+    const sliceRows = tl.top_slices.length
+      ? tl.top_slices.slice(0, 40).map(s => {
+          const w = Math.max(2, Math.round(s.dur_us / maxDur * 100));
+          return `<tr><td class="mono">${esc(s.name)}</td><td>${(s.start_us / 1e6).toFixed(2)} s</td>` +
+            `<td><div style="position:relative;min-width:84px">` +
+            `<div style="position:absolute;top:2px;bottom:2px;right:0;width:${w}%;background:rgba(63,182,224,.16);border-radius:3px"></div>` +
+            `<span style="position:relative">${fmt.us(s.dur_us)}</span></div></td></tr>`;
+        }).join("")
+      : `<tr><td colspan="3" class="empty">无 >1.5ms 的真实计算 kernel</td></tr>`;
     root.innerHTML = `
       <div class="grid cols-4">
-        ${metric("时间跨度", tl.span_s + " s")}
-        ${metric("时间桶", fmt.int(tl.bins), { foot: fmt.us(tl.bin_us) + "/桶" })}
-        ${metric("泳道", fmt.int(tl.lanes.length))}
-        ${metric("Overlap 段", fmt.int(tl.overlap_segments.length))}
+        ${metric("时间跨度", tl.span_s + " s", { foot: fmt.int(tl.bins) + " 桶 · " + tl.lanes.length + " 泳道" })}
+        ${metric("有效计算", comp.toFixed(1) + "%", { tone: comp >= 60 ? "good" : comp >= 40 ? "warn" : "bad", barPct: comp, foot: "Computing / 总步长" })}
+        ${metric("未掩盖通信", notov.toFixed(1) + "%", { tone: notov >= 20 ? "bad" : notov >= 8 ? "warn" : "good", barPct: notov, foot: "通信未被计算掩盖" })}
+        ${metric("Free 空泡", free.toFixed(1) + "%", { tone: free >= 20 ? "bad" : free >= 8 ? "warn" : "good", barPct: free, foot: "设备完全空闲（可优化）" })}
       </div>
-      ${panel("泳道占用率热力图（回放式时间轴）", "每个时间桶内事件覆盖比例（0–1）；颜色越亮越忙", `<div id="tl-heat" class="chart" style="height:210px"></div>`, "span-2")}
-      <div class="grid cols-2">
-        ${panel("AI Core 频率", "MHz over time", `<div id="tl-freq" class="chart short"></div>`)}
-        ${panel("Top Device Kernel 切片 (>1.5ms)", "", `<div class="tbl-wrap" style="max-height:240px"><table class="tbl"><thead><tr><th>Kernel</th><th>起始</th><th>时长</th></tr></thead><tbody>${sliceRows}</tbody></table></div>`)}
-      </div>
+      ${panel("泳道占用率热力图（回放式时间轴）", "绿=满载（主机流常驻属正常），暖→红=占用骤降的空泡；与下方两图共享时间轴", `<div id="tl-heat" class="chart" style="height:264px"></div>`, "span-2")}
+      ${panel("Overlap 时间条（每桶按 有效计算 / 未掩盖通信 / Free 三段拆分，合计=步长 100%）", "红=未掩盖通信，琥珀=Free 空泡——两者越多越值得优化", `<div id="tl-overlap" class="chart" style="height:176px"></div>`, "span-2")}
+      ${panel("AI Core 频率", "MHz over time（x 轴已钉死并与上方对齐）", `<div id="tl-freq" class="chart" style="height:176px"></div>`, "span-2")}
+      ${panel("最长计算 kernel 切片 (>1.5ms)", "已过滤同步等待项（WAIT / NOTIFY 等），仅保留真实计算 kernel", `<div class="tbl-wrap" style="max-height:260px"><table class="tbl"><thead><tr><th>Kernel</th><th>起始</th><th>时长</th></tr></thead><tbody>${sliceRows}</tbody></table></div>`, "span-2")}
       <div class="note">${esc(tl.note)}</div>`;
     charts([
       { id: "tl-heat", option: heatmap(tl) },
-      { id: "tl-freq", option: freqLine(tl.ai_core_freq) },
+      { id: "tl-overlap", option: overlapBand(tl) },
+      { id: "tl-freq", option: freqLine(tl.ai_core_freq, tl.span_us) },
     ]);
   };
 
+  // shared horizontal grid -> the 3 time charts line up vertically (only left/right
+  // must match; each keeps its own top/bottom). left gutter holds the lane labels.
+  const TL_GX = { left: 150, right: 22 };
+  const LANE_COLOR = {
+    "Device (Ascend Hardware)": "#5ee0b8",  // the lane we care about -> bright accent
+    "Communication": "#58a6ff",
+    "Host Runtime (CANN)": "#9aa7b8",        // host lanes recede (muted)
+    "Framework (Python)": "#6b7888",
+  };
+  const LANE_SHORT = {
+    "Device (Ascend Hardware)": "Device",
+    "Communication": "Communication",
+    "Host Runtime (CANN)": "Host · CANN",
+    "Framework (Python)": "Framework · Py",
+  };
+  const OV_COLOR = {
+    "Computing": "#2f6f4f",                  // useful compute -> dim green (recedes)
+    "Communication": "#58a6ff",              // comm hidden behind compute -> neutral
+    "Communication(Not Overlapped)": "#f85149",  // exposed comm stall -> red (loud)
+    "Free": "#d29922",                       // device idle bubble -> amber (loud)
+  };
+  const OV_LABEL = {
+    "Computing": "Computing",
+    "Communication": "通信(已掩盖)",
+    "Communication(Not Overlapped)": "未掩盖通信",
+    "Free": "Free 空泡",
+  };
+
+  // idle-loud: occupancy 0 (空泡) -> red, 1 (满载) -> dim green. Inverts the usual
+  // "bright = busy" so the always-on host lanes recede and Device/通信 dips pop.
   function heatmap(tl) {
     if (!tl.lanes || !tl.lanes.length) return { xAxis: {}, yAxis: {}, series: [] };
     const lanes = tl.lanes.map(l => l.label);
     const data = [];
-    tl.lanes.forEach((l, li) => l.occupancy.forEach((v, bi) => { if (v > 0.001) data.push([bi, li, v]); }));
+    tl.lanes.forEach((l, li) => l.occupancy.forEach((v, bi) => data.push([bi, li, v])));
     return {
-      tooltip: Object.assign({ position: "top", formatter: p =>
-        `${lanes[p.data[1]]}<br/>t=${(p.data[0]*tl.bin_us/1e6).toFixed(2)}s<br/>占用 ${(p.data[2]*100).toFixed(0)}%` }, tooltipBase),
-      grid: { left: 10, right: 14, top: 10, bottom: 28, containLabel: true },
-      xAxis: axis({ type: "category", data: tl.lanes[0].occupancy.map((_, i) => i), name: "时间桶",
-        axisLabel: { show: true, interval: Math.floor(tl.bins / 10), formatter: i => (i*tl.bin_us/1e6).toFixed(1)+"s" } }),
-      yAxis: axis({ type: "category", data: lanes, axisLabel: { color: "#c9d4e0", width: 150, overflow: "truncate" } }),
-      visualMap: { min: 0, max: 1, calculable: true, orient: "horizontal", left: "center", bottom: -4, show: false,
-        inRange: { color: ["#0d1117", "#1d4e63", "#3fb6e0", "#5ee0b8"] } },
-      series: [{ type: "heatmap", data, progressive: 2000, itemStyle: { borderWidth: 0 } }],
+      animation: false,
+      tooltip: Object.assign({ position: "top", formatter: p => {
+        const occ = p.data[2];
+        const state = occ >= 0.85 ? "满载" : occ >= 0.4 ? "部分空闲" : "空泡 / 空闲";
+        return `${lanes[p.data[1]]}<br/>t=${(p.data[0] * tl.bin_us / 1e6).toFixed(2)}s<br/>占用 ${(occ * 100).toFixed(0)}% · ${state}`;
+      } }, tooltipBase),
+      grid: Object.assign({ top: 12, bottom: 44 }, TL_GX),
+      xAxis: axis({ type: "category", data: tl.lanes[0].occupancy.map((_, i) => i),
+        axisLabel: { show: true, interval: Math.floor(tl.bins / 10), formatter: i => (i * tl.bin_us / 1e6).toFixed(1) + "s" } }),
+      yAxis: axis({ type: "category", data: lanes,
+        axisLabel: { width: 130, overflow: "truncate", color: v => LANE_COLOR[v] || "#c9d4e0", formatter: v => LANE_SHORT[v] || v } }),
+      visualMap: { min: 0, max: 1, calculable: true, orient: "horizontal", left: "center", bottom: 0,
+        text: ["满载", "空泡"], textStyle: { color: "#9aa7b8", fontSize: 10 },
+        inRange: { color: ["#f85149", "#e8833a", "#caa53d", "#2f6f4f", "#21402f"] } },
+      series: [{ type: "heatmap", data, progressive: 2400, itemStyle: { borderColor: "#0d1117", borderWidth: 0.5 } }],
     };
   }
-  function freqLine(freq) {
+  // 100% stacked band over the 3 step-partitioning tracks (Computing + 未掩盖通信 +
+  // Free sum to ~1). Total "Communication" is excluded — it overlaps Computing and
+  // would push the stack past 100%; the comm lane in the heatmap already shows it.
+  function overlapBand(tl) {
+    const ob = tl.overlap_bins || [];
+    if (!ob.length) return { xAxis: {}, yAxis: {}, series: [] };
+    const byTrack = {}; ob.forEach(t => { byTrack[t.track] = t.occupancy; });
+    const order = ["Computing", "Communication(Not Overlapped)", "Free"].filter(k => byTrack[k]);
+    if (!order.length) return { xAxis: {}, yAxis: {}, series: [] };
+    const n = byTrack[order[0]].length;
+    const cats = byTrack[order[0]].map((_, i) => i);
+    const series = order.map(k => ({
+      name: OV_LABEL[k] || k, type: "bar", stack: "ov", barWidth: "100%",
+      itemStyle: { color: OV_COLOR[k] || "#888", borderWidth: 0 }, data: byTrack[k],
+    }));
     return {
-      tooltip: Object.assign({ trigger: "axis", formatter: p => `${(p[0].data[0]/1e6).toFixed(2)}s<br/><b>${p[0].data[1]} MHz</b>` }, tooltipBase),
-      grid: { left: 10, right: 16, top: 14, bottom: 28, containLabel: true },
-      xAxis: axis({ type: "value", name: "s", axisLabel: { formatter: v => (v/1e6).toFixed(1) } }),
+      animation: false,
+      tooltip: Object.assign({ trigger: "axis", axisPointer: { type: "shadow" }, formatter: ps => {
+        const t = (ps[0].dataIndex * tl.bin_us / 1e6).toFixed(2);
+        const rows = ps.filter(p => p.data > 0.005).map(p => `${p.marker}${p.seriesName} ${(p.data * 100).toFixed(0)}%`).join("<br/>");
+        return `t=${t}s<br/>${rows || "—"}`;
+      } }, tooltipBase),
+      legend: { data: order.map(k => OV_LABEL[k] || k), top: 0, right: 10, itemWidth: 10, itemHeight: 10, itemGap: 12, textStyle: { color: "#9aa7b8", fontSize: 11 } },
+      grid: Object.assign({ top: 30, bottom: 26 }, TL_GX),
+      xAxis: axis({ type: "category", data: cats, boundaryGap: true,
+        axisLabel: { interval: Math.floor(n / 10), formatter: i => (i * tl.bin_us / 1e6).toFixed(1) + "s" } }),
+      yAxis: axis({ type: "value", min: 0, max: 1, axisLabel: { formatter: v => (v * 100).toFixed(0) + "%" } }),
+      series,
+    };
+  }
+  function freqLine(freq, span_us) {
+    return {
+      tooltip: Object.assign({ trigger: "axis", formatter: p => `${(p[0].data[0] / 1e6).toFixed(2)}s<br/><b>${p[0].data[1]} MHz</b>` }, tooltipBase),
+      grid: Object.assign({ top: 16, bottom: 26 }, TL_GX),
+      xAxis: axis({ type: "value", name: "s", min: 0, max: span_us, axisLabel: { formatter: v => (v / 1e6).toFixed(1) } }),
       yAxis: axis({ type: "value", name: "MHz", scale: true }),
       series: [{ type: "line", showSymbol: false, smooth: true, areaStyle: { opacity: .12 }, lineStyle: { color: "#5ee0b8" }, itemStyle: { color: "#5ee0b8" },
-        data: freq.map(f => [f.t_us, f.mhz]) }],
+        data: (freq || []).map(f => [f.t_us, f.mhz]) }],
     };
   }
 
