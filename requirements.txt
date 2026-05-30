@@ -1,0 +1,6 @@
+# LLMInsight runtime dependencies.
+# Server (http.server), LLM client (urllib), and report export use only the
+# Python standard library — the two packages below are for data parsing/metrics.
+# Tested on Python 3.13 with the versions noted; older 2.x/1.26+ also work.
+pandas>=2.0
+numpy>=1.26

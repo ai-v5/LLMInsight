@@ -1,0 +1,35 @@
+# --- Secrets & sensitive data (NEVER commit) ---
+secret/
+*.key
+api_key*.txt
+
+# --- Profiling raw data (large / sensitive) ---
+*ASCEND_PROFILER_OUTPUT*/
+*.pb
+*.db
+
+# --- Runtime artifacts (restart_insight.sh) ---
+insight.log
+.insight.pid
+
+# --- Caches / build artifacts ---
+.llminsight_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Scratch / smoke scripts (underscore-prefixed, any language) ---
+scripts/_*
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Node (frontend uses CDN, but ignore just in case) ---
+node_modules/
