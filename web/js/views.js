@@ -606,10 +606,12 @@
           axisLine: { show: false }, axisTick: { show: false },
           axisLabel: { show: false }, splitLine: { show: false },
         }));
-        // visible area line (silent: lets the full-height catcher own the hover)
+        // visible area line (silent: lets the full-height catcher own the hover).
+        // smooth:false — utilization is a per-bin step quantity; splining it rounds
+        // off the real sawtooth bursts and can dip below the true value between peaks.
         series.push({
           name: L.label, type: "line", xAxisIndex: i, yAxisIndex: i, silent: true,
-          showSymbol: false, smooth: true, lineStyle: { width: 1.4, color: L.color },
+          showSymbol: false, smooth: false, lineStyle: { width: 1.4, color: L.color },
           itemStyle: { color: L.color }, areaStyle: { opacity: .18, color: L.color },
           data: L.series.map((v, k) => [+(k * binMs).toFixed(2), +(v * 100).toFixed(1)]),
         });
