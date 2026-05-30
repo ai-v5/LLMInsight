@@ -107,13 +107,23 @@
 
   function hbar(cats, vals, name, opts) {
     opts = opts || {};
+    // opts.note: optional per-bar text (aligned with cats/vals order) appended to
+    // BOTH the right-side bar label and the tooltip — e.g. "MFU 56→70, MBU 2→3".
+    // Widen the right margin when present so the longest bar's note doesn't clip.
+    const noteRev = opts.note ? opts.note.slice().reverse() : null;
     return {
-      grid: { left: 8, right: 60, top: 10, bottom: 24, containLabel: true },
-      tooltip: Object.assign({ trigger: "axis", axisPointer: { type: "shadow" }, formatter: p => `${p[0].name}<br/><b>${opts.fmt ? opts.fmt(p[0].value) : p[0].value}</b>` }, tooltipBase),
+      grid: { left: 8, right: opts.note ? 188 : 60, top: 10, bottom: 24, containLabel: true },
+      tooltip: Object.assign({ trigger: "axis", axisPointer: { type: "shadow" }, formatter: p => {
+        const d = p[0], n = noteRev && noteRev[d.dataIndex];
+        return `${d.name}<br/><b>${opts.fmt ? opts.fmt(d.value) : d.value}</b>${n ? `<br/>${n}` : ""}`;
+      } }, tooltipBase),
       xAxis: axis({ type: "value", name }),
       yAxis: axis({ type: "category", data: cats.slice().reverse(), axisLabel: { color: "#c9d4e0", width: 150, overflow: "truncate" } }),
       series: [{ type: "bar", data: vals.slice().reverse().map((v, i) => ({ value: v, itemStyle: opts.color ? { color: opts.color.slice().reverse()[i] } : undefined })),
-        barWidth: "62%", label: { show: true, position: "right", color: "#9aa7b8", formatter: p => opts.fmt ? opts.fmt(p.value) : p.value } }]
+        barWidth: "62%", label: { show: true, position: "right", color: "#9aa7b8", formatter: p => {
+          const base = opts.fmt ? opts.fmt(p.value) : p.value, n = noteRev && noteRev[p.dataIndex];
+          return n ? `${base}  ${n}` : `${base}`;
+        } } }]
     };
   }
 
@@ -133,11 +143,17 @@
       const f = x => (x == null ? "—" : Math.round(x * 100));
       return `${f(b)}→${f(a)}`;
     };
-    const gainCell = t => {
+    // "MFU 56→70, MBU 2→3" — the post-optimization deltas, reused by the table
+    // cell, the headroom bar's right label, and its tooltip.
+    const changeStr = t => {
       const segs = [];
       if (t.mfu != null && t.mfu_after != null) segs.push(`MFU ${arrow(t.mfu, t.mfu_after)}`);
       if (t.mbu != null && t.mbu_after != null) segs.push(`MBU ${arrow(t.mbu, t.mbu_after)}`);
-      const tail = segs.length ? ` <span style="color:var(--text-dim)">（${segs.join(", ")}）</span>` : "";
+      return segs.join(", ");
+    };
+    const gainCell = t => {
+      const c = changeStr(t);
+      const tail = c ? ` <span style="color:var(--text-dim)">（${c}）</span>` : "";
       return `<strong style="color:var(--accent-2)">${fmt.us(t.reclaim_us)}</strong>${tail}`;
     };
     const optRows = top.map(t =>
@@ -169,7 +185,7 @@
     charts([
       { id: "ef-roof", option: roofline(ef.scatter, chip) },
       { id: "ef-waste", option: hbar(top.map(t => t.name.slice(0, 26)), top.map(t => t.reclaim_us), "可回收 us",
-          { fmt: v => fmt.us(v), color: top.map(t => boundColor(t.bound)) }) },
+          { fmt: v => fmt.us(v), color: top.map(t => boundColor(t.bound)), note: top.map(changeStr) }) },
     ]);
   };
   function boundColor(b) { return { compute: "#79b8ff", memory: "#e3b341", vector: "#5ee0b8" }[b] || "#6b7888"; }
