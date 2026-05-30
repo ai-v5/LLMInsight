@@ -116,6 +116,60 @@ def _estimate_attention_flops(shapes_in, shapes_out, is_grad: bool) -> Optional[
     return fwd * (_ATTN_BWD_FWD_RATIO if is_grad else 1.0)
 
 
+# Per-element FLOP factors for VECTOR-core (AI Vector Core / MIX_AIV) kernels.
+# Unlike matmul / fused-attention (cube, modeled exactly from shapes), elementwise /
+# normalization / optimizer kernels have no closed-form FLOP count, so we approximate
+# work = factor·N, where N is the dominant tensor's element count. Factors are
+# engineering estimates of arithmetic ops per element and are meant to be tuned; they
+# drive the VECTOR-peak MFU and the max(vector-compute, memory) headroom floor.
+# Pure data-movement ops (Cast / ZerosLike / Copy / Reshape / …) do ~0 arithmetic →
+# factor 0 → left unmodeled for FLOPs, so they stay honestly memory-bound (MBU only),
+# exactly as before.
+_VECTOR_FLOPS_PER_ELEM: Dict[str, float] = {
+    # elementwise arithmetic — ~1 op/element
+    "Mul": 1.0, "Muls": 1.0, "Add": 1.0, "Adds": 1.0, "Sub": 1.0, "Subs": 1.0,
+    "Div": 1.0, "RealDiv": 1.0, "Neg": 1.0, "Reciprocal": 1.0, "Sqrt": 1.0,
+    "Rsqrt": 1.0, "Square": 1.0, "Abs": 1.0, "Maximum": 1.0, "Minimum": 1.0,
+    "Sign": 1.0, "AddcmulV2": 3.0, "Axpy": 2.0,
+    # activations / transcendentals — a few ops/element
+    "Exp": 2.0, "Log": 2.0, "Sigmoid": 4.0, "Tanh": 4.0, "Gelu": 8.0,
+    "GeluGrad": 10.0, "Silu": 4.0, "SwiGlu": 8.0, "Swiglu": 8.0, "SwiGluGrad": 12.0,
+    "FastGelu": 8.0, "Relu": 1.0,
+    # softmax / reductions
+    "Softmax": 5.0, "SoftmaxV2": 5.0, "LogSoftmaxV2": 6.0, "SoftmaxGrad": 6.0,
+    "ReduceSum": 1.0, "ReduceMean": 1.0,
+    # normalization
+    "RmsNorm": 5.0, "RmsNormGrad": 10.0, "LayerNorm": 6.0, "LayerNormV2": 6.0,
+    "LayerNormGrad": 12.0,
+    # optimizer step (per-parameter update math)
+    "ApplyAdamWV2": 11.0, "ApplyAdamW": 11.0, "ApplyAdam": 11.0,
+    # pure data movement / format — no arithmetic (stay memory-only)
+    "Cast": 0.0, "ZerosLike": 0.0, "Zero": 0.0, "Fill": 0.0, "Fills": 0.0,
+    "Copy": 0.0, "BroadcastTo": 0.0, "Transpose": 0.0, "Slice": 0.0,
+    "StridedSlice": 0.0, "Concat": 0.0, "Gather": 0.0, "GatherV2": 0.0,
+    "Reshape": 0.0,
+}
+# Any vector kernel not listed: assume light elementwise (1 op/element). Safe — low
+# arithmetic intensity keeps it memory-bound, so this only ADDS a (small) MFU read
+# and never raises the headroom floor above the memory roofline.
+_VECTOR_DEFAULT_FPE = 1.0
+
+
+def _estimate_vector_flops(op_type: str, shapes_in, shapes_out) -> Optional[float]:
+    """Approx FLOPs for a VECTOR-core kernel = factor(op_type)·N, where N is the
+    largest tensor's element count (the elementwise working set). Returns None for
+    zero-arithmetic ops (factor 0) so they stay memory-only — identical to before."""
+    factor = _VECTOR_FLOPS_PER_ELEM.get(op_type, _VECTOR_DEFAULT_FPE)
+    if factor <= 0:
+        return None
+    n = 0
+    for s in list(shapes_in) + list(shapes_out):
+        n = max(n, numel(s))
+    if n <= 0:
+        return None
+    return factor * n
+
+
 def _bound_from_ratios(mac, mte2, vec) -> str:
     mac = mac or 0.0
     mte2 = mte2 or 0.0
@@ -216,16 +270,22 @@ def compute_efficiency(prof) -> Dict[str, Any]:
 
         is_matmul = types[i] in MATMUL_TYPES
         is_attention = types[i] in ATTENTION_TYPES
+        core_u = str(core[i]).upper()
+        is_vector = "VECTOR" in core_u or "AIV" in core_u
         if is_matmul:
             flops = _estimate_matmul_flops(shapes_in)
         elif is_attention:
             flops = _estimate_attention_flops(
                 shapes_in, shapes_out, types[i] in ATTENTION_GRAD_TYPES)
+        elif is_vector:
+            # VECTOR-core elementwise / norm / optimizer kernels: approximate FLOPs so
+            # their MFU reads against the VECTOR peak and the headroom floor respects
+            # max(vector-compute, memory) — not the memory roofline alone, which
+            # over-states reclaim for FLOP-dense vector ops (AdamW / RMSNorm / …).
+            flops = _estimate_vector_flops(types[i], shapes_in, shapes_out)
         else:
             flops = None
 
-        core_u = str(core[i]).upper()
-        is_vector = "VECTOR" in core_u or "AIV" in core_u
         # Peak routing: matmul / fused-attention kernels run on the CUBE unit;
         # pure vector-core ops (AI_VECTOR_CORE / MIX_AIV: RMSNorm/SwiGlu/Cast/...)
         # run on the VECTOR unit; any other AI_CORE / MIX_AIC op defaults to cube.
@@ -258,7 +318,10 @@ def compute_efficiency(prof) -> Dict[str, Any]:
             ideal_us = max(t_compute, t_mem) * 1e6
             efficiency = max(0.0, min(ideal_us / d_us, 1.0)) if d_us > 0 else 0.0
             wasted_us = max(0.0, d_us - ideal_us)
-            bound = ("compute" if t_compute >= t_mem else "memory") if flops is not None else "memory"
+            if flops is not None and t_compute >= t_mem:
+                bound = "vector" if is_vector else "compute"  # vector→green, cube→blue
+            else:
+                bound = "memory"
             if ceiling:
                 floor_us = max(t_compute / ceiling, t_mem) * 1e6
                 reclaim_us = max(0.0, d_us - floor_us)
