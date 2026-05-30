@@ -30,6 +30,9 @@
     const dmfu = (nv) => (smfu == null || nv == null) ? "—" : (nv - smfu >= 0 ? "+" : "-") + fmt.mfu(Math.abs(nv - smfu));
     // step column shows time saved vs base, in seconds (— at base, which saves nothing).
     const saved = (us) => us > 0 ? "-" + (us / 1e6).toFixed(2) + " s" : "—";
+    // combined row is the summary line, so its MFU shows the absolute reached value
+    // plus the gain in parens — e.g. 76.7%（+35.8%）— unlike the delta-only lever rows.
+    const mfuAbsDelta = (nv) => nv == null ? "—" : `${fmt.mfu(nv)}（${dmfu(nv)}）`;
     const baseRow = theo.available
       ? `<tr style="color:var(--text-dim)"><td></td><td>当前（base）</td><td>—</td><td>—</td><td>${fmt.mfu(smfu)}</td></tr>`
       : "";
@@ -53,7 +56,7 @@
         + `<td><strong>已启用组合 (${ticked.length}/${levers.length})</strong></td>`
         + `<td style="color:var(--accent-2)"><strong>${saved(saveUs)}</strong></td>`
         + `<td style="color:var(--accent-2)">${saveUs > 0 ? "-" + fmt.pct(savePct) : "—"}</td>`
-        + `<td style="color:var(--accent)"><strong>${dmfu(newMfu)}</strong></td>`;
+        + `<td style="color:var(--accent)"><strong>${mfuAbsDelta(newMfu)}</strong></td>`;
     };
     root.innerHTML = `
       <div class="grid cols-6">${cards.join("")}</div>
