@@ -280,11 +280,14 @@ DTYPE_BYTES = {
     "INT32": 4, "UINT32": 4,
     "INT16": 2, "UINT16": 2,
     "INT8": 1, "UINT8": 1, "BOOL": 1,
+    # Low-precision 950-series modes. FP4 is sub-byte (two elements per byte).
+    "FP8": 1, "HIF8": 1, "HIFLOAT8": 1, "FLOAT8": 1, "FLOAT8_E4M3": 1, "FLOAT8_E5M2": 1,
+    "FP4": 0.5, "FLOAT4": 0.5, "FLOAT4_E2M1": 0.5,
     "": 2,
 }
 
 
-def dtype_bytes(dtype: str) -> int:
+def dtype_bytes(dtype: str) -> float:
     if not dtype:
         return 2
     return DTYPE_BYTES.get(dtype.strip().upper(), 2)

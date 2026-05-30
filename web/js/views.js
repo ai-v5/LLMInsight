@@ -112,51 +112,56 @@
     const optRows = top.map(t =>
       `<tr><td class="mono">${esc(t.name)}</td><td><span class="tag">${esc(t.bound || "—")}</span></td><td>${fmt.us(t.dur_us)}</td><td>${gainCell(t)}</td></tr>`).join("");
     const byType = ef.by_type.slice(0, 20).map(t =>
-      `<tr><td>${esc(t.type)}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td><td>${t.mfu != null ? fmt.mfu(t.mfu) : "—"}</td><td>${t.mbu != null ? fmt.mfu(t.mbu) : "—"}</td><td>${fmt.us(t.wasted_us)}</td></tr>`).join("");
+      `<tr><td>${esc(t.type)}</td><td class="mono">${t.dtype ? esc(t.dtype) : "—"}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td><td>${t.mfu != null ? fmt.mfu(t.mfu) : "—"}</td><td>${t.mbu != null ? fmt.mfu(t.mbu) : "—"}</td><td>${fmt.us(t.wasted_us)}</td></tr>`).join("");
     root.innerHTML = `
       ${banner(chip.calibrated ? "warn" : "info", "🎯",
-        `芯片：<strong>${esc(chip.name)}</strong> · 假设峰值 BF16 <strong>${chip.peak_bf16_tflops.toFixed(0)} TFLOPS</strong> · HBM <strong>${chip.hbm_tbps.toFixed(2)} TB/s</strong>` +
+        `芯片：<strong>${esc(chip.name)}</strong> · CUBE BF16 <strong>${(chip.cube_bf16_tflops||chip.peak_bf16_tflops).toFixed(0)}</strong> / VECTOR BF16 <strong>${(chip.vector_bf16_tflops||0).toFixed(0)}</strong> TFLOPS · HBM <strong>${chip.hbm_tbps.toFixed(2)} TB/s</strong>` +
         (chip.hbm_capacity_gb ? ` · 显存 <strong>${chip.hbm_capacity_gb.toFixed(0)} GB</strong>` : "") +
         (chip.calibrated
           ? `　|　⚠️ 实测峰值 <strong>${chip.observed_peak_tflops.toFixed(0)} TFLOPS</strong> &gt; 假设值 → 已按实测校准（设真实 SKU 峰值可覆盖）`
           : `（${chip.assumed ? "参考峰值；顶部可切换芯片，或在 config.ChipSpec 校正" : "实测"}）`) +
         `　|　matmul MFU ≈ <strong>${ef.matmul_mfu != null ? (ef.matmul_mfu*100).toFixed(0)+"%" : "—"}</strong>　|　建模 kernel ${fmt.int(ef.kernels_with_flops)}/${fmt.int(ef.kernels_total)}`)}
       <div class="grid cols-2">
-        ${panel("Roofline", "点 = kernel；x = 算术强度 (FLOP/Byte)，y = 达成算力 (TFLOPS)，对照屋顶线", `<div id="ef-roof" class="chart tall"></div>`)}
+        ${panel("Roofline（dtype 归一化）", "点 = kernel；x = 归一化算术强度 (AI / 脊点，1 = 拐点)，y = MFU (占该算子 cube/vector 峰值 %)；单条屋顶线让不同 dtype 同台对照", `<div id="ef-roof" class="chart tall"></div>`)}
         ${panel("优化空间排行 (Top 15)", "按「实测 − Roofline 理想」的浪费时间排序；颜色 = 瓶颈类型", `<div id="ef-waste" class="chart tall"></div>`)}
       </div>
       ${panel("优化候选明细 (Top 15)", "优化收益 = 实测 − Roofline 理想；括号为达到理想耗时后的 MFU / MBU", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>算子</th><th>瓶颈</th><th>当前耗时</th><th>优化收益</th></tr></thead><tbody>${optRows}</tbody></table></div>`, "span-2")}
-      ${panel("按算子类型 MFU / MBU / 浪费", "", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>Count</th><th>耗时</th><th>MFU</th><th>MBU</th><th>浪费(vs理想)</th></tr></thead><tbody>${byType}</tbody></table></div>`, "span-2")}`;
+      ${panel("按算子类型 MFU / MBU / 浪费（MFU 按各算子 cube/vector 峰值）", "", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>dtype</th><th>Count</th><th>耗时</th><th>MFU</th><th>MBU</th><th>浪费(vs理想)</th></tr></thead><tbody>${byType}</tbody></table></div>`, "span-2")}`;
     charts([
-      { id: "ef-roof", option: roofline(ef.scatter, chip, ef.roofline_ridge_ai) },
+      { id: "ef-roof", option: roofline(ef.scatter, chip) },
       { id: "ef-waste", option: hbar(top.map(t => t.name.slice(0, 26)), top.map(t => t.wasted_us), "浪费 us",
           { fmt: v => fmt.us(v), color: top.map(t => boundColor(t.bound)) }) },
     ]);
   };
   function boundColor(b) { return { compute: "#79b8ff", memory: "#e3b341", vector: "#5ee0b8" }[b] || "#6b7888"; }
 
-  function roofline(scatter, chip, ridge) {
-    const peak = chip.effective_peak_tflops || chip.peak_bf16_tflops, bw = chip.hbm_tbps; // TFLOPS, TB/s
-    scatter = scatter || [];
-    const xs = scatter.map(s => s.ai).filter(x => x > 0);
-    const xmin = Math.max(0.1, Math.min.apply(null, xs.concat([ridge])) / 3);
-    const xmax = Math.max(xmin * 10, Math.max.apply(null, xs.concat([ridge])) * 3);
-    const memRoof = [[xmin, xmin * bw], [ridge, peak]];
-    const compRoof = [[ridge, peak], [xmax, peak]];
+  // Double-normalized Roofline: each point sits at (AI/ridge, MFU%) against its
+  // OWN routed cube/vector dtype peak, so a single universal roof y=min(x,1)·100%
+  // serves every dtype — bf16 / fp8 / fp4 GEMMs compare on one efficiency axis.
+  function roofline(scatter, chip) {
+    scatter = (scatter || []).filter(s => s.x_norm > 0 && s.mfu != null);
+    const xs = scatter.map(s => s.x_norm);
+    const ys = scatter.map(s => s.mfu * 100).filter(y => y > 0);
+    const xmin = xs.length ? Math.min(0.5, Math.min.apply(null, xs) / 2) : 0.1;
+    const xmax = xs.length ? Math.max(2, Math.max.apply(null, xs) * 2) : 10;
+    const ymin = ys.length ? Math.max(0.05, Math.min.apply(null, ys) / 2) : 1;
+    const ymax = ys.length ? Math.max(120, Math.max.apply(null, ys) * 1.1) : 120;
+    const roof = [[xmin, xmin * 100], [1, 100], [xmax, 100]];  // y = min(x,1)·100%
     const byBound = {};
-    scatter.forEach(s => { (byBound[s.bound] = byBound[s.bound] || []).push([s.ai, s.tflops, s.name, s.dur_us]); });
+    scatter.forEach(s => { (byBound[s.bound] = byBound[s.bound] || []).push(
+      [s.x_norm, s.mfu * 100, s.name, s.dur_us, s.dtype, s.ai, s.tflops, s.peak_tflops]); });
     const series = Object.keys(byBound).map(b => ({
       name: b, type: "scatter", symbolSize: d => Math.min(22, 4 + Math.sqrt(d[3]) / 6),
       itemStyle: { color: boundColor(b), opacity: .65 }, data: byBound[b],
     }));
-    series.push({ name: "屋顶线", type: "line", data: memRoof.concat(compRoof.slice(1)), showSymbol: false, lineStyle: { color: "#f85149", width: 1.5, type: "dashed" }, tooltip: { show: false }, z: 1 });
+    series.push({ name: "屋顶线", type: "line", data: roof, showSymbol: false, lineStyle: { color: "#f85149", width: 1.5, type: "dashed" }, tooltip: { show: false }, z: 1 });
     return {
       tooltip: Object.assign({ trigger: "item", formatter: p => p.seriesName === "屋顶线" ? "" :
-        `${esc(p.data[2])}<br/>AI=${p.data[0].toFixed(2)} FLOP/B<br/>达成=${p.data[1].toFixed(1)} TFLOPS<br/>耗时=${fmt.us(p.data[3])}<br/>瓶颈: ${p.seriesName}` }, tooltipBase),
+        `${esc(p.data[2])}<br/>dtype=${esc(p.data[4] || "—")}　峰值 ${p.data[7].toFixed(0)} TFLOPS<br/>MFU=${p.data[1].toFixed(1)}%　归一化强度=${p.data[0].toFixed(2)}<br/>AI=${p.data[5].toFixed(2)} FLOP/B　达成=${p.data[6].toFixed(1)} TFLOPS<br/>耗时=${fmt.us(p.data[3])}　瓶颈: ${p.seriesName}` }, tooltipBase),
       legend: { top: 0, textStyle: { color: "#9aa7b8" } },
       grid: { left: 10, right: 20, top: 34, bottom: 36, containLabel: true },
-      xAxis: axis({ type: "log", name: "算术强度 FLOP/Byte", min: xmin, max: xmax }),
-      yAxis: axis({ type: "log", name: "TFLOPS", min: 0.1, max: peak * 1.5 }),
+      xAxis: axis({ type: "log", name: "归一化算术强度 (AI / 脊点)", min: xmin, max: xmax }),
+      yAxis: axis({ type: "log", name: "MFU %（占 dtype 峰值）", min: ymin, max: ymax }),
       series,
       markLine: undefined,
     };
