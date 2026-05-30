@@ -678,6 +678,7 @@
     });
 
     return {
+      animation: false,                                      // 3000-bin util lanes: keep zoom/pan snappy
       tooltip: Object.assign({
         trigger: "item", confine: true,
         formatter: p => {

@@ -288,6 +288,11 @@ class Settings:
     # Cap how many trace events the timeline endpoint streams to the browser.
     timeline_max_slices: int = 4000
     timeline_bins: int = 600
+    # Smart-timeline utilization lanes sample 5x finer than the Timeline page so
+    # the Cube/Vector/HBM/通信 curves reflect real per-burst structure, not a
+    # coarse rolling average. Only affects the utilization series resolution; the
+    # Gantt slice cap (timeline_max_slices) is independent.
+    smart_timeline_bins: int = 3000
 
     def to_dict(self) -> dict:
         return {
