@@ -219,12 +219,19 @@ def hidden_overhead(prof, ov: Dict[str, Any]) -> Dict[str, Any]:
 
     buckets = [
         {
-            "key": "aicpu_dispatch", "domain": "device",
-            "label": "AICPU 通信下发 (HcclLaunchAicpuKernel)",
+            # NOT a separate launch overhead: HcclLaunchAicpuKernel is the AI_CPU
+            # operator that *executes* the collectives (AICPU-unfold), so its time
+            # is the same wall-clock as step_trace "Communication" (here ~100%
+            # Wait). Shown as an operator-view lens but marked non-additive so it
+            # is never summed on top of the 未掩盖通信 bucket (double-count).
+            "key": "aicpu_dispatch", "domain": "device", "additive": False,
+            "label": "AICPU 集合通信执行 (HcclLaunchAicpuKernel · 同段通信不计入合计)",
             "us": round(aicpu_dispatch, 1),
-            "detail": f"device 侧 AI_CPU 通信下发合计 {aicpu_dispatch:,.0f}us，占 step {_pct(aicpu_dispatch, stage)}%",
-            "source": "op_statistic",
-            "suggestion": "EP64 alltoall 启动密集 → 调 HCCL buffsize/通信算法、减少 dispatch 次数、合并下发。",
+            "detail": f"AI_CPU 驱动集合通信合计 {aicpu_dispatch:,.0f}us（占 step {_pct(aicpu_dispatch, stage)}%）。"
+                      "单卡下几乎全为 Wait、Transit≈0 → 这是「未掩盖通信」的算子视角，与 Communication 为同一段时间，"
+                      "已从 Device 合计中剔除以免与未掩盖通信重复计入。",
+            "source": "op_statistic (AI_CPU)",
+            "suggestion": "本质是通信而非下发延迟：优先掩盖到计算下（moe-fb-overlap / 异步通信），再缩短通信本身（HCCL 算法/buffsize、EP 规模）。",
         },
         {
             "key": "comm_not_overlapped", "domain": "device",
@@ -283,7 +290,9 @@ def hidden_overhead(prof, ov: Dict[str, Any]) -> Dict[str, Any]:
             "suggestion": "评估「选择性重计算 / 减少重计算层」做显存↔耗时平衡。",
         },
     ]
-    device_total = sum(b["us"] for b in buckets if b["domain"] == "device" and isinstance(b["us"], (int, float)))
+    device_total = sum(b["us"] for b in buckets
+                       if b["domain"] == "device" and b.get("additive", True)
+                       and isinstance(b["us"], (int, float)))
     host_total = sum(b["us"] for b in buckets if b["domain"] == "host" and isinstance(b["us"], (int, float)))
     return {
         "available": True,
@@ -293,7 +302,8 @@ def hidden_overhead(prof, ov: Dict[str, Any]) -> Dict[str, Any]:
         "stage_us": stage,
         "note": (
             "host 与 device 时间不可直接相加（部分并发/被 blocking 放大）。device 桶与 step 同口径可比；"
-            "host 桶反映下发/同步压力。用于「相对量级与归因」。"
+            "host 桶反映下发/同步压力。AICPU 集合通信执行与「未掩盖通信」为同一段时间，仅作算子视角展示、"
+            "不并入 Device 合计（避免重复计入）。用于「相对量级与归因」。"
         ),
     }
 
@@ -441,6 +451,20 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]
         },
     ]
 
+    # End-to-end (step) MFU + the MFU each what-if would unlock. Useful FLOPs and
+    # the silicon peak are constant, so end-to-end MFU scales inversely with step
+    # time: new_mfu = step_mfu × (stage / new_step). A shorter step ⇒ higher MFU,
+    # which is exactly the payoff of hiding comm / removing bubbles.
+    step_mfu = None
+    if eff.get("available"):
+        useful_flops = eff.get("useful_flops_total")
+        peak_tflops = (eff.get("chip") or {}).get("effective_peak_tflops")
+        if useful_flops and peak_tflops and stage > 0:
+            step_mfu = useful_flops / (peak_tflops * 1e12 * (stage * 1e-6))
+    for w in whatif:
+        w["new_mfu"] = (round(step_mfu * stage / w["new_step_us"], 4)
+                        if (step_mfu and w.get("new_step_us")) else None)
+
     matmul_mfu = eff.get("matmul_mfu") if eff.get("available") else None
     compute_bound_note = None
     if matmul_mfu:
@@ -466,18 +490,6 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]
                 "assumed_peak_tflops": chipinfo.get("peak_bf16_tflops"),
                 "observed_peak_tflops": chipinfo.get("observed_peak_tflops"),
             }
-
-    # End-to-end (step) MFU: total executed matmul+attention FLOPs over the FULL
-    # step wall-clock against the (calibrated) silicon peak. Unlike matmul_mfu —
-    # which divides by matmul *kernel* time and reads ~cube quality — this divides
-    # by the whole step, so 未掩盖通信 + 空泡 directly drag it down. It is the number
-    # one would quote as "训练 MFU". Same single-step basis as compute_bound above.
-    step_mfu = None
-    if eff.get("available"):
-        useful_flops = eff.get("useful_flops_total")
-        peak_tflops = (eff.get("chip") or {}).get("effective_peak_tflops")
-        if useful_flops and peak_tflops and stage > 0:
-            step_mfu = useful_flops / (peak_tflops * 1e12 * (stage * 1e-6))
 
     return {
         "available": True,

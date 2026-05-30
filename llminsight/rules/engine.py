@@ -101,18 +101,34 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
                 {"overlap_rate_pct": overlap, "comm_not_overlapped_pct": cno},
             ))
 
-    # 2. AICPU communication dispatch --------------------------------------
+    # 2. AICPU-driven collective communication (NOT mere launch overhead) ---
+    #    HcclLaunchAicpuKernel is the AI_CPU operator that *executes* the EP64
+    #    collectives in AICPU-unfold mode; its device duration is the time the
+    #    AICPU is occupied inside the collective (here ~100% Wait, Transit≈0),
+    #    i.e. communication wait — not kernel-launch latency. It is the same
+    #    wall-clock as step_trace "Communication", so it must NOT be added on top
+    #    of the 未掩盖通信 bucket (would double-count the same comm).
     aicpu = next((o for o in hot.get("ops", []) if o["type"] == "HcclLaunchAicpuKernel"), None)
     if aicpu and aicpu["ratio"] >= 10:
+        comm_total_us = us.get("communication", 0) or 0
+        share = round(100.0 * aicpu["total_us"] / comm_total_us, 1) if comm_total_us else None
+        share_txt = f"约占其 {share}%" if share is not None else "为同一段时间"
         cards.append(_card(
-            "aicpu_dispatch", "high", "下发",
-            f"AICPU 通信下发开销过高：HcclLaunchAicpuKernel 占 device {aicpu['ratio']}%（单次 max {aicpu['max_us']/1000:.0f}ms）",
-            "EP64 alltoall 集合通信启动密集，通信由 AI_CPU 下发，单次启动开销巨大。",
-            "增大 HCCL_BUFFSIZE、调整 HCCL 通信算法 / 切分比；减少 dispatch 次数（合并通信、"
-            "增大 token 批次）；评估 EP 规模。",
-            "降低下发占比，directly 压缩 device 关键路径（当前占比 ~28%）。",
+            "aicpu_dispatch", "high", "通信",
+            f"AICPU 集合通信执行占 device {aicpu['ratio']}%：HcclLaunchAicpuKernel（单次 max {aicpu['max_us']/1000:.0f}ms，主要是通信等待）",
+            "HcclLaunchAicpuKernel 是 AICPU 展开模式下驱动 EP64 alltoall / allGather 等集合通信的 AI_CPU 算子，"
+            f"其 device 时长是 AICPU 占用在集合通信中的时间，而非内核启动 / 下发延迟（单次达 {aicpu['max_us']/1000:.0f}ms，"
+            "远超任何下发耗时量级）。本次单卡采集中集合通信 Transit≈0、几乎 100% 为 Wait，故这段时间主要是"
+            f"「等待对端 / 同步」。它与 step 的 Communication 实为同一段时间（{share_txt}），切勿与「未掩盖通信」相加。",
+            "① 优先把这段通信掩盖到计算下（核对 --moe-fb-overlap / --moe-permutation-async-comm，扩大重叠窗口）；"
+            "② 缩短通信本身（HCCL 算法 / HCCL_BUFFSIZE、评估 EP 规模、增大 token 批次以减少 collective 次数）；"
+            "③ 仅 per-collective 的调度部分才与「减少下发次数」相关。需多卡复采才能区分「等待对端」与「真实传输」。",
+            "该时间与未掩盖通信高度重叠，收益已计入「通信掩盖」What-if（勿重复计入）；"
+            "若多卡确认为负载不均，均衡后可压缩其中的等待。",
             0.85,
-            {"ratio_pct": aicpu["ratio"], "count": aicpu["count"], "max_us": aicpu["max_us"]},
+            {"ratio_pct": aicpu["ratio"], "count": aicpu["count"], "max_us": aicpu["max_us"],
+             "total_us": aicpu["total_us"], "communication_us": comm_total_us,
+             "share_of_communication_pct": share, "transit_dominated": False, "wait_dominated": True},
         ))
 
     # 3 & 11. capture checkup / host sync blocking -------------------------
@@ -236,10 +252,12 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
     if ho.get("available"):
         cards.append(_card(
             "hidden_overhead_ledger", "medium", "隐性开销",
-            "隐性开销总账：下发 / 等待·同步 / 未掩盖通信 / 格式转换·初始化 / 动态 shape / 空泡 合计可观",
-            "多项分散开销单看不起眼，合计是吞吐杀手；其中 device 侧可直接计入 step，host 侧反映下发/同步压力。",
-            "按总账逐项减负：通信掩盖→AICPU 下发→空泡→格式转换；host 侧关 blocking、降下发次数。",
-            "总账用于排优先级，避免只盯单点热点而漏掉合计更大的隐性项。",
+            "隐性开销总账：未掩盖通信 / 等待·同步 / 空泡 / 格式转换·初始化 / 动态 shape 合计可观",
+            "多项分散开销单看不起眼，合计是吞吐杀手；device 侧可直接计入 step，host 侧反映下发/同步压力。"
+            "注意通信以两种视角出现——step 的「未掩盖通信」= 算子表的「AICPU 集合通信执行」，为同一段时间，"
+            "Device 合计只计一次（AICPU 执行项不并入合计）。",
+            "按总账逐项减负：通信掩盖→空泡→格式转换/初始化；host 侧关 blocking、降下发次数。",
+            "总账用于排优先级，避免只盯单点热点而漏掉合计更大的隐性项；亦避免把同段通信重复计入。",
             0.7,
             {"device_total_us": ho.get("device_total_us"), "host_total_us": ho.get("host_total_us"),
              "buckets": [{"key": b["key"], "us": b["us"], "domain": b["domain"]} for b in ho.get("buckets", [])]},

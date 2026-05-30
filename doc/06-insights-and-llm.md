@@ -24,7 +24,7 @@
 | # | id | 严重度 | 类别 | 触发条件（要点） | 置信 |
 |---|---|---|---|---|---|
 | 1 | `comm_not_overlapped` | high | 通信 | 未掩盖通信 ≥10% 或 重叠率 <40% | 0.9 |
-| 2 | `aicpu_dispatch` | high | 下发 | `HcclLaunchAicpuKernel` 占比 ≥10% | 0.85 |
+| 2 | `aicpu_dispatch` | high | 通信 | `HcclLaunchAicpuKernel` 占比 ≥10%（AICPU 驱动的集合通信执行，≈通信本身、非下发延迟） | 0.85 |
 | 3/11 | `capture_blocking` | high | 采集体检 | `ASCEND_LAUNCH_BLOCKING=1` | 1.0 |
 | 4 | `dynamic_shape` | medium | 动态shape | MaskedSelect/NonZero host 累计 >50ms | 0.7 |
 | 5a | `low_efficiency_ops` | medium | 算子效率 | 存在 `wasted_us>0` 的 Top 候选 | 0.6 |
@@ -41,7 +41,7 @@
 ### 代表性洞察（样例命中）
 
 - **通信掩盖严重不足**：未掩盖 26% / 重叠率 12.6% → 核对 `--moe-fb-overlap` / `--moe-permutation-async-comm`，扩大重叠窗口。
-- **AICPU 通信下发过高**：`HcclLaunchAicpuKernel` 占 device 28% → EP64 alltoall 启动密集；调 `HCCL_BUFFSIZE` / 通信算法、减少 dispatch、评估 EP 规模。
+- **AICPU 集合通信执行占比高（≈通信，非下发延迟）**：`HcclLaunchAicpuKernel` 占 device 28%，是 AICPU 展开模式下**驱动 EP64 集合通信的 AI_CPU 算子**，其时长≈ Communication 的 72%、单卡几乎全是 Wait（单次 max 280ms 远超下发量级）→ 与「未掩盖通信」为同一段时间，**勿重复计入**。优先掩盖到计算下，再缩短通信本身（`HCCL_BUFFSIZE` / 通信算法、EP 规模、增大 token 批次减少 collective 次数）。
 - **采集配置扭曲**：检测 `ASCEND_LAUNCH_BLOCKING=1` → 标注 host 同步数字「不可直接采信」，给正确复采方式（置信度 1.0）。
 - **芯片峰值假设偏低**：实测 matmul 峰值 ≈432 > 假设 376 TFLOPS → 已按实测上界校准；建议在 `ChipSpec` 填真实 SKU 峰值。
 

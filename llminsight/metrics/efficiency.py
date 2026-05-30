@@ -309,7 +309,20 @@ def compute_efficiency(prof) -> Dict[str, Any]:
 
     top_opt = sorted(rows, key=lambda r: r["wasted_us"], reverse=True)[:25]
     for r in top_opt:
-        for k in ("flops", "bytes", "mfu", "mbu", "ai", "achieved_tflops"):
+        # Post-optimization MFU/MBU: closing the wasted gap means running at ideal_us
+        # instead of dur. MFU and MBU are both inversely proportional to duration
+        # (FLOPs/bytes are fixed), so they scale by dur/ideal = 1/efficiency; the
+        # bound dimension reaches ~100% (capped). Lets a row read "MFU 73→100".
+        eff_r = r.get("efficiency")
+        if eff_r and eff_r > 0:
+            scale = 1.0 / eff_r
+            r["mfu_after"] = min(r["mfu"] * scale, 1.0) if r.get("mfu") else None
+            r["mbu_after"] = min(r["mbu"] * scale, 1.0) if r.get("mbu") else None
+        else:
+            r["mfu_after"] = None
+            r["mbu_after"] = None
+        for k in ("flops", "bytes", "mfu", "mbu", "ai", "achieved_tflops",
+                  "mfu_after", "mbu_after"):
             if isinstance(r.get(k), float):
                 r[k] = round(r[k], 4) if r[k] and r[k] < 1 else (round(r[k], 1) if r[k] else r[k])
 

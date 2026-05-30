@@ -89,7 +89,7 @@ bound = "compute" if t_compute >= t_mem else "memory"
 
 | 桶 | 域 | 来源 | 典型现象 |
 |---|---|---|---|
-| AICPU 通信下发 | device | op_statistic | `HcclLaunchAicpuKernel` 占 28% |
+| AICPU 集合通信执行（同段，不计入合计） | device | op_statistic (AI_CPU) | `HcclLaunchAicpuKernel` 占 28%，≈ Communication 的 72% |
 | 通信未掩盖 | device | step_trace + comm + kernel | 直接计入 step |
 | 空泡 / Free | device | step_trace | ≈18.56% |
 | 格式转换 / 内存初始化 | device | op_statistic | Cast/ZerosLike/TensorMove |
@@ -99,6 +99,8 @@ bound = "compute" if t_compute >= t_mem else "memory"
 | 重计算 | config | 训练脚本 | `--recompute-granularity full` |
 
 > **口径警示**：host 与 device 时间**不可直接相加**（部分并发 / 被 blocking 放大）。device 桶与 step 同口径可比；host 桶反映下发 / 同步压力。用于「相对量级与归因」。
+>
+> **避免重复计入**：`HcclLaunchAicpuKernel` 是 AICPU 展开模式下**驱动集合通信的 AI_CPU 算子**，其 device 时长 = AICPU 占用在 collective 中的时间（本数据几乎 100% Wait、Transit≈0）—— 它**就是通信本身**（≈ Communication 的 72%），并非内核启动 / 下发延迟（单次 max 280ms 远超任何下发量级）。因此它与「通信未掩盖」是**同一段时间的两种视角**，标记为 `additive:false`、**不并入 Device 合计**，仅作算子视角展示。
 
 ## 4.6 attribution · 模型结构归因（H3）
 
