@@ -24,25 +24,51 @@
       metric("端到端 MFU", fmt.mfu(smfu), { tone: smfu == null ? undefined : (smfu >= 0.5 ? "good" : smfu >= 0.3 ? "warn" : "bad"), foot: "有效FLOPs /(峰值×step)", barPct: smfu != null ? smfu * 100 : undefined }),
       metric("Step 时间", r.step_time_s + " s", { foot: "Stage = " + fmt.us(u.stage) }),
     ];
+    const levers = theo.available ? theo.whatif : [];
+    const baseStep = theo.available ? theo.current_step_us : 0;
     const baseRow = theo.available
-      ? `<tr style="color:var(--text-dim)"><td>当前（base）</td><td>${fmt.us(theo.current_step_us)}</td><td>—</td><td>${fmt.mfu(smfu)}</td></tr>`
+      ? `<tr style="color:var(--text-dim)"><td></td><td>当前（base）</td><td>${fmt.us(baseStep)}</td><td>—</td><td>${fmt.mfu(smfu)}</td></tr>`
       : "";
-    const whatifRows = (theo.available ? theo.whatif : []).map(w =>
-      `<tr><td>${esc(w.scenario)}</td><td>${fmt.us(w.new_step_us)}</td><td style="color:var(--accent-2)">-${fmt.pct(w.save_pct)}</td><td style="color:var(--accent)">${fmt.mfu(w.new_mfu)}</td></tr>`).join("");
+    const leverRows = levers.map(w =>
+      `<tr><td style="text-align:center"><input type="checkbox" class="wi-lever" style="accent-color:#5ee0b8;cursor:pointer" data-save="${w.save_us}" checked></td>`
+      + `<td>${esc(w.scenario)}</td><td>${fmt.us(w.new_step_us)}</td>`
+      + `<td style="color:var(--accent-2)">-${fmt.pct(w.save_pct)}</td>`
+      + `<td style="color:var(--accent)">${fmt.mfu(w.new_mfu)}</td></tr>`).join("");
     const cb = theo.available && theo.compute_bound;
+    // "已启用组合" row recomputed from whichever levers are ticked. 未掩盖通信 and Free
+    // are disjoint slices of Stage, so savings add; MFU = smfu · stage / new_step.
+    const recomputeCombined = () => {
+      const ticked = Array.from(document.querySelectorAll("input.wi-lever")).filter(el => el.checked);
+      const saveUs = ticked.reduce((s, el) => s + (+el.dataset.save || 0), 0);
+      const newStep = Math.max(baseStep - saveUs, 0);
+      const savePct = baseStep ? (saveUs / baseStep * 100) : 0;
+      const newMfu = (smfu && newStep > 0) ? smfu * baseStep / newStep : null;
+      const row = document.getElementById("wi-combined");
+      if (row) row.innerHTML =
+        `<td style="text-align:center;color:var(--accent-2)">✓</td>`
+        + `<td><strong>已启用组合 (${ticked.length}/${levers.length})</strong></td>`
+        + `<td><strong>${fmt.us(newStep)}</strong></td>`
+        + `<td style="color:var(--accent-2)">${saveUs > 0 ? "-" + fmt.pct(savePct) : "—"}</td>`
+        + `<td style="color:var(--accent)"><strong>${fmt.mfu(newMfu)}</strong></td>`;
+    };
     root.innerHTML = `
       <div class="grid cols-6">${cards.join("")}</div>
       <div class="grid cols-2" style="margin-top:16px">
         ${panel("Step 时间构成", "Computing / 未掩盖通信 / Free（单位 us）", `<div id="ov-donut" class="chart"></div>`)}
-        ${panel("理论上界 & What-if 收益模拟", "基于 step 时间构成的优化上界（用于排优先级，非精确预测）",
-          `<table class="tbl"><thead><tr><th>场景</th><th>预计 step</th><th>节省</th><th>端到端 MFU</th></tr></thead><tbody>${baseRow}${whatifRows || `<tr><td colspan=4 class="empty">—</td></tr>`}</tbody></table>
+        ${panel("理论上界 & What-if 收益模拟", "每项为单独启用的收益；勾选后底部「已启用组合」实时显示叠加效果",
+          `<table class="tbl"><thead><tr><th style="width:38px">启用</th><th>优化项</th><th>单独预计 step</th><th>单独节省</th><th>端到端 MFU</th></tr></thead>`
+          + `<tbody>${theo.available ? (baseRow + leverRows + `<tr id="wi-combined" style="border-top:2px solid rgba(94,224,184,.35)"></tr>`) : `<tr><td colspan=5 class="empty">—</td></tr>`}</tbody></table>
            ${cb ? (cb.peak_underestimated
              ? banner("warn","⚠️", `matmul 实测 MFU <strong>${cb.matmul_mfu_pct}%</strong> &gt; 100% → 假设芯片峰值偏低，请在 config.ChipSpec 校正。`)
              : `<div class="note">matmul MFU ≈ <strong>${cb.matmul_mfu_pct}%</strong>；计算理想 ${fmt.us(cb.ideal_matmul_us)}，余量 ${fmt.us(cb.headroom_us)}。${cb.calibrated ? `（芯片峰值按实测 ${cb.observed_peak_tflops} TFLOPS 校准，假设 ${cb.assumed_peak_tflops != null ? cb.assumed_peak_tflops.toFixed(0) : "—"}）` : ""}</div>`) : ""}
-           <div class="note" style="font-size:11px;line-height:1.55;margin-top:8px;border-top:1px solid rgba(255,255,255,.06);padding-top:6px">💡 优化优先级：「通信完全掩盖」通常是最大单项 → 先做计算-通信重叠（--moe-fb-overlap / 异步通信），再压同步空泡，二者组合收益最高。　⚠️ 表中「通信完全掩盖」与算子页 <strong>HcclLaunchAicpuKernel</strong> 是同一段集合通信（单卡几乎全是 Wait，非下发延迟），勿重复计入。</div>`)}
+           <div class="note" style="font-size:11px;line-height:1.55;margin-top:8px;border-top:1px solid rgba(255,255,255,.06);padding-top:6px">💡 优化优先级：「通信完全掩盖」通常是最大单项 → 先做计算-通信重叠（--moe-fb-overlap / 异步通信），再压同步空泡。底部「已启用组合」随勾选实时计算叠加后的 step 与端到端 MFU。　⚠️ 「通信完全掩盖」与算子页 <strong>HcclLaunchAicpuKernel</strong> 是同一段集合通信（单卡几乎全是 Wait，非下发延迟），勿重复计入。</div>`)}
       </div>
       <div class="note">${esc(theo.available ? theo.note : "")}</div>`;
     charts([{ id: "ov-donut", option: donut(ov.composition.map(c => ({ name: c.name, value: c.us, pct: c.pct }))) }]);
+    if (theo.available) {
+      document.querySelectorAll("input.wi-lever").forEach(el => el.addEventListener("change", recomputeCombined));
+      recomputeCombined();
+    }
   };
 
   function donut(items) {

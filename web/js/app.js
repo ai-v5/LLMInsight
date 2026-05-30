@@ -3,8 +3,8 @@
   const { api, apiPost, clearCache, fmt, esc } = LI;
 
   const NAV = [
+    { id: "smart_timeline",  label: "智能时间线",  ico: "🎞️", star: true, sub: "算子泳道 Gantt · MFU/MBU 悬停 · 利用率泳道" },
     { id: "overview",        label: "总览",        ico: "📊", sub: "Step 时间构成 · 关键比率 · 理论上界" },
-    { id: "replay",          label: "全训练回放",  ico: "🎬", star: true, sub: "回放式时间轴（骨架）" },
     { id: "hotspots",        label: "算子热点",    ico: "🔥", sub: "Top 算子 · 按 Core 类型聚合" },
     { id: "efficiency",      label: "算子效率",    ico: "🎯", sub: "MFU / MBU / Roofline · 优化余量" },
     { id: "communication",   label: "通信分析",    ico: "🔗", sub: "集合通信 · 等待占比 · 带宽" },
@@ -12,8 +12,8 @@
     { id: "attribution",     label: "结构归因",    ico: "🧩", sub: "MLA / MoE / Norm / Optimizer" },
     { id: "memory",          label: "显存洞察",    ico: "🧠", sub: "内存-时间权衡（待采集）" },
     { id: "timeline",        label: "时间线",      ico: "📽️", sub: "泳道占用 · 频率 · 切片" },
-    { id: "smart_timeline",  label: "智能时间线",  ico: "🎞️", star: true, sub: "算子泳道 Gantt · MFU/MBU 悬停 · 利用率泳道" },
     { id: "insights",        label: "LLM 洞察",    ico: "🤖", star: true, sub: "诊断卡片 + 可选 LLM 叙述" },
+    { id: "replay",          label: "全训练回放",  ico: "🎬", star: true, sub: "回放式时间轴（骨架）" },
   ];
 
   const rendered = {};

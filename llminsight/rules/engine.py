@@ -222,16 +222,20 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
 
     # 9. theoretical bound + what-if ---------------------------------------
     if theo.get("available"):
-        best = max(theo.get("whatif", []), key=lambda w: w.get("save_pct", 0), default=None)
-        if best:
+        comb = theo.get("whatif_combined")
+        head = comb or max(theo.get("whatif", []),
+                           key=lambda w: w.get("save_pct", 0), default=None)
+        if head:
+            mfu_txt = (f"，端到端 MFU 升至约 {round(head['new_mfu'] * 100, 1)}%"
+                       if head.get("new_mfu") else "")
             cards.append(_card(
                 "theoretical_whatif", "info", "理论上界",
-                f"理论上界与 What-if：最优场景「{best['scenario']}」可省约 {best['save_pct']}% step",
+                f"理论上界与 What-if：全部优化项叠加可省约 {head['save_pct']}% step{mfu_txt}",
                 "由 step 时间构成推导优化上界：通信掩盖、消除空泡为最大两块收益来源。",
-                "按 What-if 收益排序优化优先级；先攻通信掩盖（最大单项），再压空泡。",
-                f"综合 What-if 上界最高约 {best['save_pct']}%（{best.get('basis','')}）。",
+                "按 What-if 收益排序优化优先级；先攻通信掩盖（最大单项），再压空泡，可逐项勾选看叠加收益。",
+                f"综合 What-if 上界约 {head['save_pct']}%（{head.get('basis','')}）。",
                 0.7,
-                {"whatif": theo.get("whatif")},
+                {"whatif": theo.get("whatif"), "whatif_combined": comb},
             ))
 
     # 10. parallelism advisor ----------------------------------------------

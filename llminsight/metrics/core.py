@@ -427,8 +427,13 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]
     comm_no = u["comm_not_overlapped"]
     free = u["free"]
 
+    # Atomic optimization levers (not preset combos): 未掩盖通信 and Free are the two
+    # disjoint, independently-removable slices of Stage. Each row reports the gain of
+    # enabling *only* that lever; the UI lets the user tick any subset and the combined
+    # effect is derived from these (see whatif_combined). A stable `id` keys each lever.
     whatif = [
         {
+            "id": "comm_overlap",
             "scenario": "通信完全掩盖（未掩盖通信→0）",
             "new_step_us": round(computing + free, 1),
             "save_us": round(comm_no, 1),
@@ -436,18 +441,12 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]
             "basis": "把 Communication(Not Overlapped) 全部与计算重叠。",
         },
         {
+            "id": "free_zero",
             "scenario": "消除空泡（Free→0）",
             "new_step_us": round(computing + comm_no, 1),
             "save_us": round(free, 1),
             "save_pct": _pct(free, stage),
             "basis": "理想下发与同步，Free 归零（上界估计）。",
-        },
-        {
-            "scenario": "通信掩盖 + 空泡减半",
-            "new_step_us": round(computing + free * 0.5, 1),
-            "save_us": round(comm_no + free * 0.5, 1),
-            "save_pct": _pct(comm_no + free * 0.5, stage),
-            "basis": "组合优化的综合估计。",
         },
     ]
 
@@ -464,6 +463,20 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]
     for w in whatif:
         w["new_mfu"] = (round(step_mfu * stage / w["new_step_us"], 4)
                         if (step_mfu and w.get("new_step_us")) else None)
+
+    # Combined what-if: every lever enabled at once. Since the levers are disjoint
+    # slices of Stage their savings add, and the floor is pure Computing. This is the
+    # true upper bound and the default for the UI's "已启用组合" row (all ticked).
+    combined_save_us = comm_no + free
+    combined_step_us = max(stage - combined_save_us, 0.0)
+    whatif_combined = {
+        "save_us": round(combined_save_us, 1),
+        "save_pct": _pct(combined_save_us, stage),
+        "new_step_us": round(combined_step_us, 1),
+        "new_mfu": (round(step_mfu * stage / combined_step_us, 4)
+                    if (step_mfu and combined_step_us > 0) else None),
+        "basis": "全部优化项叠加（各项互不重叠，收益可加）。",
+    }
 
     matmul_mfu = eff.get("matmul_mfu") if eff.get("available") else None
     compute_bound_note = None
@@ -495,6 +508,7 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]
         "available": True,
         "current_step_us": round(stage, 1),
         "whatif": whatif,
+        "whatif_combined": whatif_combined,
         "compute_bound": compute_bound_note,
         "step_mfu": round(step_mfu, 4) if step_mfu else None,
         "note": "What-if 为基于 step 时间构成的上界估算，用于优化排序，非精确预测。芯片峰值为假设值。",
