@@ -1,10 +1,12 @@
 """Smart timeline: profiler-style operator Gantt + utilization lanes.
 
-Replicates the LLMperf timeline paradigm in ECharts: device/communication trace
-slices are laid out as horizontal bars across **stream lanes** (Cube / Flash-
-Attention / Vector / MIX / Communication / other), and three time-aligned
-utilization lanes (compute / HBM bandwidth / communication) are stacked below.
-显存容量 / 主机内存 are surfaced as "待采集" placeholders (need memory_record.csv).
+Replicates the LLMperf timeline paradigm in ECharts as ONE merged multi-lane
+chart on a single time axis: four utilization lanes (Cube / Vector / HBM / 通信,
+each 0–100%) stacked on top, and device/communication trace slices laid out as
+horizontal Gantt bars across **stream lanes** (Cube / FlashAttention / Vector /
+MIX / Communication / other) below. Notify_Wait synchronization stalls are
+excluded from every lane. 显存容量 / 主机内存 are surfaced as "待采集"
+placeholders (need memory_record.csv).
 
 Two layers, mirroring the chip-switch design elsewhere:
   * chip-independent **geometry** — one streaming pass over trace_view.json,
@@ -41,7 +43,13 @@ STREAMS = [
 DEVICE_PROC = "Ascend Hardware"
 COMM_PROC = "Communication"
 
-_GEOM_VERSION = "v1"  # bump when geometry/stream logic changes (cache invalidation)
+_GEOM_VERSION = "v2"  # bump when geometry/stream logic changes (cache invalidation)
+
+
+def _is_notify_wait(name: str) -> bool:
+    """Synchronization stalls (HCCL Notify_Wait / NOTIFY_WAIT_SQE) — pure idle
+    waiting, excluded from every lane so they don't inflate comm / occupancy."""
+    return "notify_wait" in (name or "").lower()
 
 
 def _stream_from_meta(typ: Optional[str], core: Optional[str]) -> str:
@@ -117,6 +125,7 @@ def _build_geometry(prof, kindex: Dict[str, Any]) -> Dict[str, Any]:
     flops_sum = [0.0] * bins
     bytes_sum = [0.0] * bins
     comm_occ = [0.0] * bins
+    vec_occ = [0.0] * bins  # vector ops have no FLOP model → time occupancy
 
     def spread(arr: List[float], s: float, e: float, total: float) -> None:
         """Distribute `total` across the time bins [s,e] proportionally."""
@@ -156,6 +165,8 @@ def _build_geometry(prof, kindex: Dict[str, Any]) -> Dict[str, Any]:
         if not ts or dur <= 0:
             continue
         name = str(ev.get("name") or "")
+        if _is_notify_wait(name):
+            continue  # synchronization idle — not a real lane occupant
         ki = kindex.get(name)
 
         if is_comm:
@@ -179,6 +190,8 @@ def _build_geometry(prof, kindex: Dict[str, Any]) -> Dict[str, Any]:
             else:
                 typ = core = dtype = None
                 stream = _stream_from_name(name)
+            if stream == "vector":
+                spread(vec_occ, ts, ts + dur, dur)
 
         slices.append({
             "name": name,           # FULL name (kept for the chip-overlay join)
@@ -216,6 +229,7 @@ def _build_geometry(prof, kindex: Dict[str, Any]) -> Dict[str, Any]:
         "flops_sum": [round(v, 1) for v in flops_sum],
         "bytes_sum": [round(v, 1) for v in bytes_sum],
         "comm_occ": [round(v, 3) for v in comm_occ],
+        "vec_occ": [round(v, 3) for v in vec_occ],
         "total_slices": total_slices,
         "shown_slices": len(slices),
         "matched_dev": matched_dev,
@@ -245,6 +259,7 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]:
     flops_sum = geom["flops_sum"]
     bytes_sum = geom["bytes_sum"]
     comm_occ = geom["comm_occ"]
+    vec_occ = geom.get("vec_occ", [0.0] * bins)
 
     if effective_peak > 0 and bin_s > 0:
         compute_series = [round(_clamp01(flops_sum[b] / (bin_s * effective_peak)), 4)
@@ -258,6 +273,8 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]:
         hbm_series = [0.0] * bins
     comm_series = ([round(_clamp01(comm_occ[b] / bin_us), 4) for b in range(bins)]
                    if bin_us > 0 else [0.0] * bins)
+    vector_series = ([round(_clamp01(vec_occ[b] / bin_us), 4) for b in range(bins)]
+                     if bin_us > 0 else [0.0] * bins)
 
     # per-slice representative MFU/MBU (by name) + truncated display name
     out_slices: List[Dict[str, Any]] = []
@@ -284,15 +301,18 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]:
                    if geom.get("span_us") else None)
 
     utilization = [
-        {"key": "compute", "label": "算力 (Cube)", "available": True, "unit": "%",
-         "color": "#3fb6e0", "series": compute_series,
-         "note": "Σ建模FLOPs /（桶时长 × 有效峰值）"},
-        {"key": "hbm_bw", "label": "显存带宽 (HBM)", "available": True, "unit": "%",
-         "color": "#d29922", "series": hbm_series,
+        {"key": "cube", "label": "Cube 利用率", "available": True, "unit": "%",
+         "color": "#4f9fe0", "series": compute_series,
+         "note": "Σ建模FLOPs /（桶时长 × Cube 有效峰值）"},
+        {"key": "vector", "label": "Vector 利用率", "available": True, "unit": "%",
+         "color": "#4caf50", "series": vector_series,
+         "note": "Vector 泳道每桶时间占用率（向量算子无 FLOP 模型，按占用计）"},
+        {"key": "hbm_bw", "label": "HBM 利用率", "available": True, "unit": "%",
+         "color": "#e3b341", "series": hbm_series,
          "note": "Σ读写字节 /（桶时长 × HBM 带宽）"},
-        {"key": "comm", "label": "通信 (HCCL)", "available": True, "unit": "%",
-         "color": "#f85149", "series": comm_series,
-         "note": "Communication 泳道每桶时间覆盖率"},
+        {"key": "comm", "label": "通信 利用率", "available": True, "unit": "%",
+         "color": "#f0655c", "series": comm_series,
+         "note": "Communication 泳道每桶时间占用率（已剔除 Notify_Wait 同步等待）"},
         {"key": "hbm_cap", "label": "显存容量 (HBM)", "available": False,
          "reason": "待 memory_record.csv 采集（与「显存洞察」页口径一致）"},
         {"key": "host_mem", "label": "主机内存", "available": False,
@@ -314,10 +334,14 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]:
         "total_slices": geom["total_slices"],
         "shown_slices": geom["shown_slices"],
         "note": (
-            "算子按 stream 泳道铺成 Gantt；悬停显示 名称/类型/Core/start/dur，"
+            "单张大图、统一时间轴：上方 Cube / Vector / HBM / 通信 四条利用率泳道，"
+            "下方算子按 stream 泳道铺成 Gantt。悬停算子显示 名称/类型/Core/start/dur，"
             "命中按名 join 的 kernel_index 时追加 MFU/MBU/dtype（按名平均，参考值）。"
-            "利用率：算力 = Σ建模FLOPs /（桶 × 有效峰值），显存带宽 = Σ字节 /（桶 × HBM 带宽），"
-            "通信 = 每桶时间覆盖率。显存容量 / 主机内存待 memory_record.csv 采集。"
+            "利用率口径：Cube = Σ建模FLOPs /（桶 × Cube 有效峰值），"
+            "Vector = 向量泳道每桶时间占用率（无 FLOP 模型），"
+            "HBM = Σ字节 /（桶 × HBM 带宽），通信 = Communication 泳道每桶时间占用率。"
+            "Notify_Wait 同步等待已全程剔除，不进入任何泳道。"
+            "显存容量 / 主机内存待 memory_record.csv 采集。"
             f"切片共 {geom['total_slices']} 个，按时长下采样保留最长 {geom['shown_slices']} 个。"
         ),
     }
