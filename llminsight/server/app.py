@@ -64,8 +64,8 @@ class AppState:
         t0 = time.time()
         try:
             self.prof = load_profile(SETTINGS.data_dir)
-            self.metrics = compute_all(self.prof)
             self.capture = read_capture_config()
+            self.metrics = compute_all(self.prof, self.capture)
             self.cards = run_rules(self.metrics, self.capture)
             self.ready = True
         except Exception as exc:  # surface load failures to the UI
@@ -93,7 +93,7 @@ class AppState:
             eff.pop("kernel_index", None)
             self.metrics["efficiency"] = eff
             self.metrics["theoretical"] = metrics_core.theoretical(
-                self.prof, self.metrics.get("overview", {}), eff)
+                self.prof, self.metrics.get("overview", {}), eff, self.capture)
             self.metrics["meta"] = {**self.metrics.get("meta", {}),
                                     "settings": SETTINGS.to_dict()}
             self.cards = run_rules(self.metrics, self.capture)

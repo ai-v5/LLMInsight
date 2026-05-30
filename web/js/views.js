@@ -70,6 +70,7 @@
              : `<div class="note">matmul MFU ≈ <strong>${cb.matmul_mfu_pct}%</strong>${cb.ceiling_based ? "（≈ 天花板）" : ""}；算子达天花板后计算 ${fmt.us(cb.ideal_matmul_us)}，可回收 ${fmt.us(cb.headroom_us)}。${cb.calibrated ? `（芯片峰值按实测 ${cb.observed_peak_tflops} TFLOPS 校准，假设 ${cb.assumed_peak_tflops != null ? cb.assumed_peak_tflops.toFixed(0) : "—"}）` : ""}</div>`) : ""}
            <div class="note" style="font-size:11px;line-height:1.55;margin-top:8px;border-top:1px solid rgba(255,255,255,.06);padding-top:6px">💡 优化优先级：「通信完全掩盖」通常是最大单项 → 先做计算-通信重叠（--moe-fb-overlap / 异步通信），再压同步空泡。「算子极致优化」按各算子 MFU 天花板（matmul 95% / FA 85% / FAG 70%）收口，已达标算子不再投入——单项收益小而精，而非冲到 100% 的虚高。底部「已启用组合」随勾选实时计算叠加后的 step 与端到端 MFU。　⚠️ 「通信完全掩盖」与算子页 <strong>HcclLaunchAicpuKernel</strong> 是同一段集合通信（单卡几乎全是 Wait，非下发延迟），勿重复计入。</div>`)}
       </div>
+      ${theo.available ? `<div style="margin-top:16px">${whatifFloor(theo)}</div>` : ""}
       <div class="note">${esc(theo.available ? theo.note : "")}</div>`;
     charts([{ id: "ov-donut", option: donut(ov.composition.map(c => ({ name: c.name, value: c.us, pct: c.pct }))) }]);
     if (theo.available) {
@@ -77,6 +78,48 @@
       recomputeCombined();
     }
   };
+
+  // What-if 严谨性分析 · 能否减到 0 / 现实地板 —— renders theo.realistic, which the
+  // backend derived from the LOADED profile (floors are formulas over measured slices;
+  // 失真 caveats are conditioned on this capture's blocking / single-card state). Same
+  // structured payload the shareable report renders, so web & report stay in lockstep.
+  function whatifFloor(theo) {
+    if (!theo || !theo.available) return "";
+    const r = theo.realistic || {};
+    const levers = r.levers || [];
+    if (!levers.length) return "";
+    const miniH = (t) => `<div style="font-size:11.5px;font-weight:600;color:var(--text-mut);margin-bottom:5px">${esc(t)}</div>`;
+    const ul = (xs) => `<ul style="margin:0;padding-left:17px;font-size:12px;line-height:1.65">${(xs || []).map(x => `<li>${esc(x)}</li>`).join("")}</ul>`;
+    const items = levers.map(lv => {
+      const zero = lv.can_reach_zero ? "可减到 0" : "不能减到 0（有不可消除下限）";
+      const caveats = (lv.caveats || []).map(c => banner("warn", "⚠️", esc(c))).join("");
+      const line =
+        `实测 <strong>${fmt.us(lv.measured_us)}</strong>（step ${fmt.pct(lv.measured_pct)}）`
+        + ` → 现实地板 ≈ <strong style="color:var(--accent-2)">${fmt.us(lv.floor_us)}</strong>（step ${fmt.pct(lv.floor_pct)}）`
+        + ` · 可回收 ≈ <strong style="color:var(--accent)">${fmt.us(lv.recoverable_us)}</strong>`
+        + `（区间 ${fmt.us(lv.recoverable_lo_us)}–${fmt.us(lv.recoverable_hi_us)}）`
+        + ` · 优化后 step ${fmt.us(lv.new_step_us)} / 端到端 MFU ${fmt.mfu(lv.new_mfu)}`;
+      return `<div style="margin:13px 0;padding-top:11px;border-top:1px solid var(--border)">`
+        + miniH(`${lv.title} · 能减到 0？${zero}`)
+        + `<div class="sub" style="margin-bottom:7px">${esc(lv.floor_basis)}</div>`
+        + `<div style="margin-bottom:9px;font-size:12.5px">${line}</div>`
+        + `<div class="grid cols-2">`
+        + `<div>${miniH("优化方法")}${ul(lv.methods)}</div>`
+        + `<div>${miniH("为何不能到 0 / 下限来源")}${ul(lv.reasons)}</div>`
+        + `</div>${caveats}</div>`;
+    }).join("");
+    const c = r.combined || {};
+    const comb = (c && c.new_step_us != null)
+      ? banner("info", "🎯",
+          `<strong>综合现实地板</strong>：优化后 step ≈ <strong>${fmt.us(c.new_step_us)}</strong>`
+          + `（区间 ${fmt.us(c.new_step_hi_us)}–${fmt.us(c.new_step_lo_us)}），`
+          + `端到端 MFU ≈ <strong>${fmt.mfu(c.new_mfu)}</strong>`
+          + `（${fmt.mfu(c.new_mfu_lo)}–${fmt.mfu(c.new_mfu_hi)}），`
+          + `省 ≈ <strong>${fmt.pct(c.recoverable_pct)}</strong>。${esc(c.basis)}`)
+      : "";
+    return panel("What-if 严谨性分析 · 能否减到 0 / 现实地板（基于当前加载的 profiling）",
+      r.note || "", items + comb);
+  }
 
   function donut(items) {
     return {

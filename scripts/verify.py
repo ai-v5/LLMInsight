@@ -130,6 +130,69 @@ def main():
     chk_true("end-to-end step MFU present", theo_m.get("step_mfu") is not None,
              f"(step_mfu={theo_m.get('step_mfu')})")
 
+    print("\n== what-if 现实地板 (realistic floor, derived from LOADED profile) ==")
+    # The 严谨性分析 ("can it reach 0? if not, how far?") must be computed from the
+    # loaded profile's measured slices, NOT a static sample. Floors are formulas over
+    # the measured values; 失真 caveats are conditioned on THIS capture's blocking /
+    # single-card state. Web panel + shareable report both render this same payload.
+    rz = theo_m.get("realistic") or {}
+    rlevers = rz.get("levers") or []
+    rl_by = {l.get("id"): l for l in rlevers}
+    chk_true("realistic block present", bool(rz), f"(keys={list(rz.keys())})")
+    chk_true("realistic has comm+free(+op) levers",
+             "comm_overlap" in rl_by and "free_zero" in rl_by,
+             f"(ids={set(rl_by)})")
+    chk_true("no lever can reach 0 (every slice keeps an irreducible floor)",
+             rlevers and all(l.get("can_reach_zero") is False for l in rlevers))
+    # comm/free floors are formulas over the LOADED measured slices: 0 < floor < measured,
+    # so the recoverable is a strict positive fraction, never the whole slice → 0.
+    for lid in ("comm_overlap", "free_zero"):
+        lv = rl_by.get(lid) or {}
+        chk_true(f"{lid}: 0 < floor < measured (cannot zero out)",
+                 lv.get("floor_us") is not None and lv.get("measured_us") is not None
+                 and 0 < lv["floor_us"] < lv["measured_us"],
+                 f"(floor={lv.get('floor_us')} measured={lv.get('measured_us')})")
+        chk_true(f"{lid}: recoverable > 0 with lo<=mid<=hi band",
+                 (lv.get("recoverable_us") or 0) > 0
+                 and lv.get("recoverable_lo_us") <= lv.get("recoverable_us") <= lv.get("recoverable_hi_us"),
+                 f"(lo={lv.get('recoverable_lo_us')} mid={lv.get('recoverable_us')} hi={lv.get('recoverable_hi_us')})")
+    # op-余量 lever mirrors the efficiency ceiling reclaim (compute is useful work, not →0)
+    op_rl = rl_by.get("op_ceiling")
+    chk_true("op_ceiling realistic lever mirrors efficiency reclaim",
+             op_rl is not None
+             and abs((op_rl.get("recoverable_us") or 0) - (oco.get("total_reclaim_us") or 0)) <= 1.0,
+             f"(lever={op_rl.get('recoverable_us') if op_rl else None} reclaim={oco.get('total_reclaim_us')})")
+    # 失真 caveats are CONDITIONED on this capture (single-card + blocking both on here).
+    chk_true("realistic flags track capture (single_card & blocking on)",
+             rz.get("single_card") is True and rz.get("blocking") is True,
+             f"(single_card={rz.get('single_card')} blocking={rz.get('blocking')})")
+    comm_cav = " ".join((rl_by.get("comm_overlap") or {}).get("caveats") or [])
+    free_cav = " ".join((rl_by.get("free_zero") or {}).get("caveats") or [])
+    chk_true("comm lever caveats note single-card + blocking distortion",
+             "communication_matrix" in comm_cav and "ASCEND_LAUNCH_BLOCKING" in comm_cav,
+             f"(caveats={(rl_by.get('comm_overlap') or {}).get('caveats')})")
+    chk_true("free lever caveat notes blocking distortion",
+             "ASCEND_LAUNCH_BLOCKING" in free_cav)
+    # combined realistic floor: a genuine floor ABOVE the physical "→0" upper bound, and
+    # strictly BELOW the base step (it does recover real time). Bands ordered.
+    rcomb = rz.get("combined") or {}
+    chk_true("realistic combined present (step+MFU+band)",
+             rcomb.get("new_step_us") is not None and rcomb.get("new_mfu") is not None
+             and rcomb.get("new_step_lo_us") is not None and rcomb.get("new_step_hi_us") is not None,
+             f"(combined={rcomb})")
+    chk_true("realistic floor sits between →0 upper bound and base step",
+             comb.get("new_step_us") is not None
+             and comb["new_step_us"] < (rcomb.get("new_step_us") or 0) < u["stage"],
+             f"(upper={comb.get('new_step_us')} realistic={rcomb.get('new_step_us')} base={u['stage']})")
+    chk_true("realistic band ordered (hi=fastest <= mid <= lo=slowest)",
+             rcomb.get("new_step_hi_us") <= rcomb.get("new_step_us") <= rcomb.get("new_step_lo_us"),
+             f"(hi={rcomb.get('new_step_hi_us')} mid={rcomb.get('new_step_us')} lo={rcomb.get('new_step_lo_us')})")
+    chk_true("realistic combined recoverable == Σ lever recoverables (disjoint slices add)",
+             abs((rcomb.get("recoverable_us") or 0) - sum(l.get("recoverable_us") or 0 for l in rlevers)) <= 1.0,
+             f"(combined={rcomb.get('recoverable_us')} sum={sum(l.get('recoverable_us') or 0 for l in rlevers)})")
+    chk("realistic combined new_step us (~1.90s floor)", rcomb.get("new_step_us"), 1900187.0, 5000.0)
+    chk("realistic combined recoverable %", rcomb.get("recoverable_pct"), 39.23, 0.5)
+
     print("\n== rule engine (insight cards) ==")
     # 11 under the default 950DT: peak == observed ceiling, so the peak_underestimated
     # calibration advisory does not fire (it does under the 910B what-if — see below).
