@@ -18,8 +18,8 @@ import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Dict
-from urllib.parse import urlparse
+from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse, parse_qs
 
 from ..config import SETTINGS, set_chip
 from ..parser import load_profile
@@ -44,35 +44,160 @@ _CONTENT_TYPES = {
     ".map": "application/json",
 }
 
+# A directory "looks like" an Ascend profiler output if it carries any of these.
+# Used both to gate POST /api/load and to flag candidates in the GET /api/browse
+# directory listing (so the UI can highlight loadable folders).
+_PROFILE_MARKERS = (
+    "kernel_details.csv", "trace_view.json", "step_trace_time.csv",
+    "op_statistic.csv", "operator_details.csv", "communication.json",
+)
+
+
+def _looks_like_profile_dir(path: str) -> bool:
+    try:
+        return any(os.path.isfile(os.path.join(path, f)) for f in _PROFILE_MARKERS)
+    except OSError:
+        return False
+
+
+def _list_drives() -> List[str]:
+    """Windows drive roots (C:\\, D:\\ …) so the picker can jump across volumes.
+    Empty on POSIX, where everything hangs off '/'."""
+    if os.name != "nt":
+        return []
+    import string
+    return [f"{c}:\\" for c in string.ascii_uppercase if os.path.isdir(f"{c}:\\")]
+
+
+def _browse_dir(raw: str) -> Dict[str, Any]:
+    """List the SUBDIRECTORIES of a server-side path (files are irrelevant to a
+    directory chooser). Marks each child that looks like a profiler output. This
+    is a localhost dev tool, so browsing the local filesystem is intentional and
+    unsandboxed (unlike the static file server). Errors are returned, not raised."""
+    if not raw:
+        parent = os.path.dirname(SETTINGS.data_dir)
+        raw = parent if os.path.isdir(parent) else os.path.expanduser("~")
+    path = os.path.normpath(os.path.expanduser(str(raw).strip()))
+    if not os.path.isdir(path):
+        return {"ok": False, "error": f"目录不存在：{path}"}
+    try:
+        names = []
+        with os.scandir(path) as it:
+            for e in it:
+                try:
+                    if e.is_dir():
+                        names.append(e.name)
+                except OSError:
+                    continue
+    except PermissionError:
+        return {"ok": False, "error": f"无权限读取：{path}"}
+    except OSError as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    names.sort(key=str.lower)
+    dirs = [{"name": n, "path": os.path.join(path, n),
+             "is_profile": _looks_like_profile_dir(os.path.join(path, n))}
+            for n in names]
+    parent = os.path.dirname(path)
+    if parent == path:  # filesystem / drive root has no parent
+        parent = None
+    return {
+        "ok": True,
+        "path": path,
+        "parent": parent,
+        "sep": os.sep,
+        "is_profile_dir": _looks_like_profile_dir(path),
+        "drives": _list_drives(),
+        "dirs": dirs,
+    }
+
 
 class AppState:
-    """Loads the profile + computes everything once; routes read from here."""
+    """Holds the parsed profile + computed metrics for the *currently loaded*
+    directory. Loading is lazy: the app starts idle and the user picks a
+    profiling directory in the UI (POST /api/load), which (re)builds in place."""
 
     def __init__(self) -> None:
+        # status: idle (awaiting selection) | loading | ready | error
+        self.status = "idle"
         self.ready = False
-        self.error: str | None = None
+        self.error: Optional[str] = None
         self.metrics: Dict[str, Any] = {}
         self.cards: list = []
         self.capture: Dict[str, Any] = {}
         self.load_seconds = 0.0
+        self.loaded_dir: Optional[str] = None  # dir whose data is currently held
         # The parsed profile is retained (the 104MB trace is streamed, never held,
         # so this is cheap) to allow chip-switch recomputation without a reload.
         self.prof: Any = None
         self.lock = threading.Lock()
+        self._load_lock = threading.Lock()  # serializes load triggers
 
-    def build(self) -> None:
+    def build(self, data_dir: str) -> None:
+        """(Re)load a profiling directory and recompute everything. Blocking —
+        callers wanting a responsive socket should go through start_load()."""
         t0 = time.time()
+        SETTINGS.data_dir = data_dir
+        # Drop any prior data up front so a failed/partial load can never serve
+        # stale numbers from the previous directory.
+        self.status = "loading"
+        self.ready = False
+        self.error = None
+        self.metrics = {}
+        self.cards = []
+        self.prof = None
         try:
-            self.prof = load_profile(SETTINGS.data_dir)
+            self.prof = load_profile(data_dir)
             self.metrics = compute_all(self.prof)
             self.capture = read_capture_config()
             self.cards = run_rules(self.metrics, self.capture)
+            self.loaded_dir = data_dir
             self.ready = True
+            self.status = "ready"
         except Exception as exc:  # surface load failures to the UI
             self.error = f"{type(exc).__name__}: {exc}"
+            self.status = "error"
             raise
         finally:
             self.load_seconds = round(time.time() - t0, 2)
+
+    def start_load(self, data_dir: str) -> Dict[str, Any]:
+        """Validate + kick off a background (re)build. Returns immediately so the
+        HTTP socket stays responsive; the frontend polls /api/meta for progress."""
+        data_dir = os.path.normpath(os.path.expanduser(str(data_dir or "").strip()))
+        if not data_dir or not os.path.isdir(data_dir):
+            return {"ok": False, "error": f"目录不存在：{data_dir}"}
+        if not _looks_like_profile_dir(data_dir):
+            return {"ok": False, "error": ("该目录下找不到 profiling 文件"
+                    "（需含 kernel_details.csv / trace_view.json / step_trace_time.csv 等之一）")}
+        with self._load_lock:
+            if self.status == "loading":
+                return {"ok": False, "error": "正在加载中，请稍候"}
+            self.status = "loading"
+            self.ready = False
+            self.error = None
+        threading.Thread(target=self._load_worker, args=(data_dir,), daemon=True).start()
+        return {"ok": True, "loading": True, "dir": data_dir}
+
+    def _load_worker(self, data_dir: str) -> None:
+        try:
+            self.build(data_dir)
+        except Exception:
+            pass  # status/error already recorded by build()
+
+    def reset(self) -> Dict[str, Any]:
+        """Drop loaded data and return to the idle (awaiting-selection) state."""
+        with self._load_lock:
+            if self.status == "loading":
+                return {"ok": False, "error": "正在加载中，无法重置"}
+            self.status = "idle"
+            self.ready = False
+            self.error = None
+            self.metrics = {}
+            self.cards = []
+            self.prof = None
+            self.loaded_dir = None
+            self.load_seconds = 0.0
+        return {"ok": True}
 
     def switch_chip(self, key: str) -> Dict[str, Any]:
         """Re-point the chip preset and recompute only the chip-dependent
@@ -116,11 +241,13 @@ STATE = AppState()
 def _meta() -> Dict[str, Any]:
     return {
         "ready": STATE.ready,
+        "status": STATE.status,            # idle | loading | ready | error
         "error": STATE.error,
         "load_seconds": STATE.load_seconds,
         "meta": STATE.metrics.get("meta"),
         "llm": get_provider().status(),
-        "data_dir": SETTINGS.data_dir,
+        "data_dir": STATE.loaded_dir,       # currently-loaded dir (null when idle)
+        "suggested_dir": SETTINGS.data_dir,  # default sample — seeds the dir picker
         "sections": ["overview", "hotspots", "efficiency", "communication",
                      "hidden_overhead", "attribution", "memory", "theoretical",
                      "timeline", "smart_timeline", "insights"],
@@ -191,8 +318,11 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- routing ------------------------------------------------------------
     def do_GET(self):
-        path = urlparse(self.path).path
-        if path.startswith("/api/"):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/api/browse":          # works pre-load (no ready guard)
+            self._handle_browse(parsed.query)
+        elif path.startswith("/api/"):
             self._handle_api(path)
         elif path == "/report.html":
             self._serve_report()
@@ -207,8 +337,36 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_api(path)
         elif path == "/api/chip":
             self._handle_chip()
+        elif path == "/api/load":
+            self._handle_load()
+        elif path == "/api/reset":
+            self._send_json(STATE.reset())
         else:
             self._send_json({"error": "not found"}, 404)
+
+    def _handle_browse(self, query: str):
+        """GET /api/browse?path=<abs> — list server-side subdirectories for the
+        directory picker. Defaults to the suggested sample's parent when empty."""
+        raw = (parse_qs(query or "").get("path", [""])[0] or "").strip()
+        res = _browse_dir(raw)
+        self._send_json(res, 200 if res.get("ok") else 400)
+
+    def _handle_load(self):
+        """POST /api/load {"dir": "<abs>"} — validate + start a background
+        (re)load of a profiling directory. The frontend then polls /api/meta."""
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(n) if n > 0 else b""
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+            data_dir = str(body.get("dir", "")).strip()
+        except Exception as exc:
+            self._send_json({"ok": False, "error": f"bad request: {exc}"}, 400)
+            return
+        if not data_dir:
+            self._send_json({"ok": False, "error": "missing 'dir'"}, 400)
+            return
+        res = STATE.start_load(data_dir)
+        self._send_json(res, 200 if res.get("ok") else 400)
 
     def _handle_chip(self):
         """POST /api/chip {"chip": "950DT"} — switch the reference chip and
@@ -276,16 +434,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send(fh.read(), ctype)
 
 
+def _autoload_enabled() -> bool:
+    return os.environ.get("LLMINSIGHT_AUTOLOAD", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def serve(host: str = "127.0.0.1", port: int = 8000, open_browser: bool = True) -> None:
-    print(f"[LLMInsight] loading profile from: {SETTINGS.data_dir}")
-    try:
-        STATE.build()
-    except Exception:
-        print(f"[LLMInsight] FAILED to load: {STATE.error}")
-        raise
-    print(f"[LLMInsight] ready in {STATE.load_seconds}s — "
-          f"{len(STATE.cards)} insight cards, "
-          f"LLM={'on' if get_provider().available else 'off (default)'}")
+    # Lazy by default: start idle and let the user choose a profiling directory in
+    # the UI (POST /api/load). The socket therefore opens immediately. Set
+    # LLMINSIGHT_AUTOLOAD=1 to eagerly (re)load the default / LLMINSIGHT_DATA_DIR
+    # sample at startup in the background (the old one-shot behavior).
+    if _autoload_enabled():
+        print(f"[LLMInsight] autoload (LLMINSIGHT_AUTOLOAD): {SETTINGS.data_dir}")
+        STATE.start_load(SETTINGS.data_dir)
+    else:
+        print("[LLMInsight] idle — open the app and choose a profiling directory")
+    print(f"[LLMInsight] LLM={'on' if get_provider().available else 'off (default)'}")
     httpd = ThreadingHTTPServer((host, port), Handler)
     url = f"http://{host}:{port}/"
     print(f"[LLMInsight] serving at {url}  (Ctrl+C to stop)")
