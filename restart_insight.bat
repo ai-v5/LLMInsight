@@ -78,23 +78,25 @@ if defined NEWPID (
   echo [restart_insight] launched ^(PID not captured; log: %LOGFILE%^)
 )
 
-REM --- wait for readiness ----------------------------------------------------
-REM The socket only opens AFTER the profile is parsed, so a cold cache (104MB
-REM trace) can take a while on first launch - hence the generous budget.
-echo [restart_insight] waiting for readiness ...
+REM --- wait until the server is up -------------------------------------------
+REM The app is lazy-by-default: the socket opens immediately and the server sits
+REM idle until a profiling directory is chosen in the browser (or autoloaded via
+REM LLMINSIGHT_AUTOLOAD). So we wait for /api/meta to RESPOND (any status), not
+REM for "ready":true - the data is loaded later, from the UI.
+echo [restart_insight] waiting for the server to come up ...
 set "READY="
 set "SERVERDEAD="
-for /l %%N in (1,1,130) do if not defined READY if not defined SERVERDEAD call :poll_once
+for /l %%N in (1,1,60) do if not defined READY if not defined SERVERDEAD call :poll_once
 if defined SERVERDEAD (
   echo [restart_insight] ERROR: server exited early - see %LOGFILE% 1>&2
   type "%LOGFILE%" 2>nul
   exit /b 1
 )
 if defined READY (
-  echo [restart_insight] ready - serving at http://%HOST%:%PORT%/
+  echo [restart_insight] up - open http://%HOST%:%PORT%/ and choose a profiling directory
   exit /b 0
 )
-echo [restart_insight] WARNING: not ready after timeout - check %LOGFILE% 1>&2
+echo [restart_insight] WARNING: server did not come up after timeout - check %LOGFILE% 1>&2
 exit /b 1
 
 REM ===========================================================================
@@ -123,6 +125,6 @@ if defined NEWPID (
   tasklist /FI "PID eq %NEWPID%" /NH /FO CSV 2>nul | find "%NEWPID%" >nul
   if errorlevel 1 ( set "SERVERDEAD=1" & goto :eof )
 )
-for /f "usebackq delims=" %%R in (`powershell -NoProfile -Command "try { $r=Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri 'http://%CHECKHOST%:%PORT%/api/meta'; if ($r.Content -match '\"ready\"\s*:\s*true') { 'ready' } } catch { }"`) do set "READY=%%R"
+for /f "usebackq delims=" %%R in (`powershell -NoProfile -Command "try { $r=Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri 'http://%CHECKHOST%:%PORT%/api/meta'; if ($r.Content -match '\"status\"') { 'ready' } } catch { }"`) do set "READY=%%R"
 if not defined READY ping -n 2 127.0.0.1 >nul
 goto :eof

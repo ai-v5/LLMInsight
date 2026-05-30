@@ -205,3 +205,73 @@ input[type=range] { flex: 1; accent-color: var(--accent); }
 .tl-legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 10px 2px 4px; }
 .tl-leg { display: inline-flex; align-items: center; gap: 6px; color: var(--text-dim); font-size: 12px; }
 .tl-leg i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+
+/* ---------- directory picker (lazy-load: choose a profiling dir) ---------- */
+.export-btn.ghost { background: transparent; color: var(--text-dim); border: 1px solid var(--border-2); }
+.export-btn.ghost:hover { color: var(--text); border-color: var(--accent); filter: none; }
+
+.picker { max-width: 860px; margin: 8px auto 40px; width: 100%; text-align: left; }
+.picker-head { margin-bottom: 12px; }
+.picker-title { font-size: 18px; font-weight: 750; color: var(--text); }
+.picker-sub { font-size: 12px; color: var(--text-mut); margin-top: 4px; line-height: 1.6; }
+.picker-err {
+  background: rgba(248,81,73,.08); border: 1px solid rgba(248,81,73,.35); color: #ff7b72;
+  border-radius: 8px; padding: 8px 12px; font-size: 12.5px; margin-bottom: 12px;
+}
+.picker-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.picker-input {
+  flex: 1; min-width: 0; background: var(--bg-2); border: 1px solid var(--border-2);
+  border-radius: 8px; padding: 8px 11px; color: var(--text); font: inherit;
+  font-family: "JetBrains Mono", Consolas, monospace; font-size: 12px;
+}
+.picker-input:focus { outline: none; border-color: var(--accent); }
+.picker-btn {
+  background: var(--panel-2); color: var(--text-dim); border: 1px solid var(--border-2);
+  border-radius: 8px; padding: 8px 14px; font: inherit; font-weight: 650; cursor: pointer; white-space: nowrap;
+}
+.picker-btn:hover { color: var(--text); }
+.picker-btn.primary { background: var(--accent); color: #07222b; border-color: transparent; }
+.picker-btn.primary:hover { filter: brightness(1.08); }
+.picker-btn.ghost { background: transparent; }
+.picker-btn.sm { padding: 4px 11px; font-size: 12px; }
+
+.picker-crumbs {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 3px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px 8px 0 0;
+  border-bottom: none; padding: 8px 11px; font-size: 12px;
+}
+.crumb-chip {
+  cursor: pointer; color: var(--text-dim); border: 1px solid var(--border-2);
+  border-radius: 6px; padding: 1px 7px; margin-right: 4px; font-weight: 600;
+}
+.crumb-chip:hover { color: var(--text); border-color: var(--accent); }
+.crumb-chip.on { color: var(--accent); border-color: var(--accent); }
+.crumb-seg { cursor: pointer; color: var(--text-dim); padding: 1px 3px; border-radius: 5px; }
+.crumb-seg:hover { color: var(--accent); background: var(--panel); }
+.crumb-sl { color: var(--text-mut); }
+
+.picker-list {
+  border: 1px solid var(--border); border-radius: 0 0 8px 8px; max-height: 52vh; overflow: auto;
+  background: var(--panel);
+}
+.picker-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 7px 12px; border-bottom: 1px solid var(--border); cursor: default;
+}
+.picker-item:last-child { border-bottom: none; }
+.picker-item:hover { background: var(--panel-2); }
+.picker-item.is-profile { background: rgba(94,224,184,.05); }
+.picker-item-name { display: flex; align-items: center; gap: 9px; min-width: 0; cursor: pointer; flex: 1; }
+.picker-item-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picker-item-name:hover .picker-item-label { color: var(--accent); }
+.picker-ico { width: 18px; text-align: center; flex: 0 0 18px; }
+.tag-profile {
+  flex: 0 0 auto; font-size: 10px; font-weight: 700; padding: 1px 7px; border-radius: 5px;
+  background: rgba(94,224,184,.16); color: var(--accent-2);
+}
+.picker-cur {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 9px 12px; border-bottom: 1px solid var(--border);
+  background: rgba(94,224,184,.1); color: var(--accent-2); font-weight: 600; font-size: 12.5px;
+}
+.picker-empty { padding: 18px; text-align: center; color: var(--text-mut); font-size: 12.5px; }

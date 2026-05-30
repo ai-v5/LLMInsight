@@ -82,6 +82,19 @@ def main():
     chk_true("no per-type MFU > 100%",
              all((t.get("mfu") is None or t["mfu"] <= 1.0) for t in eff.get("by_type", [])),
              f"(max={max([t.get('mfu') or 0 for t in eff.get('by_type', [])] or [0]):.3f})")
+    # Vector-core ops now carry a VECTOR-peak MFU: elementwise/norm/optimizer kernels
+    # get a flop model so their headroom floor is max(vector-compute, memory), not
+    # memory alone. Mul (FLOAT, AI_VECTOR_CORE) gets a small but physical MFU routed
+    # to the vector peak (≈2.5%; an 8x-higher cube peak would read ~0.3%).
+    bt = {t["type"]: t for t in eff.get("by_type", [])}
+    _mul_mfu = bt.get("Mul", {}).get("mfu")
+    chk_true("vector op (Mul) has physical vector-peak MFU",
+             _mul_mfu is not None and 0.0 < _mul_mfu <= 1.0, f"(Mul mfu={_mul_mfu})")
+    # Pure data-movement ops (factor 0: ZerosLike/Cast) do ~0 arithmetic, so they stay
+    # MFU-less and honestly memory-bound — no fabricated compute.
+    chk_true("zero-arith vector op (ZerosLike) stays MFU-less",
+             "ZerosLike" not in bt or bt["ZerosLike"].get("mfu") is None,
+             f"(mfu={bt.get('ZerosLike', {}).get('mfu')})")
     ch = eff.get("chip", {})
     # 950DT datasheet cube peak (432 TF) matches the observed silicon ceiling, so the
     # MFU is the real utilization and calibration stays off (no >100% to correct).

@@ -39,7 +39,39 @@ global.fetch = (url, opts) => _realFetch(url.startsWith("http") ? url : BASE + u
 vm.runInThisContext(fs.readFileSync(path.join(WEB, "util.js"), "utf8") + "\nglobalThis.LI = LI;");
 vm.runInThisContext(fs.readFileSync(path.join(WEB, "views.js"), "utf8"));
 
+// The app is lazy-by-default now: the server starts idle and a profiling dir is
+// chosen via POST /api/load. Drive that flow (also exercises /api/browse + load)
+// so the views/report below render against real loaded data.
+async function ensureLoaded() {
+  const getMeta = async () => (await _realFetch(BASE + "/api/meta")).json();
+  let meta = await getMeta();
+  if (meta.status === "ready" || meta.ready) { console.log("  loaded (already ready)"); return; }
+
+  const br = await (await _realFetch(BASE + "/api/browse")).json();
+  console.log(`  browse           ok=${br.ok} dirs=${(br.dirs || []).length} path=${br.path}`);
+
+  const dir = meta.suggested_dir || meta.data_dir;
+  const res = await (await _realFetch(BASE + "/api/load", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ dir }),
+  })).json();
+  if (!res.ok) throw new Error("load failed: " + (res.error || JSON.stringify(res)));
+  for (let i = 0; i < 300; i++) {
+    meta = await getMeta();
+    if (meta.status === "ready" || meta.ready) { console.log(`  loaded in ${meta.load_seconds}s: ${dir}`); return; }
+    if (meta.status === "error") throw new Error("load error: " + meta.error);
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  throw new Error("load timed out");
+}
+
 (async () => {
+  try {
+    await ensureLoaded();
+  } catch (e) {
+    console.log("  FAIL ensureLoaded     " + e.message);
+    process.exit(1);
+  }
   const ids = Object.keys(LI.views).filter(k => !k.startsWith("_"));
   let fail = 0;
   for (const id of ids) {
