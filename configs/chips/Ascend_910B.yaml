@@ -1,0 +1,16 @@
+# Ascend 910B-class — ASSUMED specs, offered as a what-if alternative. The bundled
+# DeepSeek-V3 sample was captured on a 950DT (see Ascend_950DT.yaml); selecting 910B
+# projects the same workload onto a 910-class ceiling, so `assumed: true` surfaces an
+# "assumed — adjust here" hint. efficiency.py also auto-calibrates the cube peak up to
+# the observed GEMM ceiling (~432 TFLOPS) so MFU never reads a non-physical >100%.
+# Units: *_tflops = TFLOPS (loader x1e12); memory_* = bytes (/s).
+# name carries a space for display; the YAML stem "Ascend_910B" is the switch key.
+name: Ascend 910B
+fp16_tflops: 376.0          # CUBE bf16/fp16 peak (conservative public 910B figure)
+fp32_tflops: 75.0           # VECTOR fp32 peak
+bf16_vector_tflops: null    # VECTOR bf16 peak (null -> 2x fp32 = 150)
+memory_bandwidth: 1600000000000.0   # 1.6 TB/s
+memory_capacity: 64000000000.0      # 64 GB
+dies_per_package: 1
+intra_package_link: null
+assumed: true
