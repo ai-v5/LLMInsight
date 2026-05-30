@@ -22,3 +22,12 @@ launch_overhead: 6.0e-06
 pcie_bandwidth: 64000000000.0
 dies_per_package: 1
 intra_package_link: null
+# Realistic per-op-class MFU ceilings — the achievable-MFU target above which a
+# kernel is "done" and further tuning isn't worth it (drives the "算子极致优化"
+# What-if lever and the ceiling-aware operator ranking). matmul saturates the
+# cube near peak; FlashAttention fwd (FA) and FlashAttentionScoreGrad (FAG) leave
+# structural headroom (softmax / masking / recompute), so they cap below 100%.
+mfu_ceilings:
+  matmul: 0.95          # MatMul / GroupedMatmul / Gemm cube ceiling
+  attention: 0.85       # FlashAttentionScore (FA forward) ceiling
+  attention_grad: 0.70  # FlashAttentionScoreGrad (FAG) ceiling

@@ -34,6 +34,19 @@ _ATTN_CAUSAL_FACTOR = 0.5
 _ATTN_BWD_FWD_RATIO = 2.5
 
 
+def _op_class(op_type: str) -> Optional[str]:
+    """Map a kernel Type to its ceiling-governed op-class (matmul / attention /
+    attention_grad), or None for everything else (vector / memory ops, which
+    optimize toward the 100% roofline instead of a capped ceiling)."""
+    if op_type in MATMUL_TYPES:
+        return "matmul"
+    if op_type in ATTENTION_FWD_TYPES:
+        return "attention"
+    if op_type in ATTENTION_GRAD_TYPES:
+        return "attention_grad"
+    return None
+
+
 def _estimate_matmul_flops(shapes: List[List[int]]) -> Optional[float]:
     mats = [s for s in shapes if len(s) >= 2]
     if len(mats) < 2:
@@ -233,14 +246,28 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         modeled = (flops is not None) or (is_vector and b_bytes > 0)
         t_compute = (flops / peak_flops) if flops else 0.0
         t_mem = (b_bytes / chip.hbm_bandwidth) if b_bytes else 0.0
+        # Ceiling-aware reclaim: matmul / FA / FAG have a realistic MFU ceiling
+        # (<100%) below which further tuning isn't worth it. reclaim_us is the time
+        # recoverable by optimizing *to that ceiling* — 0 once a kernel is already
+        # at/above it (running at MFU>=ceiling means dur <= compute_time/ceiling).
+        # Non-ceiling modeled ops optimize toward the 100% roofline, so their
+        # reclaim == wasted_us.
+        op_class = _op_class(types[i]) if flops is not None else None
+        ceiling = chip.mfu_ceiling(op_class)
         if modeled:
             ideal_us = max(t_compute, t_mem) * 1e6
             efficiency = max(0.0, min(ideal_us / d_us, 1.0)) if d_us > 0 else 0.0
             wasted_us = max(0.0, d_us - ideal_us)
             bound = ("compute" if t_compute >= t_mem else "memory") if flops is not None else "memory"
+            if ceiling:
+                floor_us = max(t_compute / ceiling, t_mem) * 1e6
+                reclaim_us = max(0.0, d_us - floor_us)
+            else:
+                reclaim_us = wasted_us
         else:
             efficiency = None
             wasted_us = 0.0
+            reclaim_us = 0.0
             bound = _bound_from_ratios(mac_r[i], mte2_r[i], vec_r[i])
 
         rows.append(
@@ -257,6 +284,9 @@ def compute_efficiency(prof) -> Dict[str, Any]:
                 "mbu": mbu,
                 "efficiency": efficiency,
                 "wasted_us": wasted_us,
+                "reclaim_us": reclaim_us,
+                "op_class": op_class,
+                "ceiling": ceiling,
                 "bound": bound,
                 "ai": (flops / b_bytes) if (flops and b_bytes) else None,
                 "achieved_tflops": (achieved_flops / 1e12) if achieved_flops else None,
@@ -291,13 +321,15 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         t = by_type.setdefault(
             r["type"],
             {"type": r["type"], "count": 0, "dur_us": 0.0, "flops": 0.0,
-             "bytes": 0.0, "wasted_us": 0.0, "peak_time": 0.0, "dt_dur": {}},
+             "bytes": 0.0, "wasted_us": 0.0, "reclaim_us": 0.0,
+             "peak_time": 0.0, "dt_dur": {}},
         )
         t["count"] += 1
         t["dur_us"] += r["dur_us"]
         t["flops"] += r["flops"] or 0.0
         t["bytes"] += r["bytes"] or 0.0
         t["wasted_us"] += r["wasted_us"]
+        t["reclaim_us"] += r["reclaim_us"]
         # Aggregate-MFU denominator consistent with per-kernel routing: sum each
         # kernel's OWN routed-peak × time, so type MFU = Σflops / Σ(peak·t) rather
         # than dividing everything by the single cube-bf16 peak (which under-reads
@@ -321,28 +353,62 @@ def compute_efficiency(prof) -> Dict[str, Any]:
                 "mfu": round(mfu, 4) if mfu is not None else None,
                 "mbu": round(mbu, 4) if mbu is not None else None,
                 "wasted_us": round(t["wasted_us"], 1),
+                "reclaim_us": round(t["reclaim_us"], 1),
             }
         )
     type_rows.sort(key=lambda x: x["dur_us"], reverse=True)
 
-    top_opt = sorted(rows, key=lambda r: r["wasted_us"], reverse=True)[:25]
+    # Rank optimization candidates by ceiling-aware reclaimable time and drop the
+    # ones already at/above their MFU ceiling (reclaim ~ 0): there's no point
+    # ranking a matmul that's already saturating the cube. Non-ceiling ops keep
+    # their vs-roofline gap (reclaim == wasted_us), so memory/vector candidates
+    # still surface.
+    rankable = [r for r in rows if r.get("reclaim_us", 0.0) > 0.05]
+    top_opt = sorted(rankable, key=lambda r: r["reclaim_us"], reverse=True)[:25]
     for r in top_opt:
-        # Post-optimization MFU/MBU: closing the wasted gap means running at ideal_us
-        # instead of dur. MFU and MBU are both inversely proportional to duration
-        # (FLOPs/bytes are fixed), so they scale by dur/ideal = 1/efficiency; the
-        # bound dimension reaches ~100% (capped). Lets a row read "MFU 73→100".
-        eff_r = r.get("efficiency")
-        if eff_r and eff_r > 0:
-            scale = 1.0 / eff_r
-            r["mfu_after"] = min(r["mfu"] * scale, 1.0) if r.get("mfu") else None
-            r["mbu_after"] = min(r["mbu"] * scale, 1.0) if r.get("mbu") else None
-        else:
-            r["mfu_after"] = None
-            r["mbu_after"] = None
+        # Post-optimization MFU/MBU: closing the reclaimable gap means running at
+        # the kernel's floor duration (dur - reclaim). MFU/MBU scale inversely with
+        # duration (FLOPs/bytes fixed), so by dur/floor; matmul/FA/FAG cap at their
+        # ceiling, others at 1.0. Lets a row read "MFU 65→70" toward the FAG cap.
+        floor_us = max(r["dur_us"] - r["reclaim_us"], 1e-9)
+        scale = r["dur_us"] / floor_us
+        cap = r.get("ceiling") or 1.0
+        r["mfu_after"] = min(r["mfu"] * scale, cap) if r.get("mfu") else None
+        r["mbu_after"] = min(r["mbu"] * scale, 1.0) if r.get("mbu") else None
         for k in ("flops", "bytes", "mfu", "mbu", "ai", "achieved_tflops",
-                  "mfu_after", "mbu_after"):
+                  "mfu_after", "mbu_after", "reclaim_us", "wasted_us"):
             if isinstance(r.get(k), float):
                 r[k] = round(r[k], 4) if r[k] and r[k] < 1 else (round(r[k], 1) if r[k] else r[k])
+
+    # ---- "算子极致优化" aggregate -----------------------------------------
+    # Total reclaimable time if every modeled compute kernel (matmul / FA / FAG)
+    # is tuned up to its MFU ceiling, with a per-class breakdown and how many are
+    # already at/above their ceiling (left untouched). This is the save_us for the
+    # What-if lever in theoretical() — disjoint from comm/free (it's pure compute),
+    # so it stacks. The honest figure: matmul usually sits at its 95% ceiling, so
+    # the gain comes from FA/FAG headroom rather than a naive "everything to 100%".
+    oc_classes = ("matmul", "attention", "attention_grad")
+    oc_by = {c: {"reclaim_us": 0.0, "n": 0, "n_capped": 0,
+                 "ceiling": chip.mfu_ceiling(c)} for c in oc_classes}
+    for r in rows:
+        oc = r.get("op_class")
+        if not oc or oc not in oc_by:
+            continue
+        b = oc_by[oc]
+        b["n"] += 1
+        b["reclaim_us"] += r["reclaim_us"]
+        if r["reclaim_us"] <= 0.05:
+            b["n_capped"] += 1
+    oc_total = sum(b["reclaim_us"] for b in oc_by.values())
+    for b in oc_by.values():
+        b["reclaim_us"] = round(b["reclaim_us"], 1)
+    op_ceiling_opt = {
+        "total_reclaim_us": round(oc_total, 1),
+        "by_class": oc_by,
+        "n_modeled": sum(b["n"] for b in oc_by.values()),
+        "n_capped": sum(b["n_capped"] for b in oc_by.values()),
+        "ceilings": {c: chip.mfu_ceiling(c) for c in oc_classes},
+    }
 
     # Headline matmul MFU stays *pure GEMM* (the calibration anchor); fused
     # attention has its own per-type MFU row and is excluded here so the headline
@@ -418,6 +484,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         "peak_underestimated": calibrated,
         "by_type": type_rows[:40],
         "top_optimization": top_opt,
+        "op_ceiling_opt": op_ceiling_opt,
         "scatter": scatter,
         "kernels_with_flops": len(flops_rows),
         "kernels_total": len(rows),

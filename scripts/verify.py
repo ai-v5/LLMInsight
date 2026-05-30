@@ -92,13 +92,41 @@ def main():
     # cube vs vector peaks are surfaced separately (950DT: cube 432 TF, vector 54 TF).
     chk("950DT cube bf16 TFLOPS", ch.get("cube_bf16_tflops"), 432.0, 1.0)
     chk("950DT vector bf16 TFLOPS", ch.get("vector_bf16_tflops"), 54.0, 1.0)
+    # 算子极致优化: per-op-class MFU ceilings (matmul 95 / FA 85 / FAG 70 on 950DT)
+    # drive a reclaim-to-ceiling aggregate. matmul mostly saturates the cube, so many
+    # of its kernels are already at/above the ceiling (n_capped>0) and the honest gain
+    # comes from FA/FAG headroom — not a naive "everything to 100%".
+    oco = eff.get("op_ceiling_opt") or {}
+    ceils = oco.get("ceilings") or {}
+    chk("op-ceiling matmul ceiling", ceils.get("matmul"), 0.95, 1e-9)
+    chk("op-ceiling FA ceiling", ceils.get("attention"), 0.85, 1e-9)
+    chk("op-ceiling FAG ceiling", ceils.get("attention_grad"), 0.70, 1e-9)
+    chk_true("op-ceiling reclaim > 0 (FA/FAG headroom)",
+             (oco.get("total_reclaim_us") or 0) > 0, f"(reclaim={oco.get('total_reclaim_us')})")
+    chk_true("op-ceiling: some matmul kernels already at ceiling (excluded)",
+             oco.get("n_capped", 0) > 0, f"(n_capped={oco.get('n_capped')}/{oco.get('n_modeled')})")
+    chk_true("optimization candidates all have reclaimable time (>0)",
+             all(r.get("reclaim_us", 0) > 0 for r in eff.get("top_optimization", [])),
+             f"(min={min([r.get('reclaim_us', 0) for r in eff.get('top_optimization', [])] or [0])})")
     theo_m = m["theoretical"]
-    chk_true("theoretical what-if atomic levers (2)", len(theo_m.get("whatif", [])) == 2)
+    levers = theo_m.get("whatif", [])
+    lever_ids = {w.get("id") for w in levers}
+    chk_true("theoretical what-if atomic levers (3, incl. op_ceiling)",
+             len(levers) == 3 and "op_ceiling" in lever_ids, f"(ids={lever_ids})")
     chk_true("each what-if lever carries new_mfu",
-             all(w.get("new_mfu") is not None for w in theo_m.get("whatif", [])))
-    chk_true("combined what-if present (with MFU)",
-             (theo_m.get("whatif_combined") or {}).get("new_mfu") is not None,
-             f"(combined={theo_m.get('whatif_combined')})")
+             all(w.get("new_mfu") is not None for w in levers))
+    op_lever = next((w for w in levers if w.get("id") == "op_ceiling"), None)
+    chk_true("op_ceiling lever save_us matches efficiency reclaim",
+             op_lever is not None
+             and abs((op_lever.get("save_us") or 0) - (oco.get("total_reclaim_us") or 0)) <= 1.0,
+             f"(lever={op_lever.get('save_us') if op_lever else None} reclaim={oco.get('total_reclaim_us')})")
+    comb = theo_m.get("whatif_combined") or {}
+    chk_true("combined what-if present (with MFU)", comb.get("new_mfu") is not None,
+             f"(combined={comb})")
+    # Disjoint levers => combined save == sum of per-lever saves (additivity invariant).
+    chk_true("combined save == Σ lever saves (disjoint slices add)",
+             abs((comb.get("save_us") or 0) - sum(w.get("save_us") or 0 for w in levers)) <= 1.0,
+             f"(combined={comb.get('save_us')} sum={sum(w.get('save_us') or 0 for w in levers)})")
     chk_true("end-to-end step MFU present", theo_m.get("step_mfu") is not None,
              f"(step_mfu={theo_m.get('step_mfu')})")
 

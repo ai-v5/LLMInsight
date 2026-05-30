@@ -450,6 +450,29 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]
         },
     ]
 
+    # 算子极致优化: tune the modeled compute kernels (matmul / FA / FAG) up to their
+    # realistic MFU ceiling. The reclaimed time comes from the Computing slice —
+    # disjoint from 未掩盖通信 and Free — so this lever stacks with the other two.
+    # Kernels already at/above their ceiling are excluded (no further tuning), so the
+    # gain is the honest ceiling-relative headroom, not a naive "everything→100%".
+    oco = eff.get("op_ceiling_opt") if eff.get("available") else None
+    op_reclaim = min(float((oco or {}).get("total_reclaim_us") or 0.0), computing)
+    if oco and op_reclaim > 0:
+        cl = oco.get("ceilings") or {}
+        def _ceil_pct(x):
+            return int(round((x or 0) * 100))
+        whatif.append({
+            "id": "op_ceiling",
+            "scenario": "算子极致优化（计算算子达 MFU 天花板）",
+            "new_step_us": round(stage - op_reclaim, 1),
+            "save_us": round(op_reclaim, 1),
+            "save_pct": _pct(op_reclaim, stage),
+            "basis": "将 matmul/FA/FAG 优化到各自 MFU 天花板（matmul {m}% / FA {a}% / FAG {g}%）；"
+                     "已达天花板的 {n} 个算子不再优化。".format(
+                         m=_ceil_pct(cl.get("matmul")), a=_ceil_pct(cl.get("attention")),
+                         g=_ceil_pct(cl.get("attention_grad")), n=oco.get("n_capped", 0)),
+        })
+
     # End-to-end (step) MFU + the MFU each what-if would unlock. Useful FLOPs and
     # the silicon peak are constant, so end-to-end MFU scales inversely with step
     # time: new_mfu = step_mfu × (stage / new_step). A shorter step ⇒ higher MFU,
@@ -467,7 +490,7 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]
     # Combined what-if: every lever enabled at once. Since the levers are disjoint
     # slices of Stage their savings add, and the floor is pure Computing. This is the
     # true upper bound and the default for the UI's "已启用组合" row (all ticked).
-    combined_save_us = comm_no + free
+    combined_save_us = comm_no + free + op_reclaim
     combined_step_us = max(stage - combined_save_us, 0.0)
     whatif_combined = {
         "save_us": round(combined_save_us, 1),
@@ -475,7 +498,7 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]
         "new_step_us": round(combined_step_us, 1),
         "new_mfu": (round(step_mfu * stage / combined_step_us, 4)
                     if (step_mfu and combined_step_us > 0) else None),
-        "basis": "全部优化项叠加（各项互不重叠，收益可加）。",
+        "basis": "全部优化项叠加（通信掩盖 / 空泡 / 算子极致优化互不重叠，收益可加）。",
     }
 
     matmul_mfu = eff.get("matmul_mfu") if eff.get("available") else None
@@ -492,13 +515,17 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]
                 "hint": "实测算力超过假设峰值 → ChipSpec 峰值偏低，请按实际 SKU 调整。",
             }
         else:
-            ideal_compute_us = computing * matmul_mfu
+            # Ceiling-aware headroom: the reclaimable compute time is what's left
+            # after tuning matmul/FA/FAG up to their MFU ceilings (not to 100%), so
+            # this number matches the 算子极致优化 lever exactly instead of implying
+            # a fictitious gap that the lever would never chase.
             chipinfo = eff.get("chip", {})
             compute_bound_note = {
                 "matmul_mfu_pct": round(matmul_mfu * 100, 2),
                 "peak_underestimated": False,
-                "ideal_matmul_us": round(ideal_compute_us, 1),
-                "headroom_us": round(computing - ideal_compute_us, 1),
+                "ideal_matmul_us": round(computing - op_reclaim, 1),
+                "headroom_us": round(op_reclaim, 1),
+                "ceiling_based": True,
                 "calibrated": bool(chipinfo.get("calibrated")),
                 "assumed_peak_tflops": chipinfo.get("peak_bf16_tflops"),
                 "observed_peak_tflops": chipinfo.get("observed_peak_tflops"),
