@@ -26,6 +26,8 @@
     ];
     const levers = theo.available ? theo.whatif : [];
     const baseStep = theo.available ? theo.current_step_us : 0;
+    // MFU column shows the gain vs base (step_mfu); the base row stays the absolute anchor.
+    const dmfu = (nv) => (smfu == null || nv == null) ? "—" : (nv - smfu >= 0 ? "+" : "-") + fmt.mfu(Math.abs(nv - smfu));
     const baseRow = theo.available
       ? `<tr style="color:var(--text-dim)"><td></td><td>当前（base）</td><td>${fmt.us(baseStep)}</td><td>—</td><td>${fmt.mfu(smfu)}</td></tr>`
       : "";
@@ -33,7 +35,7 @@
       `<tr><td style="text-align:center"><input type="checkbox" class="wi-lever" style="accent-color:#5ee0b8;cursor:pointer" data-save="${w.save_us}" checked></td>`
       + `<td>${esc(w.scenario)}</td><td>${fmt.us(w.new_step_us)}</td>`
       + `<td style="color:var(--accent-2)">-${fmt.pct(w.save_pct)}</td>`
-      + `<td style="color:var(--accent)">${fmt.mfu(w.new_mfu)}</td></tr>`).join("");
+      + `<td style="color:var(--accent)">${dmfu(w.new_mfu)}</td></tr>`).join("");
     const cb = theo.available && theo.compute_bound;
     // "已启用组合" row recomputed from whichever levers are ticked. 未掩盖通信 and Free
     // are disjoint slices of Stage, so savings add; MFU = smfu · stage / new_step.
@@ -49,7 +51,7 @@
         + `<td><strong>已启用组合 (${ticked.length}/${levers.length})</strong></td>`
         + `<td><strong>${fmt.us(newStep)}</strong></td>`
         + `<td style="color:var(--accent-2)">${saveUs > 0 ? "-" + fmt.pct(savePct) : "—"}</td>`
-        + `<td style="color:var(--accent)"><strong>${fmt.mfu(newMfu)}</strong></td>`;
+        + `<td style="color:var(--accent)"><strong>${dmfu(newMfu)}</strong></td>`;
     };
     root.innerHTML = `
       <div class="grid cols-6">${cards.join("")}</div>
