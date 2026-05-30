@@ -467,10 +467,23 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]
                 "observed_peak_tflops": chipinfo.get("observed_peak_tflops"),
             }
 
+    # End-to-end (step) MFU: total executed matmul+attention FLOPs over the FULL
+    # step wall-clock against the (calibrated) silicon peak. Unlike matmul_mfu —
+    # which divides by matmul *kernel* time and reads ~cube quality — this divides
+    # by the whole step, so 未掩盖通信 + 空泡 directly drag it down. It is the number
+    # one would quote as "训练 MFU". Same single-step basis as compute_bound above.
+    step_mfu = None
+    if eff.get("available"):
+        useful_flops = eff.get("useful_flops_total")
+        peak_tflops = (eff.get("chip") or {}).get("effective_peak_tflops")
+        if useful_flops and peak_tflops and stage > 0:
+            step_mfu = useful_flops / (peak_tflops * 1e12 * (stage * 1e-6))
+
     return {
         "available": True,
         "current_step_us": round(stage, 1),
         "whatif": whatif,
         "compute_bound": compute_bound_note,
+        "step_mfu": round(step_mfu, 4) if step_mfu else None,
         "note": "What-if 为基于 step 时间构成的上界估算，用于优化排序，非精确预测。芯片峰值为假设值。",
     }

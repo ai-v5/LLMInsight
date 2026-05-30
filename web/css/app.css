@@ -103,7 +103,8 @@ body {
 .cols-3 { grid-template-columns: repeat(3, 1fr); }
 .cols-4 { grid-template-columns: repeat(4, 1fr); }
 .cols-5 { grid-template-columns: repeat(5, 1fr); }
-@media (max-width: 1200px) { .cols-4, .cols-5 { grid-template-columns: repeat(2,1fr);} .cols-3{grid-template-columns:repeat(2,1fr);} }
+.cols-6 { grid-template-columns: repeat(6, 1fr); }
+@media (max-width: 1200px) { .cols-4, .cols-5, .cols-6 { grid-template-columns: repeat(2,1fr);} .cols-3{grid-template-columns:repeat(2,1fr);} }
 
 .panel {
   background: var(--panel); border: 1px solid var(--border); border-radius: var(--r);

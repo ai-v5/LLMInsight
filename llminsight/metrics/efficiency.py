@@ -329,6 +329,9 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         "roofline_ridge_ai": effective_peak / SETTINGS.chip.hbm_bandwidth,
         "matmul_mfu": round(matmul_mfu, 4) if matmul_mfu else None,
         "matmul_mfu_assumed": round(matmul_mfu_assumed, 4) if matmul_mfu_assumed else None,
+        # Total executed useful FLOPs (matmul + fused attention) in the captured
+        # step — numerator for the end-to-end (step) MFU computed in theoretical().
+        "useful_flops_total": sum(r["flops"] for r in flops_rows),
         "peak_underestimated": calibrated,
         "by_type": type_rows[:40],
         "top_optimization": top_opt,
