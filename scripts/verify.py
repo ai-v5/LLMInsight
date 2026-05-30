@@ -150,6 +150,28 @@ def main():
              f"(cards={len(cards910)})")
     set_chip("Ascend_950DT")  # restore the default reference
 
+    print("\n== shareable report (H4) ==")
+    from llminsight.report import build_report_html
+    rhtml = build_report_html(m, cards)
+    chk_true("report is a self-contained HTML doc",
+             rhtml.lstrip().lower().startswith("<!doctype html"),
+             f"({len(rhtml)//1024} KB)")
+    # self-contained: no external assets / network → emailable, offline, printable
+    externals = [t for t in ("<script src", "<link", "@import", 'src="http',
+                             "src='http", 'href="http', "url(http")
+                 if t in rhtml.lower()]
+    chk_true("report has no external assets", not externals, f"(found={externals})")
+    # carries the same section views the UI shows (diagnostics-first ordering)
+    for marker in ("诊断", "时间构成", "What-if", "算子热点", "通信", "隐性开销", "结构归因"):
+        chk_true(f"report section: {marker}", marker in rhtml)
+    # embeds every rule-engine card (titles rendered verbatim)
+    chk_true("report embeds all card titles",
+             all(c.get("title", "") in rhtml for c in cards if c.get("title")))
+    # privacy: same whitelist as the LLM summary — no raw trace path / PII / key
+    rleaks = [t for t in ("d00568668", "plog", "CPU_AFFINITY", "/home/",
+                          "ASCEND_PROCESS_LOG", "api_key") if t in rhtml]
+    chk_true("no PII/secret leak in report", not rleaks, f"(leaks={rleaks})")
+
     print("\n== serialization ==")
     full = json.dumps(m, default=str)
     chk_true("compute_all JSON-serializable", len(full) > 0, f"({len(full)//1024} KB)")

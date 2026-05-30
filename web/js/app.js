@@ -131,6 +131,13 @@
     document.getElementById("foot-data").textContent = (meta.data_dir || "").replace(/^.*[\\/]secret[\\/]/, "secret/");
     document.getElementById("chip-note").textContent = chipNote(chip);
 
+    // shareable-report export: now that STATE is ready, enable the topbar button.
+    const exportBtn = document.getElementById("export-report");
+    if (exportBtn) {
+      exportBtn.disabled = false;
+      exportBtn.addEventListener("click", () => window.open("/report.html", "_blank", "noopener"));
+    }
+
     document.getElementById("loading").style.display = "none";
     const start = (location.hash || "").replace("#", "");
     go(NAV.find(n => n.id === start) ? start : "overview");

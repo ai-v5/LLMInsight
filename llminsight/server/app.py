@@ -29,6 +29,7 @@ from ..metrics.efficiency import compute_efficiency
 from ..metrics.smart_timeline import compute_smart_timeline
 from ..rules import run_rules, read_capture_config
 from ..insight import generate_insights, get_provider
+from ..report import build_report_html
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "web")
@@ -193,6 +194,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path.startswith("/api/"):
             self._handle_api(path)
+        elif path == "/report.html":
+            self._serve_report()
         else:
             self._serve_static(path)
 
@@ -241,6 +244,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(fn())
         except Exception as exc:
             self._send_json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+
+    def _serve_report(self):
+        """GET /report.html — render the self-contained shareable report on the
+        fly from the in-memory metrics + cards (same aggregated numbers the UI
+        shows; never the raw trace). 503 until the profile is loaded."""
+        if not STATE.ready:
+            self._send_json({"error": STATE.error or "loading"}, 503)
+            return
+        try:
+            html = build_report_html(STATE.metrics, STATE.cards)
+        except Exception as exc:
+            self._send_json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+            return
+        self._send(html.encode("utf-8"), "text/html; charset=utf-8")
 
     def _serve_static(self, path: str):
         rel = path.lstrip("/") or "index.html"

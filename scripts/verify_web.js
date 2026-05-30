@@ -57,6 +57,25 @@ vm.runInThisContext(fs.readFileSync(path.join(WEB, "views.js"), "utf8"));
       console.log(`  FAIL ${id.padEnd(16)} ${e.stack.split("\n").slice(0,3).join("\n        ")}`);
     }
   }
-  console.log(fail ? `\n${fail} view(s) FAILED` : `\nAll ${ids.length} views rendered OK`);
+
+  // ---- shareable report (H4): self-contained HTML served at /report.html ----
+  try {
+    const r = await global.fetch("/report.html");
+    const html = await r.text();
+    const okDoc = /^<!doctype html/i.test(html.trim());
+    const okDiag = html.includes("诊断");          // rule cards (diagnostics-first)
+    const okView = html.includes("时间构成");        // overview section present
+    const undefs = (html.match(/undefined/g) || []).length;
+    const ok = r.status === 200 && okDoc && okDiag && okView && undefs === 0;
+    if (!ok) fail++;
+    console.log(`  ${ok ? "OK  " : "FAIL"} ${"report.html".padEnd(16)} status=${r.status} ` +
+                `html=${String(html.length).padStart(6)}B doc=${okDoc} diag=${okDiag} overview=${okView}` +
+                (undefs ? `  ⚠ ${undefs}×"undefined"` : ""));
+  } catch (e) {
+    fail++;
+    console.log(`  FAIL ${"report.html".padEnd(16)} ${e.message}`);
+  }
+
+  console.log(fail ? `\n${fail} check(s) FAILED` : `\nAll ${ids.length} views + report rendered OK`);
   process.exit(fail ? 1 : 0);
 })();
