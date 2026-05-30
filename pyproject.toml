@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llminsight"
+dynamic = ["version"]
+description = "Ascend NPU large-model training profiling & performance insight platform"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "LLMInsight" }]
+keywords = ["ascend", "npu", "profiling", "performance", "llm", "moe", "training", "mindspeed"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: System :: Monitoring",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ai-v5/LLMInsight"
+Repository = "https://github.com/ai-v5/LLMInsight"
+
+# After `pip install`, run the web app with either `llminsight` or
+# `python -m llminsight.server`.
+[project.scripts]
+llminsight = "llminsight.server.__main__:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "llminsight.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["llminsight*"]
+
+# web/ and configs/ live at the repo ROOT in the dev layout. scripts/build_wheel.py
+# stages copies INTO the package (llminsight/web, llminsight/configs) before building
+# so the wheel is self-contained; the server resolves either location at runtime.
+[tool.setuptools.package-data]
+llminsight = [
+    "web/*",
+    "web/css/*",
+    "web/js/*",
+    "web/vendor/*",
+    "web/**/*",
+    "configs/*",
+    "configs/chips/*",
+    "configs/**/*",
+]

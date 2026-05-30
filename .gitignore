@@ -21,6 +21,13 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# --- Wheel build (scripts/build_wheel.py) ---
+/dist/
+/build/
+# staged copies of the root web/ & configs/ dirs (build_wheel.py stages then removes these)
+/llminsight/web/
+/llminsight/configs/
+
 # --- Scratch / smoke scripts (underscore-prefixed, any language) ---
 scripts/_*
 
