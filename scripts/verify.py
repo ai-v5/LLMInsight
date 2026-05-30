@@ -12,7 +12,7 @@ import json
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from llminsight.config import SETTINGS
+from llminsight.config import SETTINGS, set_chip
 from llminsight.parser import load_profile
 from llminsight.parser.profile import num
 from llminsight.metrics import compute_all
@@ -72,9 +72,10 @@ def main():
              f"({len(eff.get('scatter', []))} pts)")
     chk_true("matmul_mfu present", eff.get("matmul_mfu") is not None,
              f"(MFU={eff.get('matmul_mfu')})")
-    # MFU must be physical (<=100%): a real kernel cannot beat silicon peak. The
-    # assumed 376 TF is too low for this SKU, so efficiency.py calibrates up to the
-    # observed ~432 TF ceiling. Guard against a regression that re-surfaces >100%.
+    # MFU must be physical (<=100%): a real kernel cannot beat silicon peak. Under
+    # the default 950DT (the device this sample was captured on) the configured cube
+    # peak already equals the observed GEMM ceiling, so no calibration is needed; the
+    # 910B what-if below exercises the calibrate-up path. Guard against >100%.
     chk_true("matmul MFU <= 100% (physical)",
              eff.get("matmul_mfu") is not None and eff["matmul_mfu"] <= 1.0,
              f"(MFU={eff.get('matmul_mfu')}, vs_assumed={eff.get('matmul_mfu_assumed')})")
@@ -82,13 +83,23 @@ def main():
              all((t.get("mfu") is None or t["mfu"] <= 1.0) for t in eff.get("by_type", [])),
              f"(max={max([t.get('mfu') or 0 for t in eff.get('by_type', [])] or [0]):.3f})")
     ch = eff.get("chip", {})
-    chk_true("peak auto-calibrated from observed ceiling",
-             ch.get("calibrated") is True and (ch.get("observed_peak_tflops") or 0) > ch.get("peak_bf16_tflops", 0),
-             f"(assumed={ch.get('peak_bf16_tflops')} observed={ch.get('observed_peak_tflops')} eff={round(ch.get('effective_peak_tflops',0),1)})")
+    # 950DT datasheet cube peak (432 TF) matches the observed silicon ceiling, so the
+    # MFU is the real utilization and calibration stays off (no >100% to correct).
+    chk_true("950DT cube peak matches observed ceiling (no calibration)",
+             ch.get("calibrated") is False
+             and abs((ch.get("observed_peak_tflops") or 0) - ch.get("peak_bf16_tflops", 0)) <= 1.0,
+             f"(peak={ch.get('peak_bf16_tflops')} observed={ch.get('observed_peak_tflops')} calibrated={ch.get('calibrated')})")
+    # cube vs vector peaks are surfaced separately (950DT: cube 432 TF, vector 54 TF).
+    chk("950DT cube bf16 TFLOPS", ch.get("cube_bf16_tflops"), 432.0, 1.0)
+    chk("950DT vector bf16 TFLOPS", ch.get("vector_bf16_tflops"), 54.0, 1.0)
     chk_true("theoretical whatif present", len(m["theoretical"].get("whatif", [])) == 3)
+    chk_true("end-to-end step MFU present", m["theoretical"].get("step_mfu") is not None,
+             f"(step_mfu={m['theoretical'].get('step_mfu')})")
 
     print("\n== rule engine (insight cards) ==")
-    chk_true("card count == 12", len(cards) == 12, f"(got {len(cards)})")
+    # 11 under the default 950DT: peak == observed ceiling, so the peak_underestimated
+    # calibration advisory does not fire (it does under the 910B what-if — see below).
+    chk_true("card count == 11", len(cards) == 11, f"(got {len(cards)})")
     ids = {c["id"] for c in cards}
     for need in ("comm_not_overlapped", "aicpu_dispatch", "capture_blocking",
                  "hidden_overhead_ledger", "theoretical_whatif", "dynamic_shape",
@@ -105,12 +116,33 @@ def main():
     chk_true("LLM disabled by default", res["llm"]["enabled"] is False)
     chk_true("LLM not available (no-op)", res["llm"]["available"] is False)
     chk_true("narrative is None (no call)", res["narrative"] is None)
-    chk_true("cards passed through", len(res["cards"]) == 12)
+    chk_true("cards passed through", len(res["cards"]) == 11)
     blob = json.dumps(res["summary"], ensure_ascii=False)
     leaks = [t for t in ("d00568668", "plog", "CPU_AFFINITY", "/home/", "ASCEND_PROCESS_LOG", "api_key")
              if t in blob]
     chk_true("no PII/secret leak in LLM summary", not leaks, f"(leaks={leaks})")
     chk_true("summary is KB-level", len(blob) < 40000, f"({len(blob)//1024} KB)")
+
+    print("\n== 910B what-if: calibration guard ==")
+    # Switching to the assumed 910B ceiling (cube 376 TF < observed 432 TF) must
+    # auto-calibrate the peak upward so MFU stays physical (<=100%) and surface the
+    # peak_underestimated advisory. Exercises the calibrate-up path the default
+    # 950DT (peak == observed) intentionally does not.
+    set_chip("Ascend_910B")
+    m910 = compute_all(prof)
+    cards910 = run_rules(m910, cap)
+    ch910 = m910["efficiency"].get("chip", {})
+    chk_true("910B peak auto-calibrated from observed ceiling",
+             ch910.get("calibrated") is True
+             and (ch910.get("observed_peak_tflops") or 0) > ch910.get("peak_bf16_tflops", 0),
+             f"(assumed={ch910.get('peak_bf16_tflops')} observed={ch910.get('observed_peak_tflops')} eff={round(ch910.get('effective_peak_tflops',0),1)})")
+    chk_true("910B matmul MFU still <= 100% (calibrated)",
+             m910["efficiency"].get("matmul_mfu") is not None and m910["efficiency"]["matmul_mfu"] <= 1.0,
+             f"(MFU={m910['efficiency'].get('matmul_mfu')})")
+    chk_true("910B surfaces peak_underestimated card",
+             "peak_underestimated" in {c["id"] for c in cards910},
+             f"(cards={len(cards910)})")
+    set_chip("Ascend_950DT")  # restore the default reference
 
     print("\n== serialization ==")
     full = json.dumps(m, default=str)
