@@ -24,18 +24,22 @@
       metric("端到端 MFU", fmt.mfu(smfu), { tone: smfu == null ? undefined : (smfu >= 0.5 ? "good" : smfu >= 0.3 ? "warn" : "bad"), foot: "有效FLOPs /(峰值×step)", barPct: smfu != null ? smfu * 100 : undefined }),
       metric("Step 时间", r.step_time_s + " s", { foot: "Stage = " + fmt.us(u.stage) }),
     ];
+    const baseRow = theo.available
+      ? `<tr style="color:var(--text-dim)"><td>当前（base）</td><td>${fmt.us(theo.current_step_us)}</td><td>—</td><td>${fmt.mfu(smfu)}</td></tr>`
+      : "";
     const whatifRows = (theo.available ? theo.whatif : []).map(w =>
-      `<tr><td>${esc(w.scenario)}</td><td>${fmt.us(w.new_step_us)}</td><td style="color:var(--accent-2)">-${fmt.pct(w.save_pct)}</td></tr>`).join("");
+      `<tr><td>${esc(w.scenario)}</td><td>${fmt.us(w.new_step_us)}</td><td style="color:var(--accent-2)">-${fmt.pct(w.save_pct)}</td><td style="color:var(--accent)">${fmt.mfu(w.new_mfu)}</td></tr>`).join("");
     const cb = theo.available && theo.compute_bound;
     root.innerHTML = `
       <div class="grid cols-6">${cards.join("")}</div>
       <div class="grid cols-2" style="margin-top:16px">
         ${panel("Step 时间构成", "Computing / 未掩盖通信 / Free（单位 us）", `<div id="ov-donut" class="chart"></div>`)}
         ${panel("理论上界 & What-if 收益模拟", "基于 step 时间构成的优化上界（用于排优先级，非精确预测）",
-          `<table class="tbl"><thead><tr><th>场景</th><th>预计 step</th><th>节省</th></tr></thead><tbody>${whatifRows || `<tr><td colspan=3 class="empty">—</td></tr>`}</tbody></table>
+          `<table class="tbl"><thead><tr><th>场景</th><th>预计 step</th><th>节省</th><th>端到端 MFU</th></tr></thead><tbody>${baseRow}${whatifRows || `<tr><td colspan=4 class="empty">—</td></tr>`}</tbody></table>
            ${cb ? (cb.peak_underestimated
              ? banner("warn","⚠️", `matmul 实测 MFU <strong>${cb.matmul_mfu_pct}%</strong> &gt; 100% → 假设芯片峰值偏低，请在 config.ChipSpec 校正。`)
-             : `<div class="note">matmul MFU ≈ <strong>${cb.matmul_mfu_pct}%</strong>；计算理想 ${fmt.us(cb.ideal_matmul_us)}，余量 ${fmt.us(cb.headroom_us)}。${cb.calibrated ? `（芯片峰值按实测 ${cb.observed_peak_tflops} TFLOPS 校准，假设 ${cb.assumed_peak_tflops != null ? cb.assumed_peak_tflops.toFixed(0) : "—"}）` : ""}</div>`) : ""}`)}
+             : `<div class="note">matmul MFU ≈ <strong>${cb.matmul_mfu_pct}%</strong>；计算理想 ${fmt.us(cb.ideal_matmul_us)}，余量 ${fmt.us(cb.headroom_us)}。${cb.calibrated ? `（芯片峰值按实测 ${cb.observed_peak_tflops} TFLOPS 校准，假设 ${cb.assumed_peak_tflops != null ? cb.assumed_peak_tflops.toFixed(0) : "—"}）` : ""}</div>`) : ""}
+           <div class="note" style="font-size:11px;line-height:1.55;margin-top:8px;border-top:1px solid rgba(255,255,255,.06);padding-top:6px">💡 优化优先级：「通信完全掩盖」通常是最大单项 → 先做计算-通信重叠（--moe-fb-overlap / 异步通信），再压同步空泡，二者组合收益最高。　⚠️ 表中「通信完全掩盖」与算子页 <strong>HcclLaunchAicpuKernel</strong> 是同一段集合通信（单卡几乎全是 Wait，非下发延迟），勿重复计入。</div>`)}
       </div>
       <div class="note">${esc(theo.available ? theo.note : "")}</div>`;
     charts([{ id: "ov-donut", option: donut(ov.composition.map(c => ({ name: c.name, value: c.us, pct: c.pct }))) }]);
@@ -91,6 +95,22 @@
     if (!ef.available) { root.innerHTML = `<div class="empty">无 kernel_details 数据</div>`; return; }
     const chip = ef.chip;
     const top = ef.top_optimization.slice(0, 15);
+    // optimization gain = wasted_us; the bracket shows the MFU/MBU a kernel would
+    // reach at its Roofline ideal time (e.g. "MFU 73→100"). after = before/efficiency.
+    const arrow = (b, a) => {
+      if (b == null && a == null) return null;
+      const f = x => (x == null ? "—" : Math.round(x * 100));
+      return `${f(b)}→${f(a)}`;
+    };
+    const gainCell = t => {
+      const segs = [];
+      if (t.mfu != null && t.mfu_after != null) segs.push(`MFU ${arrow(t.mfu, t.mfu_after)}`);
+      if (t.mbu != null && t.mbu_after != null) segs.push(`MBU ${arrow(t.mbu, t.mbu_after)}`);
+      const tail = segs.length ? ` <span style="color:var(--text-dim)">（${segs.join(", ")}）</span>` : "";
+      return `<strong style="color:var(--accent-2)">${fmt.us(t.wasted_us)}</strong>${tail}`;
+    };
+    const optRows = top.map(t =>
+      `<tr><td class="mono">${esc(t.name)}</td><td><span class="tag">${esc(t.bound || "—")}</span></td><td>${fmt.us(t.dur_us)}</td><td>${gainCell(t)}</td></tr>`).join("");
     const byType = ef.by_type.slice(0, 20).map(t =>
       `<tr><td>${esc(t.type)}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td><td>${t.mfu != null ? fmt.mfu(t.mfu) : "—"}</td><td>${t.mbu != null ? fmt.mfu(t.mbu) : "—"}</td><td>${fmt.us(t.wasted_us)}</td></tr>`).join("");
     root.innerHTML = `
@@ -105,6 +125,7 @@
         ${panel("Roofline", "点 = kernel；x = 算术强度 (FLOP/Byte)，y = 达成算力 (TFLOPS)，对照屋顶线", `<div id="ef-roof" class="chart tall"></div>`)}
         ${panel("优化空间排行 (Top 15)", "按「实测 − Roofline 理想」的浪费时间排序；颜色 = 瓶颈类型", `<div id="ef-waste" class="chart tall"></div>`)}
       </div>
+      ${panel("优化候选明细 (Top 15)", "优化收益 = 实测 − Roofline 理想；括号为达到理想耗时后的 MFU / MBU", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>算子</th><th>瓶颈</th><th>当前耗时</th><th>优化收益</th></tr></thead><tbody>${optRows}</tbody></table></div>`, "span-2")}
       ${panel("按算子类型 MFU / MBU / 浪费", "", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>Count</th><th>耗时</th><th>MFU</th><th>MBU</th><th>浪费(vs理想)</th></tr></thead><tbody>${byType}</tbody></table></div>`, "span-2")}`;
     charts([
       { id: "ef-roof", option: roofline(ef.scatter, chip, ef.roofline_ridge_ai) },
@@ -175,7 +196,7 @@
   V.hidden_overhead = async function (root) {
     const ho = await api("/api/hidden_overhead");
     if (!ho.available) { root.innerHTML = `<div class="empty">无数据</div>`; return; }
-    const dev = ho.buckets.filter(b => b.domain === "device" && b.us != null);
+    const dev = ho.buckets.filter(b => b.domain === "device" && b.us != null && b.additive !== false);
     const host = ho.buckets.filter(b => b.domain === "host" && b.us != null);
     const cards = ho.buckets.map(b => `
       <div class="panel">
@@ -191,7 +212,7 @@
         ${metric("Step 时间", fmt.us(ho.stage_us))}
       </div>
       <div class="grid cols-2" style="margin-top:16px">
-        ${panel("Device 侧隐性开销 (计入 step)", "AICPU下发 / 未掩盖通信 / 空泡 / 格式转换初始化", `<div id="ho-dev" class="chart"></div>`)}
+        ${panel("Device 侧隐性开销 (计入 step)", "未掩盖通信 / 空泡 / 格式转换初始化（AICPU 通信执行为同段通信，单列、不入合计）", `<div id="ho-dev" class="chart"></div>`)}
         ${panel("Host 侧隐性开销", "Launch 下发 / 同步阻塞 / 动态 shape（采集干扰）", `<div id="ho-host" class="chart"></div>`)}
       </div>
       ${banner("info", "ℹ️", esc(ho.note))}
