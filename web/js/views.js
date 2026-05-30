@@ -541,7 +541,8 @@
   function tlLanes(tl) {
     const TOP = 10, uH = 46, oH = 30, GAP = 8;
     const utils = (tl.utilization || []).filter(u => u.available && u.series).map(u =>
-      ({ kind: "util", key: u.key, label: u.label, color: u.color, series: u.series }));
+      ({ kind: "util", key: u.key, label: u.label, color: u.color, series: u.series,
+         abs: u.abs, absUnit: u.abs_unit, peak: u.peak, peakUnit: u.peak_unit, metric: u.kind }));
     const streams = tl.streams || [];
     const present = streams.filter(s => (tl.slices || []).some(d => d.stream === s.key));
     const ops = (present.length ? present : streams).map(s =>
@@ -567,6 +568,10 @@
     streams.forEach(s => { colorOf[s.key] = s.color; labelOf[s.key] = s.label; });
     const byStream = {};
     (tl.slices || []).forEach(d => { (byStream[d.stream] = byStream[d.stream] || []).push(d); });
+    const laneMeta = {};
+    lanes.filter(L => L.kind === "util").forEach(L => {
+      laneMeta[L.label] = { absUnit: L.absUnit, peak: L.peak, peakUnit: L.peakUnit, metric: L.metric };
+    });
 
     const grid = [], xAxis = [], yAxis = [], series = [], graphic = [];
     const last = lanes.length - 1;
@@ -588,11 +593,22 @@
           axisLine: { show: false }, axisTick: { show: false },
           axisLabel: { show: false }, splitLine: { show: false },
         }));
+        // visible area line (silent: lets the full-height catcher own the hover)
         series.push({
-          name: L.label, type: "line", xAxisIndex: i, yAxisIndex: i,
-          showSymbol: false, smooth: true, lineStyle: { width: 1.3, color: L.color },
+          name: L.label, type: "line", xAxisIndex: i, yAxisIndex: i, silent: true,
+          showSymbol: false, smooth: true, lineStyle: { width: 1.4, color: L.color },
           itemStyle: { color: L.color }, areaStyle: { opacity: .18, color: L.color },
           data: L.series.map((v, k) => [+(k * binMs).toFixed(2), +(v * 100).toFixed(1)]),
+        });
+        // invisible full-lane-height bars: catch hovers anywhere in the lane (not just
+        // on the thin line) and carry the % + absolute value for the tooltip
+        series.push({
+          name: L.label, type: "bar", xAxisIndex: i, yAxisIndex: i, barWidth: "100%",
+          itemStyle: { opacity: 0 }, emphasis: { disabled: true }, z: 1,
+          data: L.series.map((v, k) => ({
+            value: [+(k * binMs).toFixed(2), 100],
+            pct: +(v * 100).toFixed(1), abs: (L.abs || [])[k],
+          })),
         });
       } else {
         yAxis.push(axis({
@@ -629,7 +645,20 @@
       tooltip: Object.assign({
         trigger: "item", confine: true,
         formatter: p => {
-          if (p.seriesType === "line") {
+          if (p.seriesType === "bar") {                       // utilization lane (catcher)
+            const m = laneMeta[p.seriesName] || {};
+            const ms = (+p.data.value[0]).toFixed(1);
+            const pct = (+p.data.pct).toFixed(0);
+            let line2 = "";
+            if (p.data.abs != null) {
+              line2 = (m.metric === "occupancy")
+                ? `占用 ${p.data.abs} / ${m.peak} ${m.absUnit}`
+                : `${p.data.abs} ${m.absUnit} / 峰值 ${m.peak} ${m.peakUnit}`;
+            }
+            return `<b>${esc(p.seriesName)}</b><br/>t ≈ ${ms} ms · 利用率 <b>${pct}%</b>`
+              + (line2 ? `<br/>${line2}` : "");
+          }
+          if (p.seriesType === "line") {                       // silent fallback
             return `${esc(p.seriesName)}<br/>t = ${(+p.data[0]).toFixed(1)} ms · <b>${(+p.data[1]).toFixed(0)}%</b>`;
           }
           const d = p.data && p.data[4]; if (!d) return "";
