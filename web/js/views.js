@@ -15,18 +15,20 @@
     const [ov, theo] = await Promise.all([api("/api/overview"), api("/api/theoretical")]);
     if (!ov.available) { root.innerHTML = `<div class="empty">无 step_trace 数据</div>`; return; }
     const r = ov.ratios, u = ov.us;
+    const smfu = theo.available ? theo.step_mfu : null;  // end-to-end (step) MFU, 0–1
     const cards = [
       metric("有效计算占比", fmt.pct(r.effective_compute_pct), { tone: r.effective_compute_pct >= 60 ? "good" : "warn", foot: "Computing / Stage", barPct: r.effective_compute_pct }),
       metric("未掩盖通信", fmt.pct(r.comm_not_overlapped_pct), { tone: "bad", foot: fmt.us(u.comm_not_overlapped), barPct: r.comm_not_overlapped_pct }),
       metric("空闲 Free", fmt.pct(r.free_pct), { tone: "warn", foot: fmt.us(u.free), barPct: r.free_pct }),
       metric("通信掩盖率", fmt.pct(r.overlap_rate_pct), { tone: r.overlap_rate_pct < 40 ? "bad" : "good", foot: "Overlapped / Communication", barPct: r.overlap_rate_pct }),
+      metric("端到端 MFU", fmt.mfu(smfu), { tone: smfu == null ? undefined : (smfu >= 0.5 ? "good" : smfu >= 0.3 ? "warn" : "bad"), foot: "有效FLOPs /(峰值×step)", barPct: smfu != null ? smfu * 100 : undefined }),
       metric("Step 时间", r.step_time_s + " s", { foot: "Stage = " + fmt.us(u.stage) }),
     ];
     const whatifRows = (theo.available ? theo.whatif : []).map(w =>
       `<tr><td>${esc(w.scenario)}</td><td>${fmt.us(w.new_step_us)}</td><td style="color:var(--accent-2)">-${fmt.pct(w.save_pct)}</td></tr>`).join("");
     const cb = theo.available && theo.compute_bound;
     root.innerHTML = `
-      <div class="grid cols-5">${cards.join("")}</div>
+      <div class="grid cols-6">${cards.join("")}</div>
       <div class="grid cols-2" style="margin-top:16px">
         ${panel("Step 时间构成", "Computing / 未掩盖通信 / Free（单位 us）", `<div id="ov-donut" class="chart"></div>`)}
         ${panel("理论上界 & What-if 收益模拟", "基于 step 时间构成的优化上界（用于排优先级，非精确预测）",
