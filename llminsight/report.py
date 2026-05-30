@@ -105,18 +105,25 @@ def _mask_path(p: Any) -> str:
 
 
 def _table(headers: List[str], rows: List[List[str]],
-           align: Optional[List[str]] = None) -> str:
-    """Build a <table>. Cells are pre-formatted HTML (callers escape text)."""
+           align: Optional[List[str]] = None,
+           row_classes: Optional[List[str]] = None) -> str:
+    """Build a <table>. Cells are pre-formatted HTML (callers escape text).
+
+    `row_classes` (optional, aligned with `rows`) adds a class to a <tr> — used
+    e.g. to dim a base row or rule-off a summary row."""
     if align is None:
         align = ["l"] + ["r"] * (len(headers) - 1)
     cls = {"l": "tl", "r": "tr", "c": "tc"}
     ths = "".join(f'<th class="{cls[a]}">{_e(h)}</th>'
                   for h, a in zip(headers, align))
     body = []
-    for row in rows:
+    for i, row in enumerate(rows):
         tds = "".join(f'<td class="{cls[a]}">{c}</td>'
                       for c, a in zip(row, align))
-        body.append(f"<tr>{tds}</tr>")
+        rc = ""
+        if row_classes and i < len(row_classes) and row_classes[i]:
+            rc = f' class="{_e(row_classes[i])}"'
+        body.append(f"<tr{rc}>{tds}</tr>")
     return (f'<table class="tbl"><thead><tr>{ths}</tr></thead>'
             f'<tbody>{"".join(body)}</tbody></table>')
 
@@ -126,6 +133,41 @@ def _metric(label: str, value: str, foot: str = "", tone: str = "") -> str:
             f'<div class="m-value">{value}</div>'
             + (f'<div class="m-foot">{_e(foot)}</div>' if foot else "")
             + "</div>")
+
+
+def _pctf(frac: Any, d: int = 1) -> str:
+    """frac is a 0–1 fraction (0.966 -> '96.6%')."""
+    if frac is None:
+        return "—"
+    try:
+        return f"{float(frac) * 100:.{d}f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _series_stats(series: Optional[List[Any]]):
+    """(avg, p95, max) of a 0–1 fraction series, ignoring None. Empty -> all None."""
+    xs = sorted(float(v) for v in (series or []) if v is not None)
+    if not xs:
+        return (None, None, None)
+    n = len(xs)
+    avg = sum(xs) / n
+    p95 = xs[min(n - 1, int(round(0.95 * (n - 1))))]
+    return (avg, p95, xs[-1])
+
+
+def _ibar(frac: Any, color: str = "") -> str:
+    """Inline mini-bar with a % label — the static stand-in for a curve/heat cell."""
+    if frac is None:
+        return "—"
+    try:
+        f = float(frac)
+    except (TypeError, ValueError):
+        return "—"
+    w = max(0.0, min(1.0, f)) * 100
+    return (f'<div class="ibar"><span style="width:{w:.0f}%;'
+            f'background:{_e(color or "#0e7490")}"></span>'
+            f'<em>{f * 100:.1f}%</em></div>')
 
 
 # --------------------------------------------------------------------------- #
@@ -256,31 +298,93 @@ def _sec_overview(overview: Dict) -> str:
 
 
 def _sec_theoretical(theo: Dict) -> str:
+    """What-if section — mirrors the live 总览 page's '理论上界 & What-if 收益模拟'
+    exactly: a dim base row, per-lever 单独节省(s)/(%) shown as negatives, the
+    端到端 MFU column shown as a gain (+x.x%) per lever, and a ruled-off combined
+    row whose MFU is the absolute reached value plus the gain (e.g. 76.7%（+35.8%）).
+    The export is a snapshot with every lever enabled, so the combined row equals
+    the page's default 已启用组合 (n/n)."""
     if not theo or not theo.get("available"):
         return ""
-    cur = theo.get("current_step_us")
-    rows = []
-    for w in theo.get("whatif", []) or []:
+    smfu = theo.get("step_mfu")  # base end-to-end MFU, 0–1
+
+    def saved_s(us):
+        try:
+            us = float(us)
+        except (TypeError, ValueError):
+            return "—"
+        return f"-{us / 1e6:.2f} s" if us > 0 else "—"
+
+    def saved_pct(p):
+        try:
+            return f"-{float(p):.1f}%" if float(p) > 0 else "—"
+        except (TypeError, ValueError):
+            return "—"
+
+    def dmfu(nv):  # gain vs base, e.g. '+14.5%' / '-1.2%' / '—'
+        if smfu is None or nv is None:
+            return "—"
+        d = (nv - smfu)
+        return ("+" if d >= 0 else "-") + f"{abs(d) * 100:.1f}%"
+
+    levers = theo.get("whatif", []) or []
+    rows = [["当前（base）", "—", "—", _mfu(smfu)]]          # dim anchor row
+    row_cls = ["dim-row"]
+    for w in levers:
         rows.append([
             _e(w.get("scenario", "")),
-            _us(w.get("save_us")),
-            f'<strong>{_pct(w.get("save_pct"))}</strong>',
-            _us(w.get("new_step_us")),
-            _mfu(w.get("new_mfu")),
+            f'<span class="pos">{saved_s(w.get("save_us"))}</span>',
+            f'<span class="pos">{saved_pct(w.get("save_pct"))}</span>',
+            f'<span class="gain">{dmfu(w.get("new_mfu"))}</span>',
         ])
+        row_cls.append("")
     comb = theo.get("whatif_combined") or {}
     if comb:
+        nv = comb.get("new_mfu")
+        mfu_cell = "—" if nv is None else f'{_mfu(nv)}（{dmfu(nv)}）'
         rows.append([
-            '<strong>全部优化项叠加</strong>',
-            f'<strong>{_us(comb.get("save_us"))}</strong>',
-            f'<strong>{_pct(comb.get("save_pct"))}</strong>',
-            f'<strong>{_us(comb.get("new_step_us"))}</strong>',
-            f'<strong>{_mfu(comb.get("new_mfu"))}</strong>',
+            f"已启用组合 ({len(levers)}/{len(levers)})",
+            f'<span class="pos">{saved_s(comb.get("save_us"))}</span>',
+            f'<span class="pos">{saved_pct(comb.get("save_pct"))}</span>',
+            f'<span class="gain">{mfu_cell}</span>',
         ])
-    tbl = _table(["What-if 优化项", "可省", "占 step", "优化后 step", "端到端 MFU"], rows)
-    sub = (f"当前 step {_us(cur)}。各项为互不重叠的原子优化，收益可叠加；"
-           "数值为基于 step 构成的上界估算，用于排优先级。")
-    return _panel("理论上界 & What-if 收益", sub, tbl)
+        row_cls.append("sum-row")
+    tbl = _table(["优化项", "单独节省(s)", "单独节省(%)", "端到端 MFU"],
+                 rows, row_classes=row_cls)
+
+    # compute-bound footnote — same wording/branching as the live page.
+    cb = theo.get("compute_bound") or {}
+    cb_note = ""
+    if cb:
+        if cb.get("peak_underestimated"):
+            cb_note = ('<div class="banner warn">matmul 实测 MFU <strong>'
+                       f'{_e(cb.get("matmul_mfu_pct"))}%</strong> &gt; 100% → '
+                       '假设芯片峰值偏低，请在 config.ChipSpec 校正。</div>')
+        else:
+            ceil = "（≈ 天花板）" if cb.get("ceiling_based") else ""
+            calib = ""
+            if cb.get("calibrated"):
+                ap = cb.get("assumed_peak_tflops")
+                calib = (f'（芯片峰值按实测 {_e(cb.get("observed_peak_tflops"))} '
+                         f'TFLOPS 校准，假设 {f"{ap:.0f}" if ap is not None else "—"}）')
+            cb_note = (f'<div class="note">matmul MFU ≈ <strong>'
+                       f'{_e(cb.get("matmul_mfu_pct"))}%</strong>{ceil}；'
+                       f'算子达天花板后计算 {_us(cb.get("ideal_matmul_us"))}，'
+                       f'可回收 {_us(cb.get("headroom_us"))}。{calib}</div>')
+
+    tip = ('<div class="note">💡 优化优先级：「通信完全掩盖」通常是最大单项 → '
+           '先做计算-通信重叠（--moe-fb-overlap / 异步通信），再压同步空泡。'
+           '「算子极致优化」按各算子 MFU 天花板（matmul 95% / FA 85% / FAG 70%）'
+           '收口，已达标算子不再投入——单项收益小而精，而非冲到 100% 的虚高。'
+           '底部「已启用组合」为各项叠加后的 step 与端到端 MFU（导出为全部启用快照）。'
+           '　⚠️ 「通信完全掩盖」与算子页 <strong>HcclLaunchAicpuKernel</strong> '
+           '是同一段集合通信（单卡几乎全是 Wait，非下发延迟），勿重复计入。</div>')
+
+    note = (f'<div class="note">{_e(theo.get("note"))}</div>'
+            if theo.get("note") else "")
+    sub = "每项为单独启用的收益；底部「已启用组合」为三项叠加（导出为全部启用快照）"
+    return _panel("理论上界 & What-if 收益模拟", sub,
+                  tbl + cb_note + tip + note)
 
 
 def _sec_whatif_floor(theo: Dict) -> str:
@@ -446,6 +550,282 @@ def _sec_memory(mem: Dict) -> str:
     return _panel("显存洞察 · 内存-时间权衡", "待 memory-level 采集接入", banner + tbl)
 
 
+_UTIL_SHORT = {"cube": "Cube", "vector": "Vector", "hbm_bw": "HBM", "comm": "通信"}
+_STREAM_SHORT = {"cube": "Cube", "flash_attn": "FlashAttn", "vector": "Vector",
+                 "mix": "MIX", "comm": "通信", "other": "其它"}
+
+
+def _svg_smart_timeline(stl: Dict) -> str:
+    """Self-contained inline-SVG of the Gantt × utilization lanes (no JS, no deps).
+
+    Mirrors the live page's stacked layout on one shared time axis: utilization
+    area lanes (Cube/Vector/HBM/通信, 0–100%) on top, operator stream lanes below.
+    Vector output stays crisp in print / 另存为 PDF. Operator rects carry a native
+    <title> (hover tooltip in browsers) without any script."""
+    slices = stl.get("slices") or []
+    streams = stl.get("streams") or []
+    util = [u for u in (stl.get("utilization") or [])
+            if u.get("available") and u.get("series")]
+    span_us = float(stl.get("span_us") or 0)
+    if not span_us or (not slices and not util):
+        return ""
+    span_ms = span_us / 1000.0
+    span_s = float(stl.get("span_s") or (span_ms / 1000.0))
+
+    W, PAD_L, PAD_R, PAD_T = 1040, 100, 14, 10
+    H_U, GAP_U = 46, 7
+    H_OP, GAP_OP = 20, 4
+    SEP, AX = 16, 22
+    plotW = W - PAD_L - PAD_R
+    right_x = PAD_L + plotW
+
+    by_stream: Dict[str, list] = {}
+    for s in slices:
+        by_stream.setdefault(s.get("stream"), []).append(s)
+    scolor = {s.get("key"): s.get("color") for s in streams}
+    present = [s.get("key") for s in streams if by_stream.get(s.get("key"))]
+    for k in by_stream:                       # defensive: any stream not in streams[]
+        if k not in present:
+            present.append(k)
+
+    nU, nOp = len(util), len(present)
+    util_h = nU * H_U + max(0, nU - 1) * GAP_U
+    gantt_h = nOp * H_OP + max(0, nOp - 1) * GAP_OP
+    gantt_top = PAD_T + util_h + SEP
+    grid_bot = gantt_top + gantt_h
+    H = grid_bot + AX
+
+    def xms(ms):
+        return PAD_L + (float(ms) / span_ms) * plotW
+
+    out = [f'<svg class="stl-svg" viewBox="0 0 {W} {H}" width="100%" '
+           f'preserveAspectRatio="xMidYMid meet" '
+           f'font-family="-apple-system,Segoe UI,Microsoft YaHei,sans-serif">']
+
+    # vertical time grid + axis labels (behind content)
+    ticks = 6
+    for i in range(ticks + 1):
+        fx = i / ticks
+        gx = PAD_L + fx * plotW
+        out.append(f'<line x1="{gx:.1f}" y1="{PAD_T}" x2="{gx:.1f}" '
+                   f'y2="{grid_bot:.1f}" stroke="#eceff2"/>')
+        out.append(f'<text x="{gx:.1f}" y="{H-7}" font-size="10" fill="#8b949e" '
+                   f'text-anchor="middle">{fx*span_s:.2f}s</text>')
+
+    cols = max(60, min(int(plotW), 930))
+
+    def ds_max(series):
+        n = len(series)
+        if n <= cols:
+            return [max(0.0, min(1.0, float(v or 0))) for v in series]
+        res = []
+        for c in range(cols):
+            a, b = c * n // cols, max(c * n // cols + 1, (c + 1) * n // cols)
+            mx = 0.0
+            for v in series[a:b]:
+                if v is not None and float(v) > mx:
+                    mx = float(v)
+            res.append(max(0.0, min(1.0, mx)))
+        return res
+
+    # utilization area lanes
+    y = PAD_T
+    for u in util:
+        col = _e(u.get("color") or "#0e7490")
+        ds = ds_max(u.get("series") or [])
+        m = len(ds)
+        band_bot = y + H_U
+        out.append(f'<rect x="{PAD_L}" y="{y}" width="{plotW}" height="{H_U}" '
+                   f'fill="#ffffff" stroke="#eceff2"/>')
+        out.append(f'<line x1="{PAD_L}" y1="{y+H_U/2:.1f}" x2="{right_x}" '
+                   f'y2="{y+H_U/2:.1f}" stroke="#f3f5f7" stroke-dasharray="3 3"/>')
+        pts = [f"{PAD_L+(c+0.5)/m*plotW:.1f},{y+H_U*(1-v):.1f}"
+               for c, v in enumerate(ds)]
+        out.append(f'<path d="M{PAD_L},{band_bot:.1f} L{"L".join(pts)} '
+                   f'L{right_x},{band_bot:.1f} Z" fill="{col}" fill-opacity="0.16"/>')
+        out.append(f'<polyline points="{" ".join(pts)}" fill="none" '
+                   f'stroke="{col}" stroke-width="1.1"/>')
+        short = _e(_UTIL_SHORT.get(u.get("key"), str(u.get("key") or "")[:8]))
+        out.append(f'<text x="{PAD_L-7}" y="{y+H_U/2+3.5:.1f}" font-size="11" '
+                   f'fill="#57606a" text-anchor="end">{short}</text>')
+        out.append(f'<text x="{right_x-3}" y="{y+12:.1f}" font-size="9.5" '
+                   f'fill="{col}" text-anchor="end">峰值 {(max(ds) if ds else 0)*100:.0f}%</text>')
+        y += H_U + GAP_U
+
+    out.append(f'<line x1="{PAD_L}" y1="{gantt_top-SEP/2:.1f}" x2="{right_x}" '
+               f'y2="{gantt_top-SEP/2:.1f}" stroke="#d8dee4"/>')
+
+    # operator stream lanes (Gantt)
+    for idx, key in enumerate(present):
+        lane_top = gantt_top + idx * (H_OP + GAP_OP)
+        col = _e(scolor.get(key) or "#8b949e")
+        out.append(f'<rect x="{PAD_L}" y="{lane_top}" width="{plotW}" '
+                   f'height="{H_OP}" fill="#fafbfc" stroke="#eceff2"/>')
+        short = _e(_STREAM_SHORT.get(key, str(key or "")[:9]))
+        out.append(f'<text x="{PAD_L-7}" y="{lane_top+H_OP/2+3.5:.1f}" '
+                   f'font-size="10" fill="#57606a" text-anchor="end">{short}</text>')
+        out.append(f'<g fill="{col}">')
+        ry, rh = lane_top + 1.5, H_OP - 3
+        for s in by_stream.get(key, []):
+            x0 = xms(s.get("start_ms") or 0)
+            w = (float(s.get("dur_ms") or 0) / span_ms) * plotW
+            if x0 + max(w, 0.5) > right_x:
+                w = right_x - x0
+            w = max(0.5, w)
+            if w >= 2.0:
+                tip = f'{_e(str(s.get("name", ""))[:48])} · {_us((s.get("dur_ms") or 0)*1e3)}'
+                if s.get("mfu") is not None:
+                    tip += f' · MFU {_mfu(s.get("mfu"))}'
+                out.append(f'<rect x="{x0:.1f}" y="{ry:.1f}" width="{w:.1f}" '
+                           f'height="{rh}"><title>{tip}</title></rect>')
+            else:
+                out.append(f'<rect x="{x0:.1f}" y="{ry:.1f}" '
+                           f'width="{w:.1f}" height="{rh}"/>')
+        out.append('</g>')
+
+    out.append('</svg>')
+    return "".join(out)
+
+
+def _sec_smart_timeline(stl: Dict) -> str:
+    if not stl or not stl.get("available"):
+        return ""
+    util = [u for u in (stl.get("utilization") or [])
+            if u.get("available") and u.get("series")]
+    cards = [
+        _metric("时间跨度", f"{stl.get('span_s', '—')} s",
+                f"{_int(stl.get('bins'))} 桶 · {_us(stl.get('bin_us'))}/桶"),
+        _metric("利用率泳道", _int(len(util)), "Cube / Vector / HBM / 通信"),
+        _metric("算子切片", _int(stl.get("shown_slices")),
+                f"共 {_int(stl.get('total_slices'))}（按时长下采样）"),
+        _metric("已建模占比", _pct(stl.get("modeled_pct")),
+                "matmul/attention 计算覆盖墙钟",
+                "good" if (stl.get("modeled_pct") or 0) >= 40 else "warn"),
+    ]
+    kpi = f'<div class="grid g4">{"".join(cards)}</div>'
+
+    # utilization lanes -> avg / p95 / peak%, plus peak absolute for rate lanes
+    urows = []
+    for u in util:
+        avg, p95, mx = _series_stats(u.get("series"))
+        peak_abs = "—"
+        if u.get("kind") == "rate":
+            mxa = max((float(x) for x in (u.get("abs") or []) if x is not None),
+                      default=None)
+            if mxa is not None:
+                peak_abs = (f'{mxa:,.0f} {_e(u.get("abs_unit", ""))} / 峰值 '
+                            f'{_int(u.get("peak"))} {_e(u.get("peak_unit", ""))}')
+        urows.append([
+            f'<span class="dot" style="background:{_e(u.get("color"))}"></span>'
+            f'{_e(u.get("label", ""))}',
+            _ibar(avg, u.get("color")), _pctf(p95), _pctf(mx), peak_abs,
+        ])
+    util_tbl = _table(["利用率泳道", "平均", "P95", "峰值", "峰值绝对值（rate 类）"],
+                      urows, align=["l", "l", "r", "r", "r"])
+
+    # longest slices -> mirror the Gantt hover (per-slice MFU/MBU/dtype)
+    slabel = {s.get("key"): s.get("label") for s in (stl.get("streams") or [])}
+    longest = sorted((stl.get("slices") or []),
+                     key=lambda s: -(s.get("dur_ms") or 0))[:10]
+    srows = [[
+        _e(str(s.get("name", ""))[:44]),
+        _e(slabel.get(s.get("stream"), s.get("stream", ""))),
+        _us((s.get("dur_ms") or 0) * 1e3),
+        _mfu(s.get("mfu")), _mfu(s.get("mbu")), _e(s.get("dtype") or "—"),
+    ] for s in longest]
+    slice_tbl = _table(["算子切片", "泳道", "耗时", "MFU", "MBU", "dtype"],
+                       srows, align=["l", "l", "r", "r", "r", "c"])
+
+    svg = _svg_smart_timeline(stl)
+    util_leg = "".join(
+        f'<span class="lg"><i style="background:{_e(u.get("color"))}"></i>'
+        f'{_e(u.get("label", ""))}</span>' for u in util)
+    op_leg = "".join(
+        f'<span class="lg"><i style="background:{_e(s.get("color"))}"></i>'
+        f'{_e(s.get("label", ""))}</span>' for s in (stl.get("streams") or []))
+    legend = (f'<div class="legend"><span class="muted">利用率</span>{util_leg}</div>'
+              f'<div class="legend" style="margin-top:5px">'
+              f'<span class="muted">算子泳道</span>{op_leg}</div>')
+
+    sub = ("算子按 stream 泳道铺成 Gantt，上叠 Cube/Vector/HBM/通信 利用率（0–100%），"
+           "共享时间轴；矢量内联图，打印/转 PDF 清晰。下方表格补充利用率分布与最长切片 MFU/MBU。")
+    body = (kpi + (legend + svg if svg else "")
+            + '<div class="mini-h" style="margin-top:14px">利用率泳道统计</div>' + util_tbl
+            + '<div class="mini-h" style="margin-top:13px">'
+            '最长算子切片 · 悬停同款 MFU/MBU（Top 10）</div>' + slice_tbl)
+    return _panel("智能时间线 · 算子泳道 Gantt × 利用率泳道", sub, body)
+
+
+def _sec_timeline(tl: Dict) -> str:
+    if not tl or not tl.get("available"):
+        return ""
+    comp = tl.get("computing_pct")
+    notov = tl.get("not_overlapped_pct")
+    free = tl.get("free_pct")
+    cards = [
+        _metric("时间跨度", f"{tl.get('span_s', '—')} s",
+                f"{_int(tl.get('bins'))} 桶 · {len(tl.get('lanes') or [])} 泳道"),
+        _metric("有效计算", _pct(comp), "Computing / 总步长",
+                "good" if (comp or 0) >= 60 else "warn"),
+        _metric("未掩盖通信", _pct(notov), "通信未被计算掩盖",
+                "bad" if (notov or 0) >= 20 else "warn"),
+        _metric("Free 空泡", _pct(free), "设备完全空闲（可优化）",
+                "warn" if (free or 0) >= 10 else ""),
+    ]
+    kpi = f'<div class="grid g4">{"".join(cards)}</div>'
+
+    lrows = []
+    for l in (tl.get("lanes") or []):
+        occ = l.get("occupancy") or []
+        avg = (sum(occ) / len(occ)) if occ else None
+        lrows.append([_e(l.get("label", "")), _ibar(avg, "#0e7490")])
+    lane_tbl = _table(["泳道", "平均占用"], lrows, align=["l", "l"])
+
+    freq = [f.get("mhz") for f in (tl.get("ai_core_freq") or [])
+            if f.get("mhz") is not None]
+    freq_note = ""
+    if freq:
+        freq_note = (f'<div class="note">AI Core 频率：min {min(freq):,} · '
+                     f'平均 {sum(freq) / len(freq):,.0f} · max {max(freq):,} MHz'
+                     f'（{len(freq)} 采样点）</div>')
+
+    top = (tl.get("top_slices") or [])[:15]
+    srows = [[_e(str(s.get("name", ""))[:46]),
+              f'{(s.get("start_us", 0) / 1e6):.2f} s', _us(s.get("dur_us"))]
+             for s in top]
+    slice_tbl = _table(["最长计算 Kernel (>1.5ms)", "起始", "时长"],
+                       srows, align=["l", "r", "r"])
+
+    sub = ("泳道占用热力 · Overlap 三段（Computing / 未掩盖通信 / Free）· "
+           "AI Core 频率 · 最长计算切片。静态报告以表格呈现热力图与曲线。")
+    body = (kpi + '<div class="two-col"><div>' + lane_tbl + freq_note + '</div>'
+            + '<div><div class="mini-h">最长真实计算 kernel（已剔除 WAIT/NOTIFY）'
+            '</div>' + slice_tbl + '</div></div>')
+    return _panel("时间线 · 泳道占用 / 频率 / 切片", sub, body)
+
+
+def _sec_replay(overview: Dict) -> str:
+    r = (overview or {}).get("ratios", {}) or {}
+    step = (overview or {}).get("step", "—")
+    snap = [
+        _metric("有效计算", _pct(r.get("effective_compute_pct")), "", "good"),
+        _metric("未掩盖通信", _pct(r.get("comm_not_overlapped_pct")), "", "bad"),
+        _metric("空闲 Free", _pct(r.get("free_pct")), "", "warn"),
+        _metric("Step 时间", f'{r.get("step_time_s", "—")} s'),
+    ]
+    bn = ('<div class="banner info"><strong>全训练回放（骨架）</strong> —— '
+          f'当前数据为单 step（step {_e(step)}）单帧；回放轴与联动机制已搭好，'
+          '多 step 全程指标（loss / 吞吐 / 显存 / 通信抖动）随后续多 step + '
+          '训练日志采集接入。</div>')
+    plan = ('<div class="note">回放将支持：全程趋势叠加（耗时构成 / 未掩盖通信占比 / '
+            '显存峰值 / loss·吞吐·grad-norm 趋势线，定位「第几步开始变慢」）；'
+            '任意两 step 对比（Δ 自动定位回归来源算子，轴上打标变慢 / 显存爬升 / '
+            '通信抖动 / loss 突刺）。</div>')
+    body = (bn + '<div class="mini-h">当前帧快照（联动总览）</div>'
+            f'<div class="grid g4">{"".join(snap)}</div>' + plan)
+    return _panel("全训练回放", "单 step 单帧 · 多 step 趋势与对比为设计预留", body)
+
+
 # --------------------------------------------------------------------------- #
 def _panel(title: str, sub: str, body: str) -> str:
     return (f'<section class="panel"><h2>{_e(title)}</h2>'
@@ -478,6 +858,17 @@ padding:20px 22px;margin-bottom:16px;box-shadow:0 1px 3px rgba(27,31,36,.06);}
 .hero{margin-top:16px;}
 .grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;}
 @media(max-width:820px){.grid{grid-template-columns:repeat(3,1fr);}}
+.grid.g4{grid-template-columns:repeat(4,1fr);}
+@media(max-width:820px){.grid.g4{grid-template-columns:repeat(2,1fr);}}
+.ibar{position:relative;background:#eef1f4;border:1px solid var(--line);
+border-radius:5px;height:16px;min-width:122px;overflow:hidden;}
+.ibar span{position:absolute;left:0;top:0;bottom:0;border-radius:5px 0 0 5px;opacity:.85;}
+.ibar em{position:relative;font-style:normal;font-size:11px;padding-left:7px;
+line-height:16px;color:var(--ink);}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;
+margin-right:7px;vertical-align:middle;}
+.stl-svg{display:block;width:100%;height:auto;background:#fff;
+border:1px solid var(--line);border-radius:8px;margin:8px 0 2px;}
 .metric{background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:10px 12px;}
 .metric .m-label{font-size:11.5px;color:var(--dim);}
 .metric .m-value{font-size:20px;font-weight:750;margin-top:3px;}
@@ -527,6 +918,11 @@ border-radius:9px;padding:10px 14px;margin-bottom:9px;background:#fff;}
 .ic-body .v.gain{color:var(--accent2);font-weight:600;}
 .banner{border:1px solid rgba(14,116,144,.3);background:rgba(14,116,144,.07);
 color:#0b5e73;border-radius:8px;padding:9px 13px;font-size:12.3px;margin-bottom:11px;}
+.banner.warn{border-color:rgba(154,103,0,.35);background:rgba(154,103,0,.08);color:#7a5200;}
+.pos{color:var(--good);}
+.gain{color:var(--accent2);font-weight:600;}
+table.tbl tr.dim-row td{color:var(--mut);}
+table.tbl tr.sum-row td{border-top:2px solid rgba(15,118,110,.45);font-weight:600;}
 .note{font-size:11.5px;color:var(--mut);margin-top:9px;line-height:1.6;}
 .rep-foot{color:var(--mut);font-size:11.5px;text-align:center;margin-top:8px;line-height:1.7;}
 @media print{body{background:#fff;}.toolbar{display:none;}
@@ -552,18 +948,25 @@ def build_report_html(metrics: Dict[str, Any],
     theo = metrics.get("theoretical", {}) or {}
     eff = metrics.get("efficiency", {}) or {}
 
+    # Walk the left-nav top-to-bottom so the report mirrors the app page order:
+    # 总览 → 智能时间线 → 算子效率 → 算子热点 → 通信 → 隐性开销 → 结构归因 →
+    # 显存 → 时间线 → LLM 洞察 → 全训练回放. The header is the report masthead
+    # (总览 hero); overview composition + What-if are the rest of 总览.
     sections = [
         _sec_header(meta, overview, theo, eff, gen),
-        _sec_insights(cards),
-        _sec_overview(overview),
-        _sec_theoretical(theo),
-        _sec_whatif_floor(theo),
-        _sec_hotspots(metrics.get("hotspots", {})),
-        _sec_efficiency(eff),
-        _sec_communication(metrics.get("communication", {})),
-        _sec_hidden(metrics.get("hidden_overhead", {})),
-        _sec_attribution(metrics.get("attribution", {})),
-        _sec_memory(metrics.get("memory", {})),
+        _sec_overview(overview),                              # 总览
+        _sec_theoretical(theo),                              # 总览 · What-if
+        _sec_whatif_floor(theo),                             # 总览 · What-if 现实地板
+        _sec_smart_timeline(metrics.get("smart_timeline", {})),  # 智能时间线
+        _sec_efficiency(eff),                                # 算子效率
+        _sec_hotspots(metrics.get("hotspots", {})),          # 算子热点
+        _sec_communication(metrics.get("communication", {})),  # 通信分析
+        _sec_hidden(metrics.get("hidden_overhead", {})),     # 隐性开销
+        _sec_attribution(metrics.get("attribution", {})),    # 结构归因
+        _sec_memory(metrics.get("memory", {})),              # 显存洞察
+        _sec_timeline(metrics.get("timeline", {})),          # 时间线
+        _sec_insights(cards),                                # LLM 洞察
+        _sec_replay(overview),                               # 全训练回放
     ]
     foot = (
         '<div class="rep-foot">本报告由 LLMInsight 规则引擎生成（LLM 叙述为可选增强，未内联）。'
