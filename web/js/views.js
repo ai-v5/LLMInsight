@@ -484,100 +484,151 @@
   V.smart_timeline = async function (root) {
     const tl = await api("/api/smart_timeline");
     if (!tl.available) { root.innerHTML = `<div class="empty">无 trace_view.json：${esc(tl.reason || "")}</div>`; return; }
-    const labelOf = {}; (tl.streams || []).forEach(s => labelOf[s.key] = s.label);
-    const legend = (tl.streams || []).map(s =>
+    const utilLeg = (tl.utilization || []).filter(u => u.available && u.series).map(u =>
+      `<span class="tl-leg"><i style="background:${u.color}"></i>${esc(u.label)}</span>`).join("");
+    const opLeg = (tl.streams || []).map(s =>
       `<span class="tl-leg"><i style="background:${s.color}"></i>${esc(s.label)}</span>`).join("");
     const placeholders = (tl.utilization || []).filter(u => !u.available).map(u =>
       banner("warn", "🧠", `<strong>${esc(u.label)}</strong> —— ${esc(u.reason || "待采集")}`)).join("");
-    const ganttH = Math.max(220, (tl.lane_count || 6) * 46 + 72);
+    const lay = tlLanes(tl);
+    const utilN = lay.lanes.filter(L => L.kind === "util").length;
     root.innerHTML = `
       <div class="grid cols-4">
         ${metric("时间跨度", tl.span_s + " s", { foot: fmt.int(tl.bins) + " 桶 · " + fmt.us(tl.bin_us) + "/桶" })}
-        ${metric("Stream 泳道", fmt.int(tl.lane_count))}
+        ${metric("利用率泳道", fmt.int(utilN), { foot: "Cube / Vector / HBM / 通信" })}
         ${metric("算子切片", fmt.int(tl.shown_slices), { foot: "共 " + fmt.int(tl.total_slices) + "（按时长下采样）" })}
         ${metric("已建模占比", fmt.pct(tl.modeled_pct), { tone: (tl.modeled_pct || 0) >= 40 ? "good" : "warn", foot: "matmul/attention 计算覆盖墙钟时间", barPct: tl.modeled_pct })}
       </div>
-      <div class="tl-legend">${legend}</div>
-      ${panel("算子泳道 Gantt", "按 stream 泳道铺条 · 悬停看 类型/Core/MFU/MBU/耗时 · 滚轮或拖动滑块缩放",
-        `<div id="stl-gantt" style="width:100%;height:${ganttH}px"></div>`, "span-2")}
-      ${panel("利用率泳道（与 Gantt 同一时间轴）", "算力 / 显存带宽 / 通信（0–100%）", `<div id="stl-util" class="chart"></div>`, "span-2")}
+      <div class="tl-legend"><span style="color:var(--text-mut)">利用率</span>${utilLeg}</div>
+      <div class="tl-legend"><span style="color:var(--text-mut)">算子泳道</span>${opLeg}</div>
+      ${panel("算子泳道 Gantt × 利用率泳道（统一时间轴）",
+        "上方 Cube/Vector/HBM/通信 利用率（0–100%）· 下方算子按 stream 泳道铺条 · 悬停算子看 类型/Core/MFU/MBU/耗时 · 滚轮或拖滑块缩放 · 已剔除 Notify_Wait",
+        `<div id="stl-all" style="width:100%;height:${lay.height}px"></div>`, "span-2")}
       ${placeholders}
       <div class="note">${esc(tl.note || "")}</div>`;
-    charts([
-      { id: "stl-gantt", option: ganttOption(tl, labelOf) },
-      { id: "stl-util", option: utilOption(tl) },
-    ]);
+    charts([{ id: "stl-all", option: mergedOption(tl) }]);
   };
 
-  function ganttOption(tl, labelOf) {
+  // Stacked lane layout: utilization lanes (Cube/Vector/HBM/通信) on top, then
+  // operator stream lanes. Each lane gets its own grid; heights are in px so the
+  // container height (set before init) and the grid tops stay in sync.
+  function tlLanes(tl) {
+    const TOP = 10, uH = 46, oH = 30, GAP = 8;
+    const utils = (tl.utilization || []).filter(u => u.available && u.series).map(u =>
+      ({ kind: "util", key: u.key, label: u.label, color: u.color, series: u.series }));
     const streams = tl.streams || [];
-    const present = streams.filter(s => tl.slices.some(d => d.stream === s.key));
-    const lanes = present.length ? present : streams;
-    const laneIdx = {}; lanes.forEach((s, i) => laneIdx[s.key] = i);
-    const laneLabels = lanes.map(s => s.label);
-    const colorOf = {}; streams.forEach(s => colorOf[s.key] = s.color);
+    const present = streams.filter(s => (tl.slices || []).some(d => d.stream === s.key));
+    const ops = (present.length ? present : streams).map(s =>
+      ({ kind: "op", key: s.key, label: s.label, color: s.color }));
+    const lanes = utils.concat(ops);
+    let y = TOP;
+    lanes.forEach(L => { L.top = y; L.h = (L.kind === "util" ? uH : oH); y += L.h + GAP; });
+    const plotBottom = y - GAP;
+    return { lanes, plotBottom, height: plotBottom + 46 };  // +46: x-labels + slider
+  }
+
+  // One ECharts instance, many vertically-stacked grids sharing a single time
+  // axis (linked dataZoom + axisPointer). Util lanes are 0–100% area lines;
+  // operator lanes are Gantt bars (custom series). Lane labels are graphic text
+  // pinned to the left gutter.
+  function mergedOption(tl) {
+    const { lanes } = tlLanes(tl);
+    const LEFT = 150, RIGHT = 18;
     const spanMs = +(tl.span_us / 1e3).toFixed(2);
-    const data = tl.slices.map(d => [d.start_ms, d.start_ms + d.dur_ms, laneIdx[d.stream], colorOf[d.stream] || "#757575", d]);
+    const binMs = tl.bin_us / 1e3;
+    const streams = tl.streams || [];
+    const colorOf = {}, labelOf = {};
+    streams.forEach(s => { colorOf[s.key] = s.color; labelOf[s.key] = s.label; });
+    const byStream = {};
+    (tl.slices || []).forEach(d => { (byStream[d.stream] = byStream[d.stream] || []).push(d); });
+
+    const grid = [], xAxis = [], yAxis = [], series = [], graphic = [];
+    const last = lanes.length - 1;
+    const allX = lanes.map((_, i) => i);
+    lanes.forEach((L, i) => {
+      const isLast = i === last;
+      grid.push({ left: LEFT, right: RIGHT, top: L.top, height: L.h });
+      xAxis.push(axis({
+        type: "value", min: 0, max: spanMs, gridIndex: i,
+        axisLine: { show: isLast, lineStyle: { color: "#2d3b52" } },
+        axisTick: { show: isLast },
+        axisLabel: isLast ? { color: "#6b7888", formatter: v => (+v).toFixed(0) } : { show: false },
+        splitLine: { show: false },
+        name: isLast ? "ms" : "", nameLocation: "end", nameGap: 4, nameTextStyle: { color: "#6b7888" },
+      }));
+      if (L.kind === "util") {
+        yAxis.push(axis({
+          type: "value", min: 0, max: 100, gridIndex: i, splitNumber: 1,
+          axisLine: { show: false }, axisTick: { show: false },
+          axisLabel: { show: false }, splitLine: { show: false },
+        }));
+        series.push({
+          name: L.label, type: "line", xAxisIndex: i, yAxisIndex: i,
+          showSymbol: false, smooth: true, lineStyle: { width: 1.3, color: L.color },
+          itemStyle: { color: L.color }, areaStyle: { opacity: .18, color: L.color },
+          data: L.series.map((v, k) => [+(k * binMs).toFixed(2), +(v * 100).toFixed(1)]),
+        });
+      } else {
+        yAxis.push(axis({
+          type: "category", data: [""], gridIndex: i,
+          axisLine: { show: false }, axisTick: { show: false },
+          axisLabel: { show: false }, splitLine: { show: false },
+        }));
+        const data = (byStream[L.key] || []).map(d =>
+          [d.start_ms, d.start_ms + d.dur_ms, 0, colorOf[d.stream] || "#757575", d]);
+        series.push({
+          name: L.label, type: "custom", xAxisIndex: i, yAxisIndex: i,
+          progressive: 2000, progressiveThreshold: 2000, encode: { x: [0, 1], y: 2 },
+          renderItem: (params, api) => {
+            const s = api.coord([api.value(0), 0]);
+            const e = api.coord([api.value(1), 0]);
+            const cs = params.coordSys;
+            const h = Math.max(6, cs.height * 0.6);
+            const rect = echarts.graphic.clipRectByRect(
+              { x: s[0], y: cs.y + (cs.height - h) / 2, width: Math.max(e[0] - s[0], 1), height: h },
+              { x: cs.x, y: cs.y, width: cs.width, height: cs.height });
+            return rect && { type: "rect", shape: rect, style: { fill: api.value(3) } };
+          },
+          data,
+        });
+      }
+      graphic.push({
+        type: "text", left: 8, top: L.top + L.h / 2, z: 30, silent: true,
+        style: { text: L.label, fill: L.kind === "util" ? L.color : "#c9d4e0",
+          font: '600 11px -apple-system,"Segoe UI",sans-serif', verticalAlign: "middle" },
+      });
+    });
+
     return {
-      tooltip: Object.assign({ trigger: "item", formatter: p => {
-        const d = p.data && p.data[4]; if (!d) return "";
-        const rows = [
-          `泳道 <b>${esc(labelOf[d.stream] || d.stream)}</b>`,
-          d.type ? `类型 ${esc(d.type)}` : null,
-          d.core ? `Core ${esc(d.core)}` : null,
-          `start ${d.start_ms.toFixed(3)} ms · 耗时 ${fmt.us(d.dur_ms * 1e3)}`,
-          (d.mfu != null || d.mbu != null)
-            ? `MFU ${fmt.mfu(d.mfu)} · MBU ${fmt.mfu(d.mbu)}${d.dtype ? " · " + esc(d.dtype) : ""}`
-            : "MFU/MBU —（该切片未建模）",
-        ].filter(Boolean);
-        return `<b>${esc(d.name)}</b><br/>` + rows.join("<br/>");
-      } }, tooltipBase),
-      grid: { left: 10, right: 16, top: 10, bottom: 44, containLabel: true },
-      xAxis: axis({ type: "value", name: "ms", min: 0, max: spanMs, axisLabel: { formatter: v => (+v).toFixed(0) } }),
-      yAxis: axis({ type: "category", data: laneLabels, inverse: true,
-        axisLabel: { color: "#c9d4e0", width: 120, overflow: "truncate" } }),
+      tooltip: Object.assign({
+        trigger: "item", confine: true,
+        formatter: p => {
+          if (p.seriesType === "line") {
+            return `${esc(p.seriesName)}<br/>t = ${(+p.data[0]).toFixed(1)} ms · <b>${(+p.data[1]).toFixed(0)}%</b>`;
+          }
+          const d = p.data && p.data[4]; if (!d) return "";
+          const rows = [
+            `泳道 <b>${esc(labelOf[d.stream] || d.stream)}</b>`,
+            d.type ? `类型 ${esc(d.type)}` : null,
+            d.core ? `Core ${esc(d.core)}` : null,
+            `start ${d.start_ms.toFixed(3)} ms · 耗时 ${fmt.us(d.dur_ms * 1e3)}`,
+            (d.mfu != null || d.mbu != null)
+              ? `MFU ${fmt.mfu(d.mfu)} · MBU ${fmt.mfu(d.mbu)}${d.dtype ? " · " + esc(d.dtype) : ""}`
+              : "MFU/MBU —（该切片未建模）",
+          ].filter(Boolean);
+          return `<b>${esc(d.name)}</b><br/>` + rows.join("<br/>");
+        },
+      }, tooltipBase),
+      axisPointer: { link: [{ xAxisIndex: "all" }], type: "line",
+        lineStyle: { color: "#3fb6e0", opacity: .5, width: 1 } },
+      grid, xAxis, yAxis, series,
       dataZoom: [
-        { type: "inside", xAxisIndex: 0, filterMode: "weakFilter" },
-        { type: "slider", xAxisIndex: 0, height: 18, bottom: 8, filterMode: "weakFilter",
+        { type: "inside", xAxisIndex: allX, filterMode: "weakFilter" },
+        { type: "slider", xAxisIndex: allX, height: 16, bottom: 6, filterMode: "weakFilter",
           backgroundColor: "#0d1117", borderColor: "#2d3b52",
           fillerColor: "rgba(63,182,224,.15)", handleStyle: { color: "#3fb6e0" }, textStyle: { color: "#6b7888" } },
       ],
-      series: [{
-        type: "custom", progressive: 3000, progressiveThreshold: 3000, encode: { x: [0, 1], y: 2 },
-        renderItem: (params, api) => {
-          const s = api.coord([api.value(0), api.value(2)]);
-          const e = api.coord([api.value(1), api.value(2)]);
-          const h = Math.max(3, api.size([0, 1])[1] * 0.6);
-          const rect = echarts.graphic.clipRectByRect(
-            { x: s[0], y: s[1] - h / 2, width: Math.max(e[0] - s[0], 1), height: h },
-            { x: params.coordSys.x, y: params.coordSys.y, width: params.coordSys.width, height: params.coordSys.height });
-          return rect && { type: "rect", shape: rect, style: { fill: api.value(3) } };
-        },
-        data,
-      }],
-    };
-  }
-
-  function utilOption(tl) {
-    const avail = (tl.utilization || []).filter(u => u.available && u.series);
-    const binMs = tl.bin_us / 1e3;
-    const spanMs = +(tl.span_us / 1e3).toFixed(2);
-    const series = avail.map(u => ({
-      name: u.label, type: "line", showSymbol: false, smooth: true,
-      lineStyle: { width: 1.4, color: u.color }, itemStyle: { color: u.color },
-      areaStyle: { opacity: .1, color: u.color },
-      data: u.series.map((v, i) => [+(i * binMs).toFixed(2), +(v * 100).toFixed(1)]),
-    }));
-    return {
-      tooltip: Object.assign({ trigger: "axis", formatter: ps => {
-        const t = ps.length ? (+ps[0].data[0]).toFixed(1) : "0";
-        return `t = ${t} ms<br/>` + ps.map(p => `${p.marker}${esc(p.seriesName)} <b>${(+p.data[1]).toFixed(0)}%</b>`).join("<br/>");
-      } }, tooltipBase),
-      legend: { data: avail.map(u => u.label), top: 2, textStyle: { color: "#9aa7b8" }, icon: "roundRect" },
-      grid: { left: 10, right: 16, top: 30, bottom: 28, containLabel: true },
-      xAxis: axis({ type: "value", name: "ms", min: 0, max: spanMs, axisLabel: { formatter: v => (+v).toFixed(0) } }),
-      yAxis: axis({ type: "value", name: "%", min: 0, max: 100 }),
-      series,
+      graphic,
     };
   }
 
