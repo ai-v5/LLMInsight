@@ -95,7 +95,7 @@ def _build_geometry(prof, kindex: Dict[str, Any]) -> Dict[str, Any]:
     if not path:
         return {"available": False, "reason": "trace_view.json missing"}
 
-    bins = SETTINGS.timeline_bins
+    bins = SETTINGS.smart_timeline_bins
     max_slices = SETTINGS.timeline_max_slices
 
     # pass 1: process_name map + global time span
@@ -383,6 +383,6 @@ def compute_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
     kindex = eff.get("kernel_index", {}) or {}
     sig = file_signature(prof.trace_path)
     key = (f"smarttl:{_GEOM_VERSION}:{sig}:"
-           f"{SETTINGS.timeline_bins}:{SETTINGS.timeline_max_slices}")
+           f"{SETTINGS.smart_timeline_bins}:{SETTINGS.timeline_max_slices}")
     geom = cached_json(key, lambda: _build_geometry(prof, kindex))
     return _apply_chip(geom, eff)
