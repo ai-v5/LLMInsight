@@ -56,6 +56,14 @@ SCRIPT_PATH = _default_script_path()
 # The dataclass defaults below mirror the assumed Ascend 910B values so the app
 # still works if the YAML dir is missing.
 # --------------------------------------------------------------------------- #
+# Realistic per-op-class MFU ceilings. matmul saturates the cube near peak;
+# FlashAttention fwd (attention) and FlashAttentionScoreGrad (attention_grad)
+# leave structural headroom (softmax / masking / recompute), so their realistic
+# "done" target sits well below 100%. Above these, further kernel tuning isn't
+# worth it. Per-chip override via the YAML `mfu_ceilings:` block.
+_DEFAULT_MFU_CEILINGS = {"matmul": 0.95, "attention": 0.85, "attention_grad": 0.70}
+
+
 @dataclass
 class ChipSpec:
     name: str = "Ascend_910B"
@@ -76,6 +84,12 @@ class ChipSpec:
     dies_per_package: int = 1
     intra_package_link: Optional[str] = None
     assumed: bool = False
+    # Realistic per-op-class MFU ceilings (matmul / attention / attention_grad):
+    # the achievable-MFU target above which a kernel is "done". Defaults apply to
+    # any chip that omits the YAML block. Drives the "算子极致优化" What-if lever
+    # and the ceiling-aware operator ranking (see metrics/efficiency.py).
+    mfu_ceilings: Dict[str, float] = field(
+        default_factory=lambda: dict(_DEFAULT_MFU_CEILINGS))
 
     @property
     def hbm_capacity_gb(self) -> float:
@@ -106,6 +120,14 @@ class ChipSpec:
         if "FLOAT32" in d or "FP32" in d or d == "FLOAT":
             return self.vector_fp32_flops
         return self.peak_cube_flops(dtype)
+
+    def mfu_ceiling(self, op_class: Optional[str]) -> Optional[float]:
+        """Realistic MFU ceiling for a ceiling-governed op-class (matmul /
+        attention / attention_grad). None for any other class — those optimize
+        toward the 100% roofline rather than a capped ceiling."""
+        if not op_class:
+            return None
+        return self.mfu_ceilings.get(op_class)
 
 
 # --------------------------------------------------------------------------- #
@@ -150,6 +172,15 @@ def load_chip_spec(name: str) -> ChipSpec:
     bf16_vec = data.get("bf16_vector_tflops")
     vector_bf16 = (float(bf16_vec) * 1e12) if bf16_vec is not None else (2.0 * fp32)
 
+    # Per-op-class MFU ceilings: start from the defaults, override with whatever
+    # the YAML's `mfu_ceilings:` block specifies (so a chip can omit it entirely).
+    ceilings = dict(_DEFAULT_MFU_CEILINGS)
+    raw_ceilings = data.get("mfu_ceilings")
+    if isinstance(raw_ceilings, dict):
+        for ck, cv in raw_ceilings.items():
+            if cv is not None:
+                ceilings[str(ck)] = float(cv)
+
     return ChipSpec(
         name=spec_name,
         cube_fp16_flops=fp16,
@@ -164,6 +195,7 @@ def load_chip_spec(name: str) -> ChipSpec:
         dies_per_package=int(data.get("dies_per_package", 1) or 1),
         intra_package_link=data.get("intra_package_link"),
         assumed=bool(data.get("assumed", False)),
+        mfu_ceilings=ceilings,
     )
 
 

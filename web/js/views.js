@@ -60,8 +60,8 @@
           + `<tbody>${theo.available ? (baseRow + leverRows + `<tr id="wi-combined" style="border-top:2px solid rgba(94,224,184,.35)"></tr>`) : `<tr><td colspan=5 class="empty">—</td></tr>`}</tbody></table>
            ${cb ? (cb.peak_underestimated
              ? banner("warn","⚠️", `matmul 实测 MFU <strong>${cb.matmul_mfu_pct}%</strong> &gt; 100% → 假设芯片峰值偏低，请在 config.ChipSpec 校正。`)
-             : `<div class="note">matmul MFU ≈ <strong>${cb.matmul_mfu_pct}%</strong>；计算理想 ${fmt.us(cb.ideal_matmul_us)}，余量 ${fmt.us(cb.headroom_us)}。${cb.calibrated ? `（芯片峰值按实测 ${cb.observed_peak_tflops} TFLOPS 校准，假设 ${cb.assumed_peak_tflops != null ? cb.assumed_peak_tflops.toFixed(0) : "—"}）` : ""}</div>`) : ""}
-           <div class="note" style="font-size:11px;line-height:1.55;margin-top:8px;border-top:1px solid rgba(255,255,255,.06);padding-top:6px">💡 优化优先级：「通信完全掩盖」通常是最大单项 → 先做计算-通信重叠（--moe-fb-overlap / 异步通信），再压同步空泡。底部「已启用组合」随勾选实时计算叠加后的 step 与端到端 MFU。　⚠️ 「通信完全掩盖」与算子页 <strong>HcclLaunchAicpuKernel</strong> 是同一段集合通信（单卡几乎全是 Wait，非下发延迟），勿重复计入。</div>`)}
+             : `<div class="note">matmul MFU ≈ <strong>${cb.matmul_mfu_pct}%</strong>${cb.ceiling_based ? "（≈ 天花板）" : ""}；算子达天花板后计算 ${fmt.us(cb.ideal_matmul_us)}，可回收 ${fmt.us(cb.headroom_us)}。${cb.calibrated ? `（芯片峰值按实测 ${cb.observed_peak_tflops} TFLOPS 校准，假设 ${cb.assumed_peak_tflops != null ? cb.assumed_peak_tflops.toFixed(0) : "—"}）` : ""}</div>`) : ""}
+           <div class="note" style="font-size:11px;line-height:1.55;margin-top:8px;border-top:1px solid rgba(255,255,255,.06);padding-top:6px">💡 优化优先级：「通信完全掩盖」通常是最大单项 → 先做计算-通信重叠（--moe-fb-overlap / 异步通信），再压同步空泡。「算子极致优化」按各算子 MFU 天花板（matmul 95% / FA 85% / FAG 70%）收口，已达标算子不再投入——单项收益小而精，而非冲到 100% 的虚高。底部「已启用组合」随勾选实时计算叠加后的 step 与端到端 MFU。　⚠️ 「通信完全掩盖」与算子页 <strong>HcclLaunchAicpuKernel</strong> 是同一段集合通信（单卡几乎全是 Wait，非下发延迟），勿重复计入。</div>`)}
       </div>
       <div class="note">${esc(theo.available ? theo.note : "")}</div>`;
     charts([{ id: "ov-donut", option: donut(ov.composition.map(c => ({ name: c.name, value: c.us, pct: c.pct }))) }]);
@@ -121,8 +121,11 @@
     if (!ef.available) { root.innerHTML = `<div class="empty">无 kernel_details 数据</div>`; return; }
     const chip = ef.chip;
     const top = ef.top_optimization.slice(0, 15);
-    // optimization gain = wasted_us; the bracket shows the MFU/MBU a kernel would
-    // reach at its Roofline ideal time (e.g. "MFU 73→100"). after = before/efficiency.
+    // optimization gain = reclaim_us (time recoverable by tuning to the kernel's
+    // MFU ceiling; matmul/FA/FAG capped below 100%, others to the roofline). The
+    // bracket shows MFU/MBU at that ceiling floor (e.g. FAG "MFU 56→70"). Kernels
+    // already at/above their ceiling are filtered out upstream, so every row here
+    // has real headroom.
     const arrow = (b, a) => {
       if (b == null && a == null) return null;
       const f = x => (x == null ? "—" : Math.round(x * 100));
@@ -133,12 +136,19 @@
       if (t.mfu != null && t.mfu_after != null) segs.push(`MFU ${arrow(t.mfu, t.mfu_after)}`);
       if (t.mbu != null && t.mbu_after != null) segs.push(`MBU ${arrow(t.mbu, t.mbu_after)}`);
       const tail = segs.length ? ` <span style="color:var(--text-dim)">（${segs.join(", ")}）</span>` : "";
-      return `<strong style="color:var(--accent-2)">${fmt.us(t.wasted_us)}</strong>${tail}`;
+      return `<strong style="color:var(--accent-2)">${fmt.us(t.reclaim_us)}</strong>${tail}`;
     };
     const optRows = top.map(t =>
       `<tr><td class="mono">${esc(t.name)}</td><td><span class="tag">${esc(t.bound || "—")}</span></td><td>${fmt.us(t.dur_us)}</td><td>${gainCell(t)}</td></tr>`).join("");
     const byType = ef.by_type.slice(0, 20).map(t =>
-      `<tr><td>${esc(t.type)}</td><td class="mono">${t.dtype ? esc(t.dtype) : "—"}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td><td>${t.mfu != null ? fmt.mfu(t.mfu) : "—"}</td><td>${t.mbu != null ? fmt.mfu(t.mbu) : "—"}</td><td>${fmt.us(t.wasted_us)}</td></tr>`).join("");
+      `<tr><td>${esc(t.type)}</td><td class="mono">${t.dtype ? esc(t.dtype) : "—"}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td><td>${t.mfu != null ? fmt.mfu(t.mfu) : "—"}</td><td>${t.mbu != null ? fmt.mfu(t.mbu) : "—"}</td><td>${fmt.us(t.reclaim_us != null ? t.reclaim_us : t.wasted_us)}</td></tr>`).join("");
+    // 算子极致优化 summary: per-class ceilings + how many kernels are already
+    // saturated (filtered out of the ranking) + total reclaimable-to-ceiling time.
+    const oco = ef.op_ceiling_opt;
+    const ceilPct = x => Math.round((x || 0) * 100);
+    const ocNote = (oco && oco.ceilings)
+      ? `<div class="note" style="margin-top:8px">🎯 算子 MFU 天花板：matmul <strong>${ceilPct(oco.ceilings.matmul)}%</strong> / FA <strong>${ceilPct(oco.ceilings.attention)}%</strong> / FAG <strong>${ceilPct(oco.ceilings.attention_grad)}%</strong>　·　已达天花板 <strong>${oco.n_capped}/${oco.n_modeled}</strong> 个算子（不再优化）　·　全部提升至天花板可回收 <strong>${fmt.us(oco.total_reclaim_us)}</strong>。下方「优化候选 / 排行」已据此筛选。</div>`
+      : "";
     root.innerHTML = `
       ${banner(chip.calibrated ? "warn" : "info", "🎯",
         `芯片：<strong>${esc(chip.name)}</strong> · CUBE BF16 <strong>${(chip.cube_bf16_tflops||chip.peak_bf16_tflops).toFixed(0)}</strong> / VECTOR BF16 <strong>${(chip.vector_bf16_tflops||0).toFixed(0)}</strong> TFLOPS · HBM <strong>${chip.hbm_tbps.toFixed(2)} TB/s</strong>` +
@@ -147,15 +157,16 @@
           ? `　|　⚠️ 实测峰值 <strong>${chip.observed_peak_tflops.toFixed(0)} TFLOPS</strong> &gt; 假设值 → 已按实测校准（设真实 SKU 峰值可覆盖）`
           : `（${chip.assumed ? "参考峰值；顶部可切换芯片，或在 config.ChipSpec 校正" : "实测"}）`) +
         `　|　matmul MFU ≈ <strong>${ef.matmul_mfu != null ? (ef.matmul_mfu*100).toFixed(0)+"%" : "—"}</strong>　|　建模 kernel ${fmt.int(ef.kernels_with_flops)}/${fmt.int(ef.kernels_total)}`)}
+      ${ocNote}
       <div class="grid cols-2">
         ${panel("Roofline（dtype 归一化）", "点 = kernel；x = 归一化算术强度 (AI / 脊点，1 = 拐点)，y = MFU (占该算子 cube/vector 峰值 %)；单条屋顶线让不同 dtype 同台对照", `<div id="ef-roof" class="chart tall"></div>`)}
-        ${panel("优化空间排行 (Top 15)", "按「实测 − Roofline 理想」的浪费时间排序；颜色 = 瓶颈类型", `<div id="ef-waste" class="chart tall"></div>`)}
+        ${panel("优化空间排行 (Top 15)", "按到各算子 MFU 天花板的可回收时间排序；颜色 = 瓶颈类型", `<div id="ef-waste" class="chart tall"></div>`)}
       </div>
-      ${panel("优化候选明细 (Top 15)", "优化收益 = 实测 − Roofline 理想；括号为达到理想耗时后的 MFU / MBU", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>算子</th><th>瓶颈</th><th>当前耗时</th><th>优化收益</th></tr></thead><tbody>${optRows}</tbody></table></div>`, "span-2")}
-      ${panel("按算子类型 MFU / MBU / 浪费（MFU 按各算子 cube/vector 峰值）", "", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>dtype</th><th>Count</th><th>耗时</th><th>MFU</th><th>MBU</th><th>浪费(vs理想)</th></tr></thead><tbody>${byType}</tbody></table></div>`, "span-2")}`;
+      ${panel("优化候选明细 (Top 15)", "优化收益 = 到 MFU 天花板的可回收时间（matmul/FA/FAG 封顶各自天花板，其余到 Roofline）；已达天花板的算子不入表；括号为优化后的 MFU / MBU", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>算子</th><th>瓶颈</th><th>当前耗时</th><th>优化收益</th></tr></thead><tbody>${optRows}</tbody></table></div>`, "span-2")}
+      ${panel("按算子类型 MFU / MBU / 可回收（MFU 按各算子 cube/vector 峰值）", "", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>dtype</th><th>Count</th><th>耗时</th><th>MFU</th><th>MBU</th><th>可回收(vs天花板)</th></tr></thead><tbody>${byType}</tbody></table></div>`, "span-2")}`;
     charts([
       { id: "ef-roof", option: roofline(ef.scatter, chip) },
-      { id: "ef-waste", option: hbar(top.map(t => t.name.slice(0, 26)), top.map(t => t.wasted_us), "浪费 us",
+      { id: "ef-waste", option: hbar(top.map(t => t.name.slice(0, 26)), top.map(t => t.reclaim_us), "可回收 us",
           { fmt: v => fmt.us(v), color: top.map(t => boundColor(t.bound)) }) },
     ]);
   };
