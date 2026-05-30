@@ -437,11 +437,12 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         if a is None:
             a = kidx_acc[r["name"]] = {
                 "type": r["type"], "core": r["core"], "dtype": r["dtype"],
-                "flops": 0.0, "bytes": 0.0, "count": 0,
+                "flops": 0.0, "bytes": 0.0, "count": 0, "dur_us": 0.0,
                 "mfu_w": 0.0, "mfu_dur": 0.0, "mbu_w": 0.0, "mbu_dur": 0.0,
             }
         a["flops"] += r["flops"] or 0.0
         a["bytes"] += r["bytes"] or 0.0
+        a["dur_us"] += r["dur_us"]
         a["count"] += 1
         if r["mfu"] is not None:
             a["mfu_w"] += r["mfu"] * r["dur_us"]
@@ -455,6 +456,12 @@ def compute_efficiency(prof) -> Dict[str, Any]:
             "type": a["type"], "core": a["core"], "dtype": a["dtype"],
             "flops": round(a["flops"] / a["count"], 1) if a["flops"] else None,
             "bytes": round(a["bytes"] / a["count"], 1) if a["bytes"] else None,
+            # name-average throughput (FLOP/μs, byte/μs): chip-independent, lets the
+            # smart-timeline attribute work ∝ each slice's actual duration instead of
+            # a fixed per-call average — so a bin's utilization matches the name's MFU
+            # regardless of how this instance's duration compares to the average.
+            "flops_per_us": round(a["flops"] / a["dur_us"], 3) if (a["flops"] and a["dur_us"]) else None,
+            "bytes_per_us": round(a["bytes"] / a["dur_us"], 3) if (a["bytes"] and a["dur_us"]) else None,
             "mfu": round(a["mfu_w"] / a["mfu_dur"], 4) if a["mfu_dur"] else None,
             "mbu": round(a["mbu_w"] / a["mbu_dur"], 4) if a["mbu_dur"] else None,
             "count": a["count"],

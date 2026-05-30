@@ -43,7 +43,7 @@ STREAMS = [
 DEVICE_PROC = "Ascend Hardware"
 COMM_PROC = "Communication"
 
-_GEOM_VERSION = "v2"  # bump when geometry/stream logic changes (cache invalidation)
+_GEOM_VERSION = "v3"  # bump when geometry/stream logic changes (cache invalidation)
 
 
 def _is_notify_wait(name: str) -> bool:
@@ -182,11 +182,17 @@ def _build_geometry(prof, kindex: Dict[str, Any]) -> Dict[str, Any]:
                 matched_dev += 1
                 typ, core, dtype = ki["type"], ki["core"], ki["dtype"]
                 stream = _stream_from_meta(typ, core)
-                if ki.get("flops") is not None:
+                # attribute work ∝ this slice's actual duration at the name's average
+                # throughput (FLOP/μs). Using a fixed per-call average flops here would
+                # dilute long instances (util = mfu × avg_dur/this_dur); throughput ×
+                # dur instead keeps a fully-covered bin's util ≈ the name's MFU.
+                fpu = ki.get("flops_per_us")
+                if fpu is not None:
                     modeled_dev_us += dur
-                    spread(flops_sum, ts, ts + dur, ki["flops"])
-                if ki.get("bytes") is not None:
-                    spread(bytes_sum, ts, ts + dur, ki["bytes"])
+                    spread(flops_sum, ts, ts + dur, fpu * dur)
+                bpu = ki.get("bytes_per_us")
+                if bpu is not None:
+                    spread(bytes_sum, ts, ts + dur, bpu * dur)
             else:
                 typ = core = dtype = None
                 stream = _stream_from_name(name)
