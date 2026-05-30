@@ -7,11 +7,16 @@ from ..config import SETTINGS
 from . import core
 from .efficiency import compute_efficiency
 from .timeline import compute_timeline
+from .smart_timeline import compute_smart_timeline
 
 
 def compute_all(prof) -> Dict[str, Any]:
     ov = core.overview(prof)
     eff = compute_efficiency(prof)
+    # smart_timeline joins trace slices to eff["kernel_index"]; drop that heavy
+    # index from the public efficiency payload once the timeline has consumed it.
+    smart_tl = compute_smart_timeline(prof, eff)
+    eff.pop("kernel_index", None)
     return {
         "meta": {**prof.meta, "settings": SETTINGS.to_dict()},
         "overview": ov,
@@ -23,4 +28,5 @@ def compute_all(prof) -> Dict[str, Any]:
         "memory": core.memory(prof),
         "theoretical": core.theoretical(prof, ov, eff),
         "timeline": compute_timeline(prof),
+        "smart_timeline": smart_tl,
     }
