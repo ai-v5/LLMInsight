@@ -28,12 +28,14 @@
     const baseStep = theo.available ? theo.current_step_us : 0;
     // MFU column shows the gain vs base (step_mfu); the base row stays the absolute anchor.
     const dmfu = (nv) => (smfu == null || nv == null) ? "—" : (nv - smfu >= 0 ? "+" : "-") + fmt.mfu(Math.abs(nv - smfu));
+    // step column shows time saved vs base, in seconds (— at base, which saves nothing).
+    const saved = (us) => us > 0 ? "-" + (us / 1e6).toFixed(2) + " s" : "—";
     const baseRow = theo.available
-      ? `<tr style="color:var(--text-dim)"><td></td><td>当前（base）</td><td>${fmt.us(baseStep)}</td><td>—</td><td>${fmt.mfu(smfu)}</td></tr>`
+      ? `<tr style="color:var(--text-dim)"><td></td><td>当前（base）</td><td>—</td><td>—</td><td>${fmt.mfu(smfu)}</td></tr>`
       : "";
     const leverRows = levers.map(w =>
       `<tr><td style="text-align:center"><input type="checkbox" class="wi-lever" style="accent-color:#5ee0b8;cursor:pointer" data-save="${w.save_us}" checked></td>`
-      + `<td>${esc(w.scenario)}</td><td>${fmt.us(w.new_step_us)}</td>`
+      + `<td>${esc(w.scenario)}</td><td style="color:var(--accent-2)">${saved(w.save_us)}</td>`
       + `<td style="color:var(--accent-2)">-${fmt.pct(w.save_pct)}</td>`
       + `<td style="color:var(--accent)">${dmfu(w.new_mfu)}</td></tr>`).join("");
     const cb = theo.available && theo.compute_bound;
@@ -49,7 +51,7 @@
       if (row) row.innerHTML =
         `<td style="text-align:center;color:var(--accent-2)">✓</td>`
         + `<td><strong>已启用组合 (${ticked.length}/${levers.length})</strong></td>`
-        + `<td><strong>${fmt.us(newStep)}</strong></td>`
+        + `<td style="color:var(--accent-2)"><strong>${saved(saveUs)}</strong></td>`
         + `<td style="color:var(--accent-2)">${saveUs > 0 ? "-" + fmt.pct(savePct) : "—"}</td>`
         + `<td style="color:var(--accent)"><strong>${dmfu(newMfu)}</strong></td>`;
     };
@@ -58,7 +60,7 @@
       <div class="grid cols-2" style="margin-top:16px">
         ${panel("Step 时间构成", "Computing / 未掩盖通信 / Free（单位 us）", `<div id="ov-donut" class="chart"></div>`)}
         ${panel("理论上界 & What-if 收益模拟", "每项为单独启用的收益；勾选后底部「已启用组合」实时显示叠加效果",
-          `<table class="tbl"><thead><tr><th style="width:38px">启用</th><th>优化项</th><th>单独预计 step</th><th>单独节省</th><th>端到端 MFU</th></tr></thead>`
+          `<table class="tbl"><thead><tr><th style="width:38px">启用</th><th>优化项</th><th>单独节省(s)</th><th>单独节省(%)</th><th>端到端 MFU</th></tr></thead>`
           + `<tbody>${theo.available ? (baseRow + leverRows + `<tr id="wi-combined" style="border-top:2px solid rgba(94,224,184,.35)"></tr>`) : `<tr><td colspan=5 class="empty">—</td></tr>`}</tbody></table>
            ${cb ? (cb.peak_underestimated
              ? banner("warn","⚠️", `matmul 实测 MFU <strong>${cb.matmul_mfu_pct}%</strong> &gt; 100% → 假设芯片峰值偏低，请在 config.ChipSpec 校正。`)
