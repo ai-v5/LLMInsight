@@ -276,6 +276,18 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]:
     vector_series = ([round(_clamp01(vec_occ[b] / bin_us), 4) for b in range(bins)]
                      if bin_us > 0 else [0.0] * bins)
 
+    # un-clamped absolute per-bin values for the hover tooltip (reveal >100% overshoot
+    # that the clamped utilization % hides — e.g. overlapping streams pushing past peak)
+    cube_abs = ([round(flops_sum[b] / bin_s / 1e12, 2) for b in range(bins)]
+                if bin_s > 0 else [0.0] * bins)        # achieved TFLOP/s
+    hbm_abs = ([round(bytes_sum[b] / bin_s / 1e9, 1) for b in range(bins)]
+               if bin_s > 0 else [0.0] * bins)         # achieved GB/s
+    vec_abs = [round(vec_occ[b], 1) for b in range(bins)]    # busy μs within bin
+    comm_abs = [round(comm_occ[b], 1) for b in range(bins)]  # busy μs within bin
+    peak_tflops = round(effective_peak / 1e12, 1)
+    peak_gbps = round(hbm_bw / 1e9, 1)
+    bin_us_r = round(bin_us, 1)
+
     # per-slice representative MFU/MBU (by name) + truncated display name
     out_slices: List[Dict[str, Any]] = []
     for s in geom["slices"]:
@@ -303,15 +315,23 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]:
     utilization = [
         {"key": "cube", "label": "Cube 利用率", "available": True, "unit": "%",
          "color": "#4f9fe0", "series": compute_series,
+         "abs": cube_abs, "abs_unit": "TFLOP/s", "peak": peak_tflops,
+         "peak_unit": "TFLOP/s", "kind": "rate",
          "note": "Σ建模FLOPs /（桶时长 × Cube 有效峰值）"},
         {"key": "vector", "label": "Vector 利用率", "available": True, "unit": "%",
          "color": "#4caf50", "series": vector_series,
+         "abs": vec_abs, "abs_unit": "μs", "peak": bin_us_r,
+         "peak_unit": "μs", "kind": "occupancy",
          "note": "Vector 泳道每桶时间占用率（向量算子无 FLOP 模型，按占用计）"},
         {"key": "hbm_bw", "label": "HBM 利用率", "available": True, "unit": "%",
          "color": "#e3b341", "series": hbm_series,
+         "abs": hbm_abs, "abs_unit": "GB/s", "peak": peak_gbps,
+         "peak_unit": "GB/s", "kind": "rate",
          "note": "Σ读写字节 /（桶时长 × HBM 带宽）"},
         {"key": "comm", "label": "通信 利用率", "available": True, "unit": "%",
          "color": "#f0655c", "series": comm_series,
+         "abs": comm_abs, "abs_unit": "μs", "peak": bin_us_r,
+         "peak_unit": "μs", "kind": "occupancy",
          "note": "Communication 泳道每桶时间占用率（已剔除 Notify_Wait 同步等待）"},
         {"key": "hbm_cap", "label": "显存容量 (HBM)", "available": False,
          "reason": "待 memory_record.csv 采集（与「显存洞察」页口径一致）"},
