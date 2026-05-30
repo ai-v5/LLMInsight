@@ -26,6 +26,7 @@ from ..parser import load_profile
 from ..metrics import compute_all
 from ..metrics import core as metrics_core
 from ..metrics.efficiency import compute_efficiency
+from ..metrics.smart_timeline import compute_smart_timeline
 from ..rules import run_rules, read_capture_config
 from ..insight import generate_insights, get_provider
 
@@ -84,6 +85,11 @@ class AppState:
             if not set_chip(key):  # loads configs/chips/<key>.yaml (alias-aware)
                 return {"ok": False, "error": f"unknown chip '{key}'"}
             eff = compute_efficiency(self.prof)
+            # MFU/MBU/算力/带宽 on the smart-timeline scale with the chip; recompute
+            # its cheap overlay (the geometry layer hits the trace-signature cache,
+            # so no 104MB re-scan) before dropping the heavy index from eff.
+            self.metrics["smart_timeline"] = compute_smart_timeline(self.prof, eff)
+            eff.pop("kernel_index", None)
             self.metrics["efficiency"] = eff
             self.metrics["theoretical"] = metrics_core.theoretical(
                 self.prof, self.metrics.get("overview", {}), eff)
@@ -116,7 +122,7 @@ def _meta() -> Dict[str, Any]:
         "data_dir": SETTINGS.data_dir,
         "sections": ["overview", "hotspots", "efficiency", "communication",
                      "hidden_overhead", "attribution", "memory", "theoretical",
-                     "timeline", "insights"],
+                     "timeline", "smart_timeline", "insights"],
     }
 
 
@@ -148,6 +154,7 @@ ROUTES: Dict[str, Callable[[], Any]] = {
     "/api/memory": _section("memory"),
     "/api/theoretical": _section("theoretical"),
     "/api/timeline": _section("timeline"),
+    "/api/smart_timeline": _section("smart_timeline"),
     "/api/insights": _insights,
     "/api/llm": _llm_run,
     "/api/all": lambda: STATE.metrics,

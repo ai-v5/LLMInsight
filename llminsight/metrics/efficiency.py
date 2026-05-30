@@ -341,8 +341,44 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     scatter.sort(key=lambda s: s["dur_us"], reverse=True)
     scatter = scatter[:1500]
 
+    # ---- per-name kernel index (for the smart-timeline trace join) -----------
+    # Trace slices carry only a name (no shapes), so the timeline looks up
+    # type/core/dtype and a representative MFU/MBU by kernel name. flops/bytes are
+    # per-call averages; mfu/mbu are duration-weighted over the per-row values —
+    # those were already routed to the correct cube/vector peak, so the index stays
+    # correct when the chip (and thus those peaks) changes.
+    kidx_acc: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        a = kidx_acc.get(r["name"])
+        if a is None:
+            a = kidx_acc[r["name"]] = {
+                "type": r["type"], "core": r["core"], "dtype": r["dtype"],
+                "flops": 0.0, "bytes": 0.0, "count": 0,
+                "mfu_w": 0.0, "mfu_dur": 0.0, "mbu_w": 0.0, "mbu_dur": 0.0,
+            }
+        a["flops"] += r["flops"] or 0.0
+        a["bytes"] += r["bytes"] or 0.0
+        a["count"] += 1
+        if r["mfu"] is not None:
+            a["mfu_w"] += r["mfu"] * r["dur_us"]
+            a["mfu_dur"] += r["dur_us"]
+        if r["mbu"] is not None:
+            a["mbu_w"] += r["mbu"] * r["dur_us"]
+            a["mbu_dur"] += r["dur_us"]
+    kernel_index: Dict[str, Dict[str, Any]] = {}
+    for name, a in kidx_acc.items():
+        kernel_index[name] = {
+            "type": a["type"], "core": a["core"], "dtype": a["dtype"],
+            "flops": round(a["flops"] / a["count"], 1) if a["flops"] else None,
+            "bytes": round(a["bytes"] / a["count"], 1) if a["bytes"] else None,
+            "mfu": round(a["mfu_w"] / a["mfu_dur"], 4) if a["mfu_dur"] else None,
+            "mbu": round(a["mbu_w"] / a["mbu_dur"], 4) if a["mbu_dur"] else None,
+            "count": a["count"],
+        }
+
     return {
         "available": True,
+        "kernel_index": kernel_index,
         "chip": {
             "name": chip.name,
             "peak_bf16_tflops": chip.cube_fp16_flops / 1e12,          # CUBE bf16 (matmul-MFU denom)

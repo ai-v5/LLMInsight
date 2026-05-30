@@ -12,6 +12,7 @@
     { id: "attribution",     label: "结构归因",    ico: "🧩", sub: "MLA / MoE / Norm / Optimizer" },
     { id: "memory",          label: "显存洞察",    ico: "🧠", sub: "内存-时间权衡（待采集）" },
     { id: "timeline",        label: "时间线",      ico: "📽️", sub: "泳道占用 · 频率 · 切片" },
+    { id: "smart_timeline",  label: "智能时间线",  ico: "🎞️", star: true, sub: "算子泳道 Gantt · MFU/MBU 悬停 · 利用率泳道" },
     { id: "insights",        label: "LLM 洞察",    ico: "🤖", star: true, sub: "诊断卡片 + 可选 LLM 叙述" },
   ];
 
@@ -70,9 +71,9 @@
 
   // Views whose numbers depend on the chip peak (MFU/MBU/Roofline/理论上界/cards)
   // or capacity (memory view's 显存容量).
-  const CHIP_VIEWS = ["overview", "efficiency", "insights", "memory"];
+  const CHIP_VIEWS = ["overview", "efficiency", "insights", "memory", "smart_timeline"];
   const CHIP_CACHES = ["/api/efficiency", "/api/theoretical", "/api/overview",
-                       "/api/insights", "/api/meta", "/api/all"];
+                       "/api/insights", "/api/meta", "/api/all", "/api/smart_timeline"];
   async function onChipChange(key) {
     const sel = document.getElementById("chip-select");
     const note = document.getElementById("chip-note");
