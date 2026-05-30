@@ -92,9 +92,15 @@ def main():
     # cube vs vector peaks are surfaced separately (950DT: cube 432 TF, vector 54 TF).
     chk("950DT cube bf16 TFLOPS", ch.get("cube_bf16_tflops"), 432.0, 1.0)
     chk("950DT vector bf16 TFLOPS", ch.get("vector_bf16_tflops"), 54.0, 1.0)
-    chk_true("theoretical whatif present", len(m["theoretical"].get("whatif", [])) == 3)
-    chk_true("end-to-end step MFU present", m["theoretical"].get("step_mfu") is not None,
-             f"(step_mfu={m['theoretical'].get('step_mfu')})")
+    theo_m = m["theoretical"]
+    chk_true("theoretical what-if atomic levers (2)", len(theo_m.get("whatif", [])) == 2)
+    chk_true("each what-if lever carries new_mfu",
+             all(w.get("new_mfu") is not None for w in theo_m.get("whatif", [])))
+    chk_true("combined what-if present (with MFU)",
+             (theo_m.get("whatif_combined") or {}).get("new_mfu") is not None,
+             f"(combined={theo_m.get('whatif_combined')})")
+    chk_true("end-to-end step MFU present", theo_m.get("step_mfu") is not None,
+             f"(step_mfu={theo_m.get('step_mfu')})")
 
     print("\n== rule engine (insight cards) ==")
     # 11 under the default 950DT: peak == observed ceiling, so the peak_underestimated
