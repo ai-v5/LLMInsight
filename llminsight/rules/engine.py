@@ -308,20 +308,35 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
         near = s.get("near_oom")
         # 12a. HBM 容量余量 / OOM 风险
         sev = "high" if near else ("medium" if (util or 0) >= 75 else "info")
+        # Memory-saving features actually in effect — read from the PROFILING-
+        # derived config (never a launch script). On the NEW sample recompute is
+        # off and swap is absent, so we must NOT claim they are on.
+        rc = _cstate("recompute")
+        swap_on = bool((capture.get("flags", {}) or {}).get("swap-optimizer"))
+        savers = ([f"recompute={rc}"] if rc in ("full", "selective") else []) \
+            + (["swap-optimizer"] if swap_on else [])
+        saver_state = ("当前已开 " + " + ".join(savers) + " 压显存") if savers \
+            else "当前未开启 recompute/swap 等压显存手段（由 profiling 反推）"
+        if near:
+            advice = ("已接近显存极限：可开启选择性重计算 / swap-optimizer 腾出激活显存，"
+                      "并回收「保留未占用」显存（见碎片项）；勿在此配置上再增激活。") if not savers else \
+                     ("已接近显存极限：要扩 batch/序列或调并行，先回收「保留未占用」显存（见碎片项）"
+                      "或换更大显存卡；勿在此配置上再增激活。")
+        else:
+            advice = (f"显存尚有余量，可评估放宽 {' / '.join(savers)} 以换吞吐。") if savers \
+                else "显存尚有余量，暂无需额外压显存手段。"
         cards.append(_card(
             "memory_headroom", sev, "显存",
             f"显存峰值 {s.get('peak_reserved_gib')} GiB ≈ {util}% of {s.get('capacity_gb')} GB"
             + ("（逼近容量，OOM 风险高）" if near else "（尚有余量）"),
             f"进程 HBM 峰值保留 {s.get('peak_reserved_mb')} MB，剩余 headroom 仅 {s.get('headroom_gib')} GiB；"
-            "当前已开 recompute=full + swap-optimizer 压显存，仍接近上限。",
-            ("已接近显存极限：要扩 batch/序列或调并行，先回收「保留未占用」显存（见碎片项）或换更大显存卡；"
-             "勿在此配置上再增激活。" if near else
-             "显存尚有余量，可评估放宽 recompute/swap 以换吞吐。"),
+            + saver_state + ("，已逼近容量上限。" if near else "。"),
+            advice,
             f"避免 OOM；可用 headroom {s.get('headroom_gib')} GiB。",
             0.9,
             {"peak_reserved_mb": s.get("peak_reserved_mb"), "util_pct": util,
              "capacity_gb": s.get("capacity_gb"), "headroom_gib": s.get("headroom_gib"),
-             "near_oom": near},
+             "near_oom": near, "recompute": rc, "swap_optimizer": swap_on},
         ))
         # 12b. 保留未占用（碎片 + 通信/运行时保留）
         frag = s.get("fragmentation_mb")

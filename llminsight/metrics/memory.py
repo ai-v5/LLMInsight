@@ -29,18 +29,21 @@ _MODULE_EPS_MB = 1.0
 
 # --------------------------------------------------------------------------- #
 def _tradeoffs() -> List[Dict[str, str]]:
-    """Config-driven recompute/swap advisor (shared by both code paths so the
-    unavailable fallback is unchanged from the historic core.memory output)."""
+    """Generic recompute/swap memory↔time advisor (shared by both code paths so
+    the unavailable fallback is unchanged from the historic core.memory output).
+    Phrased config-neutrally — whether these levers are actually on is reported
+    by the memory_headroom card from the profiling-derived config, not asserted
+    here."""
     return [
         {
-            "feature": "--recompute-granularity full (uniform, 1 层)",
+            "feature": "--recompute-granularity（重计算）",
             "effect": "省激活显存，代价是反向重跑前向 → 增加计算耗时。",
-            "advice": "显存不紧张时改选择性重计算 / 减少重计算层，换取吞吐。",
+            "advice": "显存紧张时开启（full → 选择性逐步加码）；显存宽裕时减少重计算层换取吞吐。",
         },
         {
-            "feature": "--swap-optimizer",
+            "feature": "--swap-optimizer（优化器状态换入换出）",
             "effect": "优化器状态在 HBM↔Host 间换入换出，省 HBM、代价是 H2D/D2H 拷贝与同步。",
-            "advice": "若 PCIe/同步成为瓶颈，评估关闭 swap 或仅 swap 部分状态。",
+            "advice": "显存紧张时开启；若 PCIe/同步成为瓶颈，仅 swap 部分状态或关闭。",
         },
     ]
 
