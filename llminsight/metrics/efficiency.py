@@ -14,7 +14,7 @@ from ..parser.profile import num
 from ..parser.shapes import parse_shapes, parse_dtypes, numel
 
 MATMUL_TYPES = {
-    "MatMulV3", "MatMul", "GroupedMatmul", "GemmV3", "Gemm",
+    "MatMulV3", "MatMul", "GroupedMatmul", "GroupedMatmulAdd", "GemmV3", "Gemm",
     "BatchMatMul", "BatchMatMulV2",
 }
 

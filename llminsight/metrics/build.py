@@ -6,6 +6,7 @@ from typing import Any, Dict
 from ..config import SETTINGS
 from . import core
 from .efficiency import compute_efficiency
+from .memory import compute_memory
 from .timeline import compute_timeline
 from .smart_timeline import compute_smart_timeline
 
@@ -36,7 +37,7 @@ def compute_all(prof, capture: Dict[str, Any] = None) -> Dict[str, Any]:
         "communication": core.communication(prof),
         "hidden_overhead": core.hidden_overhead(prof, ov),
         "attribution": core.attribution(prof),
-        "memory": core.memory(prof),
+        "memory": compute_memory(prof),
         "theoretical": core.theoretical(prof, ov, eff, capture),
         "timeline": compute_timeline(prof),
         "smart_timeline": smart_tl,

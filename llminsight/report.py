@@ -566,13 +566,80 @@ def _sec_attribution(attr: Dict) -> str:
 def _sec_memory(mem: Dict) -> str:
     if not mem:
         return ""
-    rows = [[_e(t.get("feature", "")), _e(t.get("effect", "")), _e(t.get("advice", ""))]
-            for t in (mem.get("config_tradeoffs") or [])]
-    tbl = _table(["配置开关", "效果", "建议"], rows, align=["l", "l", "l"])
-    banner = ('<div class="banner info">本次采集无 memory-level 数据'
-              '（memory_record.csv / npu_module_mem.csv 缺失），无法绘制真实 HBM 峰值/构成；'
-              '以下为配置驱动的内存-时间权衡顾问。</div>')
-    return _panel("显存洞察 · 内存-时间权衡", "待 memory-level 采集接入", banner + tbl)
+    trade_rows = [[_e(t.get("feature", "")), _e(t.get("effect", "")), _e(t.get("advice", ""))]
+                  for t in (mem.get("config_tradeoffs") or [])]
+    trade_tbl = _table(["配置开关", "效果", "建议"], trade_rows, align=["l", "l", "l"])
+
+    # ---- graceful fallback: capture lacked memory-level files ----
+    if not (mem.get("available") and mem.get("hbm_timeline_available")):
+        banner = ('<div class="banner info">本次采集无 memory-level 数据'
+                  '（memory_record.csv / npu_module_mem.csv 缺失），无法绘制真实 HBM 峰值/构成；'
+                  '以下为配置驱动的内存-时间权衡顾问。</div>')
+        return _panel("显存洞察 · 内存-时间权衡", "待 memory-level 采集接入", banner + trade_tbl)
+
+    # ---- real memory-level data ----
+    s = mem.get("summary", {})
+
+    def gib(mb):
+        return "—" if mb is None else f"{mb / 1024:.1f} GiB"
+
+    near = s.get("near_oom")
+    snap = [
+        _metric("HBM 峰值占用", gib(s.get("peak_reserved_mb")),
+                f'{_pct(s.get("util_pct"))} of {s.get("capacity_gb")} GB', "warn" if near else "good"),
+        _metric("活跃张量峰值", gib(s.get("peak_allocated_mb")), "Total Allocated"),
+        _metric("保留未占用 (碎片)", gib(s.get("fragmentation_mb")),
+                f'占峰值 {_pct(s.get("fragmentation_pct"))}', "warn" if (s.get("fragmentation_pct") or 0) >= 15 else ""),
+        _metric("可用 headroom", gib(s.get("headroom_mb")), f'{s.get("capacity_gb")} GB', "bad" if near else "good"),
+    ]
+    banner = (f'<div class="banner {"warn" if near else "info"}">'
+              + (f'<strong>显存逼近容量</strong> —— 峰值保留 {gib(s.get("peak_reserved_mb"))} ≈ '
+                 f'<strong>{_pct(s.get("util_pct"))}</strong> of {s.get("capacity_gb")} GB，可用 headroom 仅 '
+                 f'{gib(s.get("headroom_mb"))}，OOM 风险高。' if near
+                 else f'HBM 峰值保留 {gib(s.get("peak_reserved_mb"))}（{_pct(s.get("util_pct"))} of '
+                      f'{s.get("capacity_gb")} GB），尚有 {gib(s.get("headroom_mb"))} headroom。')
+              + '</div>')
+
+    decomp_rows = [
+        ["峰值已保留 (进程 HBM 占用，计入容量)", gib(s.get("peak_reserved_mb"))],
+        ["活跃张量峰值 (Total Allocated)", gib(s.get("peak_allocated_mb"))],
+        ["分配器缓存池 (PTA/PTA+GE Reserved)", gib(s.get("pool_reserved_mb"))],
+        ["└ 分配器缓存碎片 (池保留 − 活跃)", gib(s.get("alloc_slack_mb"))],
+        ["通信/workspace/运行时保留", gib(s.get("nontensor_reserved_mb"))
+         + (f"（HCCL {gib(s.get('hccl_reserved_mb'))}）" if s.get("hccl_reserved_mb") else "")],
+    ]
+    decomp_tbl = _table(["构成（峰值口径近似）", "大小"],
+                        [[_e(r[0]), r[1]] for r in decomp_rows], align=["l", "r"])
+
+    mod_rows = [[_e(o.get("module", "")), gib(o.get("mb")), _pct(o.get("pct"))]
+                for o in (mem.get("modules") or [])]
+    mod_tbl = _table(["驱动模块", "保留峰值", "占比"], mod_rows, align=["l", "r", "r"])
+
+    alloc_rows = [[_e(a.get("name", "")), gib(a.get("total_mb")),
+                   f'{a.get("count", "")}', gib(a.get("max_mb"))]
+                  for a in (mem.get("top_allocators") or [])]
+    alloc_tbl = _table(["框架算子", "累计分配", "次数", "单次峰值"], alloc_rows,
+                       align=["l", "r", "r", "r"])
+
+    live_rows = [[_e(l.get("name", "")), f'{l.get("life_s", 0):.2f} s', gib(l.get("mb"))]
+                 for l in (mem.get("longest_lived") or [])]
+    live_tbl = _table(["张量(算子)", "存活", "大小"],
+                      live_rows or [["—", "—", "—"]], align=["l", "r", "r"])
+
+    body = (
+        f'<div class="grid g4">{"".join(snap)}</div>'
+        + banner
+        + '<div class="two-col"><div><div class="mini-h">显存构成（峰值口径近似）</div>'
+        + decomp_tbl + '</div><div><div class="mini-h">驱动模块保留峰值（HCCL=集合通信缓冲）</div>'
+        + mod_tbl + '</div></div>'
+        + '<div class="two-col"><div><div class="mini-h">分配压力 Top 框架算子（累计分配）</div>'
+        + alloc_tbl + '</div><div><div class="mini-h">最长存活张量（≥1 MB，长期占用 HBM）</div>'
+        + live_tbl + '</div></div>'
+        + '<div class="mini-h">内存 ↔ 时间权衡顾问（配置驱动）</div>' + trade_tbl
+        + (f'<div class="note">{_e(mem.get("note", ""))}</div>' if mem.get("note") else ""))
+    return _panel("显存洞察 · HBM 峰值 / 碎片 / 内存-时间权衡",
+                  f'峰值 {gib(s.get("peak_reserved_mb"))} · {_pct(s.get("util_pct"))} of {s.get("capacity_gb")} GB · {s.get("span_s")}s · {s.get("samples")} 采样',
+                  body)
 
 
 _UTIL_SHORT = {"cube": "Cube", "vector": "Vector", "hbm_bw": "HBM", "comm": "通信"}
