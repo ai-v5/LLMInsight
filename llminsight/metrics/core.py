@@ -195,7 +195,7 @@ def _op_time(op: pd.DataFrame, names: List[str]) -> float:
     return _f(num(op[mask]["Total Time(us)"]).sum())
 
 
-def hidden_overhead(prof, ov: Dict[str, Any]) -> Dict[str, Any]:
+def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None) -> Dict[str, Any]:
     api = prof.api_statistic
     op = prof.op_statistic
     kd = prof.kernel_details
@@ -216,6 +216,16 @@ def hidden_overhead(prof, ov: Dict[str, Any]) -> Dict[str, Any]:
     contiguous = _api_sum(api, r"[Cc]ontiguous|Copy|Memcpy")
     # --- dynamic shape ---
     dyn = _api_sum(api, r"MaskedSelect|NonZero|Unique|MaskedScatter")
+
+    # Capture/config state is RECONSTRUCTED FROM PROFILING (parser.derive), never a
+    # launch script. The host_sync suggestion and the recompute bucket below follow
+    # these derived facts so they stay consistent across datasets and with
+    # rules/engine.py + summarizer.py — no hardcoded blocking / full-recompute.
+    cap = capture or {}
+    cap_state = cap.get("capture", {}) or {}
+    blocking = bool((cap_state.get("blocking", {}) or {}).get("value")) if cap_state else \
+        ((cap.get("env") or {}).get("ASCEND_LAUNCH_BLOCKING") == "1")
+    recompute = (cap_state.get("recompute", {}) or {}).get("value")  # full|selective|off|None
 
     buckets = [
         {
@@ -271,7 +281,11 @@ def hidden_overhead(prof, ov: Dict[str, Any]) -> Dict[str, Any]:
             "us": round(sync_stream["time_us"], 1),
             "detail": f"aclrtSynchronize* 累计 {sync_stream['time_us']:,.0f}us，单次 max {sync_stream['max_us']:,.0f}us",
             "source": "api_statistic",
-            "suggestion": "ASCEND_LAUNCH_BLOCKING=1 放大了同步开销（采集干扰项）；正式训练应关闭。",
+            "suggestion": (
+                "ASCEND_LAUNCH_BLOCKING=1 放大了同步开销（采集干扰项）；正式训练应关闭。" if blocking else
+                "本次未检出 blocking（profiling 反推）：该同步主要来自动态 shape 的 D2H 同步"
+                "（aclnnMaskedSelect 等）→ 固定 expert capacity / 对路由结果 padding，合并或减少同步点。"
+            ),
         },
         {
             "key": "dynamic_shape", "domain": "host",
@@ -281,15 +295,22 @@ def hidden_overhead(prof, ov: Dict[str, Any]) -> Dict[str, Any]:
             "source": "api_statistic",
             "suggestion": "MoE 路由/掩码导致 host 重编译/同步 → 固定 capacity / padding。",
         },
-        {
-            "key": "recompute", "domain": "config",
-            "label": "重计算开销 (Full Recompute)",
-            "us": None,
-            "detail": "训练脚本启用 --recompute-granularity full（uniform, 1 层）→ 反向重跑前向。本次采集未单独标注，估算见理论分析。",
-            "source": "训练脚本配置",
-            "suggestion": "评估「选择性重计算 / 减少重计算层」做显存↔耗时平衡。",
-        },
     ]
+    # 重计算桶：仅当 profiling 反推重计算开启（full/selective）时呈现；反推为 off/未知时
+    # 本次配置无此开销，不臆造（与「配置只来自 profiling、不依赖启动脚本」一致）。
+    if recompute in ("full", "selective"):
+        _rc_kind = "Full" if recompute == "full" else "Selective"
+        buckets.append({
+            "key": "recompute", "domain": "config",
+            "label": f"重计算开销 ({_rc_kind} Recompute)",
+            "us": None,
+            "detail": (
+                f"profiling 反推重计算={recompute}（由 FlashAttention 前向/反向次数比推断）→ 反向重跑前向。"
+                "本次采集未单独标注重计算耗时，估算见理论分析。"
+            ),
+            "source": "profiling 反推 (parser.derive)",
+            "suggestion": "评估「选择性重计算 / 减少重计算层」做显存↔耗时平衡。",
+        })
     device_total = sum(b["us"] for b in buckets
                        if b["domain"] == "device" and b.get("additive", True)
                        and isinstance(b["us"], (int, float)))
@@ -492,12 +513,29 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
     g_lo = min(free, stage * REALISTIC_FREE_RESIDUAL_BAND[1])   # 0.05 → higher floor
     g_hi = min(free, stage * REALISTIC_FREE_RESIDUAL_BAND[0])   # 0.02 → lower floor
     rec2_mid, rec2_lo, rec2_hi = free - g_mid, free - g_lo, free - g_hi
+    # floor_basis / methods follow the PROFILING-DERIVED blocking: only blame & propose
+    # closing ASCEND_LAUNCH_BLOCKING when it was actually detected. When derive says
+    # async (the case on both samples), the cheapest-cut method and the "关 blocking"
+    # floor prefix would be a fabricated config assertion — drop them.
     free_caveats = []
     if blocking:
         free_caveats.append("当前 Free 主因是 ASCEND_LAUNCH_BLOCKING=1 的逐算子同步（采集失真）；"
                             "关掉后大部分气泡即塌缩。")
+        _free_floor_pre = "关 blocking + 图模式 + 固定 capacity 后"
+        _free_methods = [
+            "关 ASCEND_LAUNCH_BLOCKING（最大且最廉价的一刀）",
+            "图模式 / ACL Graph 下沉、TASK_QUEUE_ENABLE 下发队列降 host 下发压力",
+            "固定 MoE capacity / padding，消除动态 shape 的 host 往返",
+            "减少 D2H；评估 --swap-optimizer 换入换出代价",
+        ]
     else:
-        free_caveats.append("采集未开 blocking：Free 多为真实下发/同步气泡，按上述方法逐项压缩。")
+        free_caveats.append("采集未开 blocking（profiling 反推）：Free 多为真实下发/同步气泡，按下述方法逐项压缩。")
+        _free_floor_pre = "图模式 + 固定 capacity 后"
+        _free_methods = [
+            "图模式 / ACL Graph 下沉、TASK_QUEUE_ENABLE 下发队列降 host 下发压力",
+            "固定 MoE capacity / padding，消除动态 shape 的 host 往返",
+            "减少 D2H；评估 --swap-optimizer 换入换出代价",
+        ]
     levers.append({
         "id": "free_zero", "title": "空泡 Free", "can_reach_zero": False,
         "scenario": "空泡 Free {m:.1f}%→{f:.1f}%".format(
@@ -507,17 +545,13 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
         "recoverable_us": round(rec2_mid, 1), "recoverable_pct": _pct(rec2_mid, stage),
         "recoverable_lo_us": round(rec2_lo, 1), "recoverable_hi_us": round(rec2_hi, 1),
         "new_step_us": round(stage - rec2_mid, 1), "new_mfu": _mfu_at(stage - rec2_mid),
-        "floor_basis": "关 blocking + 图模式 + 固定 capacity 后，Free 通常落到 step 的 "
+        "floor_basis": "{pre}，Free 通常落到 step 的 "
                        "~{tgt:.0f}%（{lo:.0f}–{hi:.0f}%），无法归零。".format(
+                           pre=_free_floor_pre,
                            tgt=REALISTIC_FREE_RESIDUAL * 100,
                            lo=REALISTIC_FREE_RESIDUAL_BAND[0] * 100,
                            hi=REALISTIC_FREE_RESIDUAL_BAND[1] * 100),
-        "methods": [
-            "关 ASCEND_LAUNCH_BLOCKING（最大且最廉价的一刀）",
-            "图模式 / ACL Graph 下沉、TASK_QUEUE_ENABLE 下发队列降 host 下发压力",
-            "固定 MoE capacity / padding，消除动态 shape 的 host 往返",
-            "减少 D2H；评估 --swap-optimizer 换入换出代价",
-        ],
+        "methods": _free_methods,
         "reasons": [
             "数据依赖的 host 往返（MoE 路由需在 host 读 token 计数）无法完全消除",
             "流水的填充/排空首尾各有一段空泡",
@@ -691,8 +725,14 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
 
     # Realistic「能否减到 0 / 现实地板」analysis — derived from THIS profile's measured
     # slices + capture state (blocking / single-card), not the static sample.
+    # blocking comes from the PROFILING-DERIVED capture fact (parser.derive), never a
+    # launch script; mirror engine.py so the free_zero lever's caveats/methods/floor
+    # follow the same truth as the rule cards. env is only a legacy fallback (always
+    # empty under derive — it never asserts ASCEND_LAUNCH_BLOCKING).
     cap = capture or {}
-    blocking = (cap.get("env") or {}).get("ASCEND_LAUNCH_BLOCKING") == "1"
+    _cap_state = cap.get("capture", {}) or {}
+    blocking = bool((_cap_state.get("blocking", {}) or {}).get("value")) if _cap_state else \
+        ((cap.get("env") or {}).get("ASCEND_LAUNCH_BLOCKING") == "1")
     single_card = _single_card(prof)
     realistic = _whatif_realistic(
         stage, computing, comm_no, free,

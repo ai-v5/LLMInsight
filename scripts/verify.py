@@ -209,6 +209,17 @@ def main():
     chk_true("free lever caveat reflects blocking-off capture (no false 失真)",
              "采集未开 blocking" in free_cav and "采集失真" not in free_cav,
              f"(caveats={(rl_by.get('free_zero') or {}).get('caveats')})")
+    # The free_zero lever's METHODS + floor_basis must also follow derived blocking:
+    # when blocking is not detected, neither may propose/blame closing
+    # ASCEND_LAUNCH_BLOCKING (that was an unconditional fabrication pre-fix).
+    free_methods = " ".join((rl_by.get("free_zero") or {}).get("methods") or [])
+    free_floor = (rl_by.get("free_zero") or {}).get("floor_basis") or ""
+    chk_true("free lever methods exclude ASCEND_LAUNCH_BLOCKING (derived blocking=False)",
+             "ASCEND_LAUNCH_BLOCKING" not in free_methods,
+             f"(methods={(rl_by.get('free_zero') or {}).get('methods')})")
+    chk_true("free lever floor_basis drops '关 blocking' prefix (derived blocking=False)",
+             "关 blocking" not in free_floor,
+             f"(floor_basis={free_floor})")
     # combined realistic floor: a genuine floor ABOVE the physical "→0" upper bound, and
     # strictly BELOW the base step (it does recover real time). Bands ordered.
     rcomb = rz.get("combined") or {}
@@ -244,6 +255,13 @@ def main():
         chk_true(f"card hit: {need}", need in ids)
     chk_true("capture_blocking NOT fired (blocking undetectable from data)",
              "capture_blocking" not in ids)
+    # the hidden_overhead_ledger card fires on every dataset; its host-side advice must
+    # follow derived blocking (=False here) — never tell the user to 关 blocking when it
+    # was not detected (same config-derivation-sweep fix as the core.py free_zero lever).
+    _ledger = next((c for c in cards if c["id"] == "hidden_overhead_ledger"), None)
+    chk_true("ledger card advice excludes '关 blocking' (derived blocking=False)",
+             _ledger is not None and "关 blocking" not in (_ledger.get("suggestion") or ""),
+             f"(suggestion={_ledger.get('suggestion') if _ledger else None})")
 
     print("\n== config reconstructed FROM profiling (no launch script) ==")
     # model architecture is reconstructed from kernel shapes (H3 model-aware), not a script
@@ -272,6 +290,23 @@ def main():
              (capst.get("host_sync_stall") or {}).get("value") is True)
     chk_true("derived env stays empty (nothing asserted from environment)",
              cap.get("env") == {})
+
+    # hidden_overhead buckets must FOLLOW the derived config, not hardcode it:
+    # host_sync is attributed to dynamic-shape D2H (derived blocking=False here),
+    # and the recompute bucket cites profiling — never ASCEND_LAUNCH_BLOCKING / a
+    # launch script. (Regression guard for the config-derivation sweep.)
+    ho_buckets = (m.get("hidden_overhead", {}) or {}).get("buckets", [])
+    hs_b = next((b for b in ho_buckets if b.get("key") == "host_sync"), None)
+    chk_true("host_sync bucket present", hs_b is not None)
+    chk_true("host_sync suggestion NOT blamed on ASCEND_LAUNCH_BLOCKING (derived blocking=False)",
+             hs_b is not None and "ASCEND_LAUNCH_BLOCKING" not in (hs_b.get("suggestion") or ""),
+             f"(got: {hs_b.get('suggestion') if hs_b else None})")
+    rc_b = next((b for b in ho_buckets if b.get("key") == "recompute"), None)
+    chk_true("recompute bucket present on OLD (derived recompute=full)", rc_b is not None)
+    chk_true("recompute bucket source is profiling-derived, not 训练脚本配置",
+             rc_b is not None and rc_b.get("source") != "训练脚本配置"
+             and "profiling" in (rc_b.get("source") or ""),
+             f"(got: {rc_b.get('source') if rc_b else None})")
 
     print("\n== insight layer (LLM disabled by default) ==")
     res = generate_insights(m, cards, cap)

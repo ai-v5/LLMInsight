@@ -35,7 +35,7 @@ def compute_all(prof, capture: Dict[str, Any] = None) -> Dict[str, Any]:
         "hotspots": core.hotspots(prof),
         "efficiency": eff,
         "communication": core.communication(prof),
-        "hidden_overhead": core.hidden_overhead(prof, ov),
+        "hidden_overhead": core.hidden_overhead(prof, ov, capture),
         "attribution": core.attribution(prof),
         "memory": compute_memory(prof),
         "theoretical": core.theoretical(prof, ov, eff, capture),
