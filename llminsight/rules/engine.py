@@ -286,13 +286,22 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
 
     # 8. hidden-overhead总账 ------------------------------------------------
     if ho.get("available"):
+        # advice follows the PROFILING-DERIVED blocking: only tell the user to close
+        # ASCEND_LAUNCH_BLOCKING when it was actually detected. derive says async on
+        # both samples → host-side lever is reducing dispatch/sync, not "关 blocking".
+        _ledger_advice = (
+            "按总账逐项减负：通信掩盖→空泡→格式转换/初始化；host 侧关 blocking、降下发次数。"
+            if blocking else
+            "按总账逐项减负：通信掩盖→空泡→格式转换/初始化；host 侧降下发次数、减少同步点"
+            "（异步下发 / 合并小算子 / 固定动态 shape）。"
+        )
         cards.append(_card(
             "hidden_overhead_ledger", "medium", "隐性开销",
             "隐性开销总账：未掩盖通信 / 等待·同步 / 空泡 / 格式转换·初始化 / 动态 shape 合计可观",
             "多项分散开销单看不起眼，合计是吞吐杀手；device 侧可直接计入 step，host 侧反映下发/同步压力。"
             "注意通信以两种视角出现——step 的「未掩盖通信」= 算子表的「AICPU 集合通信执行」，为同一段时间，"
             "Device 合计只计一次（AICPU 执行项不并入合计）。",
-            "按总账逐项减负：通信掩盖→空泡→格式转换/初始化；host 侧关 blocking、降下发次数。",
+            _ledger_advice,
             "总账用于排优先级，避免只盯单点热点而漏掉合计更大的隐性项；亦避免把同段通信重复计入。",
             0.7,
             {"device_total_us": ho.get("device_total_us"), "host_total_us": ho.get("host_total_us"),
