@@ -42,7 +42,8 @@ llminsight/
 ├── parser/
 │   ├── profile.py         # load_profile → ProfileData（8 文件）
 │   ├── trace.py           # trace_view.json 流式 iter_events（104MB 不入内存）
-│   └── shapes.py          # "Input Shapes"/dtypes 字符串解析、numel
+│   ├── shapes.py          # "Input Shapes"/dtypes 字符串解析、numel
+│   └── derive.py          # 从 profiling 反推模型结构 + 训练/采集配置（不依赖启动脚本）
 ├── metrics/
 │   ├── build.py           # compute_all 编排（一次算齐所有 section）
 │   ├── core.py            # overview/hotspots/communication/hidden_overhead/
@@ -50,7 +51,7 @@ llminsight/
 │   ├── efficiency.py      # MFU/MBU/Roofline + FlashAttention FLOP 模型 + 峰值校准
 │   └── timeline.py        # 泳道占用 + overlap 段 + 频率（流式，缓存）
 ├── rules/
-│   └── engine.py          # 12 诊断卡片 + read_capture_config（解析训练脚本）
+│   └── engine.py          # 诊断卡片（消费 parser.derive 反推的配置，不再解析脚本）
 ├── insight/
 │   ├── provider.py        # 可插拔 LLM 客户端（OpenAI 兼容 + Anthropic），默认关闭
 │   ├── summarizer.py      # 隐私安全摘要 + prompt 构造（只发 KB 级 JSON）

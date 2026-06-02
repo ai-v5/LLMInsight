@@ -28,10 +28,11 @@ def generate_insights(m: Dict[str, Any],
     call_llm=False so merely opening the panel never spends a request; the
     explicit POST /api/llm (the "运行 LLM 分析" button) is the only trigger.
     """
-    from ..rules import run_rules, read_capture_config
+    from ..rules import run_rules
 
     if capture is None:
-        capture = read_capture_config()
+        # Use the profiling-derived config from compute_all (never a script).
+        capture = (m.get("meta", {}) or {}).get("config") or {"found": False, "env": {}, "flags": {}}
     if cards is None:
         cards = run_rules(m, capture)
 

@@ -11,12 +11,14 @@ from .smart_timeline import compute_smart_timeline
 
 
 def compute_all(prof, capture: Dict[str, Any] = None) -> Dict[str, Any]:
-    # `capture` (launch-script env/flags) feeds the What-if 现实地板 caveats. The
-    # server passes the one it already parsed; standalone callers (report CLI) leave
-    # it None and we read it here so the analysis still reflects the loaded run.
+    # `capture` carries the model + training/capture config DERIVED FROM THE
+    # PROFILING ITSELF (never a launch script — see parser.derive). It feeds the
+    # What-if 现实地板 caveats and the rule cards. The server passes the one it
+    # already derived; standalone callers (report CLI) leave it None and we
+    # derive it here so the analysis always reflects the loaded run.
     if capture is None:
-        from ..rules.engine import read_capture_config
-        capture = read_capture_config()
+        from ..parser.derive import derive_config
+        capture = derive_config(prof)
     ov = core.overview(prof)
     eff = compute_efficiency(prof)
     # smart_timeline joins trace slices to eff["kernel_index"]; drop that heavy
@@ -24,7 +26,10 @@ def compute_all(prof, capture: Dict[str, Any] = None) -> Dict[str, Any]:
     smart_tl = compute_smart_timeline(prof, eff)
     eff.pop("kernel_index", None)
     return {
-        "meta": {**prof.meta, "settings": SETTINGS.to_dict()},
+        # `config` exposes the profiling-derived model/capture/guesses (KB-level,
+        # secret-free) so the report header and UI show what the DATA says, not a
+        # hardcoded ModelConfig.
+        "meta": {**prof.meta, "settings": SETTINGS.to_dict(), "config": capture},
         "overview": ov,
         "hotspots": core.hotspots(prof),
         "efficiency": eff,

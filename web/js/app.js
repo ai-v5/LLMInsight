@@ -136,15 +136,25 @@
   function finishBoot(meta) {
     currentMeta = meta;
     const m = meta.meta || {}, settings = (m.settings || {});
-    const model = settings.model || {}, chip = settings.chip || {};
+    const chip = settings.chip || {};
     const chips = settings.chips || [];
     const chipKey = settings.chip_key || "";
+    // Model + parallel config are reconstructed FROM the profiling (parser.derive),
+    // never a launch script. Underivable fields (EP world size, TP/PP/CP) surface as
+    // labeled guesses / 未知 instead of fabricated values.
+    const cfg = m.config || {}, dm = cfg.model || {}, gs = cfg.guesses || {};
+    const arch = dm.hidden_size
+      ? "MLA+MoE · hidden " + dm.hidden_size
+        + (dm.num_attention_heads ? " · " + dm.num_attention_heads + " heads" : "")
+        + (dm.dtype ? " · " + dm.dtype : "")
+      : "—";
+    const epLabel = (gs.ep_world_size || {}).label || "未知";
     const badges = document.getElementById("badges");
     const chipOptions = (chips.length ? chips : [{ key: chipKey, name: chip.name }])
       .map(c => `<option value="${esc(c.key)}"${c.key === chipKey ? " selected" : ""}>${esc(c.name)}</option>`).join("");
     badges.innerHTML = [
-      `<span class="badge">模型 <strong>${esc(model.name || "—")}</strong></span>`,
-      `<span class="badge">并行 <strong>TP${model.tp||"?"}/PP${model.pp||"?"}/EP${model.ep||"?"}/CP${model.cp||"?"}</strong></span>`,
+      `<span class="badge" title="由 profiling 反推（无启动脚本）">模型 <strong>${esc(arch)}</strong></span>`,
+      `<span class="badge" title="EP 由是否存在 alltoallv 推断；world size 单卡不可得，故为猜测。TP/PP/CP 单卡同样不可得">并行 <strong>EP=${esc(epLabel)} · TP/PP/CP 未知</strong></span>`,
       `<span class="badge assume" title="切换参考芯片 → 重算 MFU / MBU / Roofline / 理论上界">芯片 <select id="chip-select" class="chip-select">${chipOptions}</select></span>`,
       `<span class="badge">加载 <strong>${meta.load_seconds}s</strong></span>`,
     ].join("");

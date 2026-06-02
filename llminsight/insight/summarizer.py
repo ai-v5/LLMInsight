@@ -28,8 +28,11 @@ SYSTEM_PROMPT = (
     "你会收到一份【结构化性能指标摘要】和【规则引擎已命中的诊断卡片】（事实依据，禁止编造数据）。"
     "请基于这些事实，产出一份面向算法/训练工程师的简洁中文诊断报告，包含："
     "(1) 一句话总体结论；(2) 按收益排序的 Top 3-5 优化项，每项给【现象→根因→可执行建议→预计收益→置信度】；"
-    "(3) 必要的采集可信度提醒。要求：只用给定数据，不臆造数字；建议要落地到具体开关/参数；"
-    "对被 ASCEND_LAUNCH_BLOCKING 放大的 host 指标要标注为采集干扰。"
+    "(3) 必要的采集可信度提醒。要求：只用给定数据，不臆造数字；建议要落地到具体开关/参数。"
+    "模型结构与训练/采集配置均由 profiling 反推（model.derived 为反推值，model.unknown_guesses 为"
+    "单卡不可得的\"未知(猜X)\"项——不要当作确定值；capture.state 给出每条采集判定的依据与置信度）。"
+    "仅当 capture.state.blocking.value 为真时，才把 host 指标标注为 ASCEND_LAUNCH_BLOCKING 采集干扰；"
+    "否则应将 host 同步开销归因为动态 shape 的 D2H 同步（见 capture.state.host_sync_stall）。"
 )
 
 
@@ -56,11 +59,28 @@ def build_summary(m: Dict[str, Any],
     cap_flags = {k: capture.get("flags", {}).get(k) for k in _FLAG_WHITELIST
                  if k in capture.get("flags", {})}
 
-    settings = meta.get("settings", {})
+    # Model architecture + training/capture state are now reconstructed FROM the
+    # profiling (parser.derive), never a launch script. These are aggregate
+    # numbers (shapes/counts), so they are privacy-safe to forward and give the
+    # LLM the model-aware context (H3) plus the corrected capture story.
+    cfg = capture if capture.get("source") == "profiling" else (meta.get("config") or {})
+    derived_model = cfg.get("model") or {}
+    guesses = cfg.get("guesses") or {}
+    cap_state = {
+        k: {"value": f.get("value"), "confidence": f.get("confidence"),
+            "evidence": f.get("evidence")}
+        for k, f in (cfg.get("capture") or {}).items()
+    }
+    model_block = {
+        "arch": "DeepSeek-V3 风格 MLA + MoE（由 profiling 反推，无启动脚本）",
+        "derived": derived_model,
+        "unknown_guesses": {k: g.get("label") for k, g in guesses.items()},
+    } if (derived_model or guesses) else None
+
     summary: Dict[str, Any] = {
-        "model": settings.get("model", {}).get("name"),
+        "model": model_block,
         "chip": eff.get("chip"),
-        "capture": {"env": cap_env, "flags": cap_flags},
+        "capture": {"env": cap_env, "flags": cap_flags, "state": cap_state},
         "overview": {
             "step_time_s": ov.get("ratios", {}).get("step_time_s"),
             "ratios": ov.get("ratios"),

@@ -33,12 +33,11 @@ def _default_data_dir() -> str:
 
 
 def _default_script_path() -> str:
-    env = os.environ.get("LLMINSIGHT_SCRIPT")
-    if env:
-        return env
-    here = os.path.dirname(os.path.abspath(__file__))
-    repo = os.path.dirname(here)
-    return os.path.join(repo, "secret", "8k_bf16_sbh_64p.sh")
+    # Model + training config are derived from the PROFILING (parser.derive), not
+    # a launch script — a script need not correspond 1:1 to a given profiler
+    # output. We therefore never auto-point at any script; honour an explicit
+    # LLMINSIGHT_SCRIPT only as an opt-in escape hatch (default: none).
+    return os.environ.get("LLMINSIGHT_SCRIPT", "")
 
 
 DATA_DIR = _default_data_dir()
@@ -301,16 +300,18 @@ class Settings:
     smart_timeline_bins: int = 3000
 
     def to_dict(self) -> dict:
+        # NOTE: model + training config are NOT shipped here anymore — they are
+        # derived from the profiling and live under metrics.meta["config"]
+        # (parser.derive). script_path is intentionally omitted too (no launch
+        # script dependency; also avoids leaking an absolute path into payloads).
         return {
             "data_dir": self.data_dir,
-            "script_path": self.script_path,
             # asdict() omits the hbm_capacity_gb @property, so add it explicitly.
             "chip": {**asdict(self.chip), "hbm_capacity_gb": self.chip.hbm_capacity_gb},
             "chip_key": self.chip_key,
             # YAML-backed presets for the UI dropdown (no secrets; peak summary).
             # peak_bf16_tflops is the CUBE bf16 peak (the matmul-MFU denominator).
             "chips": _chip_dropdown(),
-            "model": asdict(self.model),
         }
 
 

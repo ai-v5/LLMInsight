@@ -15,8 +15,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from llminsight.config import SETTINGS, set_chip
 from llminsight.parser import load_profile
 from llminsight.parser.profile import num
+from llminsight.parser.derive import derive_config
 from llminsight.metrics import compute_all
-from llminsight.rules import run_rules, read_capture_config
+from llminsight.rules import run_rules
 from llminsight.insight import generate_insights
 
 FAILS = []
@@ -38,8 +39,12 @@ def chk_true(label, cond, detail=""):
 def main():
     print("Loading profile:", SETTINGS.data_dir)
     prof = load_profile(SETTINGS.data_dir)
-    m = compute_all(prof)
-    cap = read_capture_config()
+    # Config is reconstructed FROM the profiling (parser.derive), never a launch
+    # script — pointing at the dir is enough (H4). compute_all derives the same
+    # capture internally when none is passed; we derive it here too for the rule
+    # engine + insight checks below.
+    cap = derive_config(prof)
+    m = compute_all(prof, cap)
     cards = run_rules(m, cap)
 
     print("\n== metrics baselines ==")
@@ -189,17 +194,21 @@ def main():
                  and f"{lv.get('measured_pct'):.1f}" in sc
                  and f"{lv.get('floor_pct'):.1f}" in sc,
                  f"(scenario={sc!r} measured_pct={lv.get('measured_pct')} floor_pct={lv.get('floor_pct')})")
-    # 失真 caveats are CONDITIONED on this capture (single-card + blocking both on here).
-    chk_true("realistic flags track capture (single_card & blocking on)",
-             rz.get("single_card") is True and rz.get("blocking") is True,
+    # 失真 caveats are CONDITIONED on this capture. Config is profiling-derived, so
+    # blocking is NOT asserted (env empty → False): the data shows async dispatch
+    # (Synchronize/launch « 1) and the real host bottleneck is dynamic-shape D2H
+    # sync, not ASCEND_LAUNCH_BLOCKING. single-card still holds (empty comm matrix).
+    chk_true("realistic flags track derived capture (single_card on, blocking NOT detected)",
+             rz.get("single_card") is True and rz.get("blocking") is False,
              f"(single_card={rz.get('single_card')} blocking={rz.get('blocking')})")
     comm_cav = " ".join((rl_by.get("comm_overlap") or {}).get("caveats") or [])
     free_cav = " ".join((rl_by.get("free_zero") or {}).get("caveats") or [])
-    chk_true("comm lever caveats note single-card + blocking distortion",
-             "communication_matrix" in comm_cav and "ASCEND_LAUNCH_BLOCKING" in comm_cav,
+    chk_true("comm lever caveat notes single-card (no false blocking distortion)",
+             "communication_matrix" in comm_cav and "ASCEND_LAUNCH_BLOCKING" not in comm_cav,
              f"(caveats={(rl_by.get('comm_overlap') or {}).get('caveats')})")
-    chk_true("free lever caveat notes blocking distortion",
-             "ASCEND_LAUNCH_BLOCKING" in free_cav)
+    chk_true("free lever caveat reflects blocking-off capture (no false 失真)",
+             "采集未开 blocking" in free_cav and "采集失真" not in free_cav,
+             f"(caveats={(rl_by.get('free_zero') or {}).get('caveats')})")
     # combined realistic floor: a genuine floor ABOVE the physical "→0" upper bound, and
     # strictly BELOW the base step (it does recover real time). Bands ordered.
     rcomb = rz.get("combined") or {}
@@ -221,19 +230,48 @@ def main():
     chk("realistic combined recoverable %", rcomb.get("recoverable_pct"), 39.23, 0.5)
 
     print("\n== rule engine (insight cards) ==")
-    # 11 under the default 950DT: peak == observed ceiling, so the peak_underestimated
-    # calibration advisory does not fire (it does under the 910B what-if — see below).
+    # 11 under the default 950DT on this OLD sample (recompute=full). Composition vs the
+    # old script-based config CHANGED: capture_blocking is GONE (blocking is not
+    # detectable from data — Synchronize/launch « 1) and host_sync_stall is NEW (the
+    # real host bottleneck = dynamic-shape D2H sync via aclrtSynchronizeStream).
+    # peak_underestimated does not fire (peak == observed; it does under the 910B
+    # what-if below). recompute_full + free_bubble fire for this full-recompute run.
     chk_true("card count == 11", len(cards) == 11, f"(got {len(cards)})")
     ids = {c["id"] for c in cards}
-    for need in ("comm_not_overlapped", "aicpu_dispatch", "capture_blocking",
+    for need in ("comm_not_overlapped", "aicpu_dispatch", "host_sync_stall",
                  "hidden_overhead_ledger", "theoretical_whatif", "dynamic_shape",
-                 "parallelism_advisor", "memory_capture"):
+                 "parallelism_advisor", "memory_capture", "recompute_full", "free_bubble"):
         chk_true(f"card hit: {need}", need in ids)
-    # capture config resolved shell vars (EP=64 not ${EP})
-    chk_true("capture EP resolved to 64",
-             cap["flags"].get("expert-model-parallel-size") == "64",
-             f"(got {cap['flags'].get('expert-model-parallel-size')})")
-    chk_true("blocking detected", cap["env"].get("ASCEND_LAUNCH_BLOCKING") == "1")
+    chk_true("capture_blocking NOT fired (blocking undetectable from data)",
+             "capture_blocking" not in ids)
+
+    print("\n== config reconstructed FROM profiling (no launch script) ==")
+    # model architecture is reconstructed from kernel shapes (H3 model-aware), not a script
+    dm = cap.get("model", {})
+    chk("derived hidden_size", dm.get("hidden_size"), 7168, 0)
+    chk("derived num_attention_heads", dm.get("num_attention_heads"), 128, 0)
+    chk("derived seq_length", dm.get("seq_length"), 8192, 0)
+    chk("derived moe_router_topk", dm.get("moe_router_topk"), 8, 0)
+    chk_true("derived dtype == BF16", dm.get("dtype") == "BF16", f"(got {dm.get('dtype')})")
+    chk_true("config source is profiling (path withheld)",
+             cap.get("source") == "profiling" and cap.get("path") is None)
+    # EP world size is UNDERIVABLE from a single rank → surfaced as a labeled guess,
+    # never a fabricated definite flag (intentionally absent from cap['flags']).
+    ep = cap.get("guesses", {}).get("ep_world_size", {})
+    chk_true("EP world size is a labeled guess (未知(猜64)), not a hard flag",
+             ep.get("label") == "未知(猜64)" and ep.get("guess") == 64
+             and "expert-model-parallel-size" not in cap.get("flags", {}),
+             f"(label={ep.get('label')} flags_has_ep={'expert-model-parallel-size' in cap.get('flags', {})})")
+    # blocking / recompute / host-sync are DERIVED capture facts (not from env/script)
+    capst = cap.get("capture", {})
+    chk_true("derived blocking == False (async dispatch, Synchronize/launch « 1)",
+             (capst.get("blocking") or {}).get("value") is False)
+    chk_true("derived recompute == full (FA fwd/grad ≈ 2.0 on this sample)",
+             (capst.get("recompute") or {}).get("value") == "full")
+    chk_true("derived host_sync_stall == True (aclrtSynchronizeStream / dynamic-shape D2H)",
+             (capst.get("host_sync_stall") or {}).get("value") is True)
+    chk_true("derived env stays empty (nothing asserted from environment)",
+             cap.get("env") == {})
 
     print("\n== insight layer (LLM disabled by default) ==")
     res = generate_insights(m, cards, cap)
@@ -241,6 +279,17 @@ def main():
     chk_true("LLM not available (no-op)", res["llm"]["available"] is False)
     chk_true("narrative is None (no call)", res["narrative"] is None)
     chk_true("cards passed through", len(res["cards"]) == 11)
+    # the LLM summary must carry the profiling-derived model (H3 model-aware) and the
+    # corrected capture story (blocking=False) — guards against losing model context.
+    smodel = res["summary"].get("model") or {}
+    chk_true("LLM summary carries derived model (hidden_size 7168)",
+             (smodel.get("derived") or {}).get("hidden_size") == 7168,
+             f"(model={list((smodel.get('derived') or {}).keys())[:3]}...)")
+    chk_true("LLM summary carries labeled EP guess (未知(猜64))",
+             (smodel.get("unknown_guesses") or {}).get("ep_world_size") == "未知(猜64)")
+    chk_true("LLM summary capture.state.blocking == False (no false blocking)",
+             ((res["summary"].get("capture") or {}).get("state") or {})
+             .get("blocking", {}).get("value") is False)
     blob = json.dumps(res["summary"], ensure_ascii=False)
     leaks = [t for t in ("d00568668", "plog", "CPU_AFFINITY", "/home/", "ASCEND_PROCESS_LOG", "api_key")
              if t in blob]

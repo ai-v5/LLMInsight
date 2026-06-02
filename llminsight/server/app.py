@@ -27,7 +27,8 @@ from ..metrics import compute_all
 from ..metrics import core as metrics_core
 from ..metrics.efficiency import compute_efficiency
 from ..metrics.smart_timeline import compute_smart_timeline
-from ..rules import run_rules, read_capture_config
+from ..rules import run_rules
+from ..parser.derive import derive_config
 from ..insight import generate_insights, get_provider
 from ..report import build_report_html
 
@@ -161,9 +162,10 @@ class AppState:
         self.prof = None
         try:
             self.prof = load_profile(data_dir)
-            # Read the launch-script capture BEFORE compute_all so the What-if 现实地板
-            # caveats (blocking / single-card) reflect THIS run's actual采集 config.
-            self.capture = read_capture_config()
+            # Derive model + capture config FROM THE PROFILING (not a launch
+            # script) BEFORE compute_all so the What-if 现实地板 caveats and rule
+            # cards reflect THIS run's actual config.
+            self.capture = derive_config(self.prof)
             self.metrics = compute_all(self.prof, self.capture)
             self.cards = run_rules(self.metrics, self.capture)
             self.loaded_dir = data_dir

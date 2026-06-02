@@ -11,7 +11,7 @@
 
 ## 6.2 规则引擎：诊断卡片
 
-`rules/engine.py::run_rules` 读 metrics 字典 + 训练脚本配置（`read_capture_config` 解析 `export VAR=` 与 `--flag`，并解析 `${VAR}` 引用），输出卡片。卡片结构：
+`rules/engine.py::run_rules` 读 metrics 字典 + **从 profiling 反推的配置**（`parser/derive.py::derive_config` 由 kernel shape / 算子计数 / 通信结构反推模型结构与训练·采集状态，**不依赖启动脚本**——脚本与 profiling 不保证一一对应）。单卡单 step 无法确定的字段（EP world size、总层数、总专家数、global batch）以 `未知(猜X)` 标注，不臆造确定值。输出卡片，结构：
 
 ```python
 { "id", "severity"(high/medium/low/info), "category", "title",
@@ -25,24 +25,25 @@
 |---|---|---|---|---|---|
 | 1 | `comm_not_overlapped` | high | 通信 | 未掩盖通信 ≥10% 或 重叠率 <40% | 0.9 |
 | 2 | `aicpu_dispatch` | high | 通信 | `HcclLaunchAicpuKernel` 占比 ≥10%（AICPU 驱动的集合通信执行，≈通信本身、非下发延迟） | 0.85 |
-| 3/11 | `capture_blocking` | high | 采集体检 | `ASCEND_LAUNCH_BLOCKING=1` | 1.0 |
+| 3/11 | `capture_blocking` | high | 采集体检 | 反推 blocking=True（Synchronize/launch 次数比 >0.5）——异步下发时**不命中** | 1.0 |
+| 3b | `host_sync_stall` | medium | 等待·同步 | 非 blocking 但 `aclrtSynchronizeStream` 占 host API ≥20%（根因：动态 shape 的 D2H 同步，如 `aclnnMaskedSelect`） | 0.8 |
 | 4 | `dynamic_shape` | medium | 动态shape | MaskedSelect/NonZero host 累计 >50ms | 0.7 |
 | 5a | `low_efficiency_ops` | medium | 算子效率 | 存在 `wasted_us>0` 的 Top 候选 | 0.6 |
 | 5b | `peak_underestimated` | info | 算子效率 | 实测 matmul 峰值 > 假设峰值（已校准） | 0.8 |
 | 6 | `free_bubble` | medium | 空泡 | `free_pct ≥10%` | 0.65 |
-| 7 | `recompute_full` | low | 显存-时间 | `--recompute-granularity full` | 0.6 |
+| 7 | `recompute_full` | low | 显存-时间 | 反推 recompute=full（FA 前向/反向次数比 ≈2） | 0.6 |
 | 8 | `hidden_overhead_ledger` | medium | 隐性开销 | hidden_overhead 可用 | 0.7 |
 | 9 | `theoretical_whatif` | info | 理论上界 | theoretical 可用（取最优 What-if） | 0.7 |
-| 10 | `parallelism_advisor` | medium | 并行策略 | 有 EP 且未掩盖通信 ≥15% | 0.55 |
+| 10 | `parallelism_advisor` | medium | 并行策略 | 存在 alltoallv（EP 开启，world size 为猜测）且未掩盖通信 ≥15% | 0.55 |
 | 12 | `memory_capture` | info | 显存 | 无 memory-level 采集 | 0.9 |
 
-> 这 12 条正是验证目标（见 [07](07-roadmap-and-verification.md)）；样例上全部命中。每条都带 `evidence`（触发它的原始数字），既给 UI 也给 LLM 做事实依据。
+> 卡片集合按**反推自 profiling 的本次实际配置**动态命中（不再依赖启动脚本，见 [07](07-roadmap-and-verification.md)）。例如 OLD 样例（recompute=full、异步下发）命中 11 条：`capture_blocking` 不命中、`host_sync_stall` 命中；NEW 样例（recompute=off）则少 `recompute_full`/`free_bubble`。每条都带 `evidence`（触发它的原始数字），既给 UI 也给 LLM 做事实依据。
 
 ### 代表性洞察（样例命中）
 
 - **通信掩盖严重不足**：未掩盖 26% / 重叠率 12.6% → 核对 `--moe-fb-overlap` / `--moe-permutation-async-comm`，扩大重叠窗口。
 - **AICPU 集合通信执行占比高（≈通信，非下发延迟）**：`HcclLaunchAicpuKernel` 占 device 28%，是 AICPU 展开模式下**驱动 EP64 集合通信的 AI_CPU 算子**，其时长≈ Communication 的 72%、单卡几乎全是 Wait（单次 max 280ms 远超下发量级）→ 与「未掩盖通信」为同一段时间，**勿重复计入**。优先掩盖到计算下，再缩短通信本身（`HCCL_BUFFSIZE` / 通信算法、EP 规模、增大 token 批次减少 collective 次数）。
-- **采集配置扭曲**：检测 `ASCEND_LAUNCH_BLOCKING=1` → 标注 host 同步数字「不可直接采信」，给正确复采方式（置信度 1.0）。
+- **Host 同步阻塞（动态 shape 而非 blocking）**：从数据反推本次为**异步下发**（Synchronize/launch 次数比 ≈0.05，未命中 blocking），但 `aclrtSynchronizeStream` 累计 ~2.5s 占 host API ~47%，根因是动态 shape（`aclnnMaskedSelect`）触发的 D2H 同步 → 建议固定 MoE capacity / padding，消除 host 往返（而非简单归因于 `ASCEND_LAUNCH_BLOCKING`）。
 - **芯片峰值假设偏低**：实测 matmul 峰值 ≈432 > 假设 376 TFLOPS → 已按实测上界校准；建议在 `ChipSpec` 填真实 SKU 峰值。
 
 ## 6.3 LLM 洞察层

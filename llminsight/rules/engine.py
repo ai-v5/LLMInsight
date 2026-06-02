@@ -71,7 +71,9 @@ def read_capture_config(script_path: Optional[str] = None) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     if capture is None:
-        capture = read_capture_config()
+        # Prefer the profiling-derived config already stashed on the metrics by
+        # compute_all; fall back to a neutral empty config (never read a script).
+        capture = (m.get("meta", {}) or {}).get("config") or {"found": False, "env": {}, "flags": {}}
     cards: List[Dict[str, Any]] = []
     ov = m.get("overview", {})
     ratios = ov.get("ratios", {}) if ov.get("available") else {}
@@ -82,7 +84,15 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
     ho = m.get("hidden_overhead", {})
     theo = m.get("theoretical", {})
     env = capture.get("env", {})
-    blocking = env.get("ASCEND_LAUNCH_BLOCKING") == "1"
+    cap_state = capture.get("capture", {}) or {}     # profiling-derived capture facts
+    guesses = capture.get("guesses", {}) or {}
+
+    def _cstate(k):
+        return (cap_state.get(k, {}) or {}).get("value")
+
+    # blocking is read back from the DATA (Synchronize/launch ratio + host«device),
+    # not asserted from an env var — a launch script can disagree with the capture.
+    blocking = bool(_cstate("blocking")) if cap_state else (env.get("ASCEND_LAUNCH_BLOCKING") == "1")
 
     # 1. communication not overlapped --------------------------------------
     if ratios:
@@ -145,6 +155,23 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
             1.0,
             {"ASCEND_LAUNCH_BLOCKING": "1",
              "aclrtSynchronize_us": (sync["us"] if sync else None)},
+        ))
+
+    # 3b. host synchronization stall — the real host bottleneck when blocking is
+    #     NOT present: cumulative aclrtSynchronizeStream driven by dynamic-shape
+    #     D2H syncs (aclnnMaskedSelect / .item()), not a blocking artifact.
+    if not blocking and _cstate("host_sync_stall") and sync and sync.get("us"):
+        cards.append(_card(
+            "host_sync_stall", "medium", "等待·同步",
+            f"Host 同步阻塞：aclrtSynchronizeStream 累计 {sync['us']/1e6:.2f}s 占据 host 关键路径",
+            "host 频繁等待 device 完成——aclnnMaskedSelect 等动态 shape 触发 D2H 同步（及 .item() 类同步），"
+            "而非 ASCEND_LAUNCH_BLOCKING（本次数据未检出 blocking）。",
+            "固定 expert capacity / 对路由结果 padding，消除动态 shape 的 D2H 同步；合并或减少同步点，"
+            "让下发与 device 计算更充分异步重叠。",
+            "削减 host 同步等待可缩短 host 关键路径、降低尾延迟（需与 device 计算重叠确认）。",
+            0.7,
+            {"aclrtSynchronize_us": sync["us"],
+             "evidence": (cap_state.get("host_sync_stall", {}) or {}).get("evidence")},
         ))
 
     # 4. dynamic shape jitter ----------------------------------------------
@@ -239,16 +266,21 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
             ))
 
     # 10. parallelism advisor ----------------------------------------------
-    ep = capture.get("flags", {}).get("expert-model-parallel-size")
-    if ep and ratios.get("comm_not_overlapped_pct", 0) >= 15:
+    #     alltoallv presence proves expert parallelism is on; a single rank
+    #     cannot reveal EP world size, so we advise off a labelled guess.
+    ep_g = guesses.get("ep_world_size", {}) or {}
+    ep_label = ep_g.get("label", "未知")
+    ep_guess = ep_g.get("guess")
+    if ep_guess and ratios.get("comm_not_overlapped_pct", 0) >= 15:
         cards.append(_card(
             "parallelism_advisor", "medium", "并行策略",
-            f"并行策略提示：EP={ep} 下通信（alltoall）占比偏高、未掩盖 {ratios.get('comm_not_overlapped_pct')}%",
-            "大 EP 带来密集 alltoall 与下发开销；当前 TP=1，通信未能与计算充分重叠。",
+            f"并行策略提示：EP={ep_label} 下通信（alltoall）占比偏高、未掩盖 {ratios.get('comm_not_overlapped_pct')}%",
+            "存在 alltoallv（专家并行已开启）；大 EP 带来密集 alltoall 与下发开销，未能与计算充分重叠。"
+            "（单卡采集无法确知 EP world size，此处为推测值。）",
             "评估 EP↓ + TP↑ 的再平衡，或加强通信-计算重叠；权衡专家并行的通信代价 vs 负载均衡。",
             "降低 alltoall 占比与下发频次，缓解通信瓶颈（需结合多卡负载数据确认）。",
-            0.55,
-            {"ep": ep, "tp": capture.get("flags", {}).get("tensor-model-parallel-size"),
+            0.5,
+            {"ep_guess": ep_guess, "ep_label": ep_label,
              "comm_not_overlapped_pct": ratios.get("comm_not_overlapped_pct")},
         ))
 
