@@ -10,7 +10,7 @@
     { id: "communication",   label: "通信分析",    ico: "🔗", sub: "集合通信 · 等待占比 · 带宽" },
     { id: "hidden_overhead", label: "隐性开销",    ico: "🫥", sub: "下发 / 等待 / 空泡 / 动态shape 总账" },
     { id: "attribution",     label: "结构归因",    ico: "🧩", sub: "MLA / MoE / Norm / Optimizer" },
-    { id: "memory",          label: "显存洞察",    ico: "🧠", sub: "内存-时间权衡（待采集）" },
+    { id: "memory",          label: "显存洞察",    ico: "🧠", sub: "HBM 峰值时间线 · 碎片 · 内存-时间权衡" },
     { id: "timeline",        label: "时间线",      ico: "📽️", sub: "泳道占用 · 频率 · 切片" },
     { id: "insights",        label: "LLM 洞察",    ico: "🤖", sub: "诊断卡片 + 可选 LLM 叙述" },
     { id: "replay",          label: "全训练回放",  ico: "🎬", sub: "回放式时间轴（骨架）" },

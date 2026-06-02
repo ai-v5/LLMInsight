@@ -299,9 +299,49 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
              "buckets": [{"key": b["key"], "us": b["us"], "domain": b["domain"]} for b in ho.get("buckets", [])]},
         ))
 
-    # 12. memory capture ----------------------------------------------------
+    # 12. memory ------------------------------------------------------------
     mem = m.get("memory", {})
-    if not mem.get("hbm_timeline_available", False):
+    if mem.get("available") and mem.get("hbm_timeline_available"):
+        s = mem.get("summary", {})
+        gib = lambda mb: round((mb or 0) / 1024.0, 1)
+        util = s.get("util_pct")
+        near = s.get("near_oom")
+        # 12a. HBM 容量余量 / OOM 风险
+        sev = "high" if near else ("medium" if (util or 0) >= 75 else "info")
+        cards.append(_card(
+            "memory_headroom", sev, "显存",
+            f"显存峰值 {s.get('peak_reserved_gib')} GiB ≈ {util}% of {s.get('capacity_gb')} GB"
+            + ("（逼近容量，OOM 风险高）" if near else "（尚有余量）"),
+            f"进程 HBM 峰值保留 {s.get('peak_reserved_mb')} MB，剩余 headroom 仅 {s.get('headroom_gib')} GiB；"
+            "当前已开 recompute=full + swap-optimizer 压显存，仍接近上限。",
+            ("已接近显存极限：要扩 batch/序列或调并行，先回收「保留未占用」显存（见碎片项）或换更大显存卡；"
+             "勿在此配置上再增激活。" if near else
+             "显存尚有余量，可评估放宽 recompute/swap 以换吞吐。"),
+            f"避免 OOM；可用 headroom {s.get('headroom_gib')} GiB。",
+            0.9,
+            {"peak_reserved_mb": s.get("peak_reserved_mb"), "util_pct": util,
+             "capacity_gb": s.get("capacity_gb"), "headroom_gib": s.get("headroom_gib"),
+             "near_oom": near},
+        ))
+        # 12b. 保留未占用（碎片 + 通信/运行时保留）
+        frag = s.get("fragmentation_mb")
+        fpct = s.get("fragmentation_pct")
+        cards.append(_card(
+            "memory_fragmentation", "medium" if (fpct or 0) >= 15 else "info", "显存",
+            f"保留未占用显存 {gib(frag)} GiB（占峰值 {fpct}%）：分配器缓存 {gib(s.get('alloc_slack_mb'))} GiB "
+            f"+ 通信/运行时 {gib(s.get('nontensor_reserved_mb'))} GiB",
+            f"峰值保留 {s.get('peak_reserved_gib')} GiB 中活跃张量仅 {s.get('peak_allocated_gib')} GiB；"
+            f"其余为分配器缓存池碎片与 HCCL/workspace/runtime 保留（HCCL 通信缓冲 {gib(s.get('hccl_reserved_mb'))} GiB）。",
+            "设 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True 降低分配器碎片；评估 HCCL buffsize 降低通信缓冲；"
+            "必要时阶段性 empty_cache。",
+            f"潜在可回收约 {gib(frag)} GiB（含必需通信缓冲，非全部可回收）。",
+            0.75,
+            {"fragmentation_mb": frag, "fragmentation_pct": fpct,
+             "alloc_slack_mb": s.get("alloc_slack_mb"),
+             "nontensor_reserved_mb": s.get("nontensor_reserved_mb"),
+             "hccl_reserved_mb": s.get("hccl_reserved_mb")},
+        ))
+    else:
         cards.append(_card(
             "memory_capture", "info", "显存",
             "缺少显存采集：本次无 memory-level 数据，无法绘制 HBM 峰值/构成",

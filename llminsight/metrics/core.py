@@ -310,8 +310,9 @@ def hidden_overhead(prof, ov: Dict[str, Any]) -> Dict[str, Any]:
 
 # --------------------------------------------------------------------------- #
 _MODULE_RULES = [
-    ("MoE-Experts", ["GroupedMatmul", "SwiGlu", "SwiGluGrad", "ScatterAdd",
-                      "InplaceIndexAdd", "ScatterElementsV2", "GatherElements"]),
+    ("MoE-Experts", ["GroupedMatmul", "GroupedMatmulAdd", "SwiGlu", "SwiGluGrad",
+                      "ScatterAdd", "InplaceIndexAdd", "ScatterElementsV2",
+                      "GatherElements"]),
     ("MoE-Router", ["TopKV2", "Sigmoid", "SigmoidGrad", "ArgMaxWithValue", "Sort",
                      "Cumsum", "ReduceSum", "LpNormV2"]),
     ("Attention-MLA", ["FlashAttentionScore", "FlashAttentionScoreGrad",
@@ -393,28 +394,11 @@ def attribution(prof) -> Dict[str, Any]:
 
 # --------------------------------------------------------------------------- #
 def memory(prof) -> Dict[str, Any]:
-    m = SETTINGS.model
-    init_ops = _op_time(prof.op_statistic, ["ZerosLike", "TensorMove", "Fill", "OnesLike"])
-    return {
-        "available": False,
-        "hbm_timeline_available": False,
-        "reason": "本次采集仅含 AI Core Freq counter，无 memory-level 采集（memory_record.csv / npu_module_mem.csv 缺失）→ 无法绘制真实 HBM 峰值时间线。",
-        "config_tradeoffs": [
-            {
-                "feature": "--recompute-granularity full (uniform, 1 层)",
-                "effect": "省激活显存，代价是反向重跑前向 → 增加计算耗时。",
-                "advice": "显存不紧张时改选择性重计算 / 减少重计算层，换取吞吐。",
-            },
-            {
-                "feature": "--swap-optimizer",
-                "effect": "优化器状态在 HBM↔Host 间换入换出，省 HBM、代价是 H2D/D2H 拷贝与同步。",
-                "advice": "若 PCIe/同步成为瓶颈，评估关闭 swap 或仅 swap 部分状态。",
-            },
-        ],
-        "init_overhead_us": round(init_ops, 1),
-        "ai_core_freq_mhz": 1650,
-        "note": "显存峰值/构成分解待接入 memory-level 采集；当前给出配置驱动的内存-时间权衡顾问。",
-    }
+    """Back-compat shim → metrics.memory.compute_memory. The real logic moved to
+    memory.py once the 3 memory-level files became ingestible; build.py calls
+    compute_memory directly, this keeps any external `core.memory` import working."""
+    from .memory import compute_memory
+    return compute_memory(prof)
 
 
 # --------------------------------------------------------------------------- #

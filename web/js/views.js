@@ -363,6 +363,31 @@
   };
 
   // ============================ 显存 Memory ============================ //
+  function hbmTimeline(tl) {
+    const cap = tl.capacity_mb;
+    const mk = (name, color, data) => ({
+      name, type: "line", showSymbol: false, smooth: true,
+      areaStyle: { opacity: .10 }, lineStyle: { color }, itemStyle: { color }, data,
+    });
+    const series = [
+      mk("已保留 (进程 HBM 占用)", "#ff7a7a", tl.reserved || []),
+      mk("已分配 (活跃张量)", "#5b8def", tl.allocated || []),
+    ];
+    if (cap) series[0].markLine = {
+      silent: true, symbol: "none", lineStyle: { type: "dashed", color: "#ffb454" },
+      data: [{ yAxis: cap, label: { formatter: "容量 " + (cap / 1024).toFixed(0) + " GiB", color: "#ffb454", position: "insideEndTop" } }],
+    };
+    return {
+      tooltip: Object.assign({ trigger: "axis", formatter: p => `${(+p[0].data[0]).toFixed(2)}s<br/>` +
+        p.map(x => `${x.marker}${x.seriesName}: <b>${(x.data[1] / 1024).toFixed(1)} GiB</b>`).join("<br/>") }, tooltipBase),
+      legend: { top: 0, textStyle: { color: "#9aa4b2", fontSize: 11 } },
+      grid: { top: 30, bottom: 28, left: 52, right: 18 },
+      xAxis: axis({ type: "value", name: "s", min: 0, axisLabel: { formatter: v => v.toFixed(1) } }),
+      yAxis: axis({ type: "value", name: "MiB", scale: true, axisLabel: { formatter: v => (v / 1024).toFixed(0) + "G" } }),
+      series,
+    };
+  }
+
   V.memory = async function (root) {
     const [me, meta] = await Promise.all([api("/api/memory"), api("/api/meta")]);
     const chip = ((meta.meta || {}).settings || {}).chip || {};
@@ -372,16 +397,62 @@
         <div class="note" style="margin-top:2px">${esc(t.effect)}</div>
         <div class="note" style="color:var(--accent-2)">💡 ${esc(t.advice)}</div>
       </div>`).join("");
+
+    // ---- graceful fallback: capture lacked memory-level files ----
+    if (!(me.available && me.hbm_timeline_available)) {
+      root.innerHTML = `
+        ${banner("warn", "🧠", `<strong>显存采集未开启</strong> —— ${esc(me.reason || "缺 memory-level 数据")}`)}
+        <div class="grid cols-3">
+          ${metric("HBM 容量", chip.hbm_capacity_gb ? chip.hbm_capacity_gb.toFixed(0) + " GB" : "—", { foot: (chip.name || "") + " · 峰值时间线待 memory 采集" })}
+          ${metric("初始化类开销", fmt.us(me.init_overhead_us), { foot: "ZerosLike/TensorMove/Fill" })}
+          ${metric("AI Core 频率", (me.ai_core_freq_mhz || "—") + " MHz")}
+        </div>
+        <div class="section-title">内存 ↔ 时间权衡顾问（配置驱动）</div>
+        <div class="grid cols-2">${trade}</div>
+        <div class="note">${esc(me.note || "")}</div>`;
+      return;
+    }
+
+    // ---- real memory-level data ----
+    const s = me.summary || {};
+    const gib = mb => (mb == null ? "—" : (mb / 1024).toFixed(1) + " GiB");
+    const modRows = (me.modules || []).map(o =>
+      `<tr><td>${esc(o.module)}</td><td>${gib(o.mb)}</td><td>${fmt.pct(o.pct)}</td></tr>`).join("");
+    const allocRows = (me.top_allocators || []).map(a =>
+      `<tr><td>${esc(a.name)}</td><td>${gib(a.total_mb)}</td><td>${fmt.int(a.count)}</td><td>${gib(a.max_mb)}</td></tr>`).join("");
+    const liveRows = (me.longest_lived || []).map(l =>
+      `<tr><td>${esc(l.name)}</td><td>${(l.life_s).toFixed(2)} s</td><td>${gib(l.mb)}</td></tr>`).join("");
+    const decompRows = [
+      ["峰值已保留 (进程 HBM 占用，计入容量)", gib(s.peak_reserved_mb)],
+      ["活跃张量峰值 (Total Allocated)", gib(s.peak_allocated_mb)],
+      ["分配器缓存池 (PTA/PTA+GE Reserved)", gib(s.pool_reserved_mb)],
+      ["└ 分配器缓存碎片 (池保留 − 活跃)", gib(s.alloc_slack_mb)],
+      ["通信/workspace/运行时保留", gib(s.nontensor_reserved_mb) + (s.hccl_reserved_mb ? `（HCCL ${gib(s.hccl_reserved_mb)}）` : "")],
+    ].map(r => `<tr><td>${esc(r[0])}</td><td>${r[1]}</td></tr>`).join("");
+
     root.innerHTML = `
-      ${banner("warn", "🧠", `<strong>显存采集未开启</strong> —— ${esc(me.reason || "缺 memory-level 数据")}`)}
-      <div class="grid cols-3">
-        ${metric("HBM 容量", chip.hbm_capacity_gb ? chip.hbm_capacity_gb.toFixed(0) + " GB" : "—", { foot: (chip.name || "") + " · 峰值时间线待 memory 采集" })}
-        ${metric("初始化类开销", fmt.us(me.init_overhead_us), { foot: "ZerosLike/TensorMove/Fill" })}
-        ${metric("AI Core 频率", (me.ai_core_freq_mhz || "—") + " MHz")}
+      ${s.near_oom ? banner("warn", "🧠", `<strong>显存逼近容量</strong> —— 峰值保留 ${gib(s.peak_reserved_mb)} ≈ <strong>${s.util_pct}%</strong> of ${s.capacity_gb} GB（${chip.name || ""}），可用 headroom 仅 ${gib(s.headroom_mb)}，OOM 风险高。`)
+        : banner("info", "🧠", `HBM 峰值保留 ${gib(s.peak_reserved_mb)}（${s.util_pct}% of ${s.capacity_gb} GB），尚有 ${gib(s.headroom_mb)} headroom。`)}
+      <div class="grid cols-4">
+        ${metric("HBM 峰值占用", gib(s.peak_reserved_mb), { tone: s.near_oom ? "warn" : "good", foot: `${s.util_pct}% of ${s.capacity_gb} GB`, barPct: s.util_pct })}
+        ${metric("活跃张量峰值", gib(s.peak_allocated_mb), { foot: "Total Allocated（真实占用）" })}
+        ${metric("保留未占用 (碎片)", gib(s.fragmentation_mb), { tone: (s.fragmentation_pct || 0) >= 15 ? "warn" : undefined, foot: `占峰值 ${s.fragmentation_pct}% · 缓存+通信/运行时` })}
+        ${metric("可用 headroom", gib(s.headroom_mb), { tone: s.near_oom ? "warn" : "good", foot: `${s.capacity_gb} GB ${chip.name || ""}` })}
+      </div>
+      ${panel("HBM 峰值时间线（已保留 vs 活跃张量，跨 " + s.span_s + "s）", s.samples + " 采样点 · memory_record.csv",
+        `<div id="hbm-tl" style="height:240px"></div>`, "span-2")}
+      <div class="grid cols-2">
+        ${panel("显存构成（峰值口径近似）", "", `<table class="tbl"><thead><tr><th>构成</th><th>大小</th></tr></thead><tbody>${decompRows}</tbody></table>`)}
+        ${panel("驱动模块保留峰值（npu_module_mem.csv）", "HCCL = 集合通信缓冲", `<table class="tbl"><thead><tr><th>模块</th><th>保留峰值</th><th>占比</th></tr></thead><tbody>${modRows}</tbody></table>`)}
+      </div>
+      <div class="grid cols-2">
+        ${panel("分配压力 Top 框架算子（累计分配，反映碎片/搬运）", "operator_memory.csv", `<table class="tbl"><thead><tr><th>框架算子</th><th>累计分配</th><th>次数</th><th>单次峰值</th></tr></thead><tbody>${allocRows}</tbody></table>`)}
+        ${panel("最长存活张量（≥1 MB，长期占用 HBM）", "", `<table class="tbl"><thead><tr><th>张量(算子)</th><th>存活</th><th>大小</th></tr></thead><tbody>${liveRows || `<tr><td colspan=3 class="note">无</td></tr>`}</tbody></table>`)}
       </div>
       <div class="section-title">内存 ↔ 时间权衡顾问（配置驱动）</div>
       <div class="grid cols-2">${trade}</div>
       <div class="note">${esc(me.note || "")}</div>`;
+    charts([{ id: "hbm-tl", option: hbmTimeline(me.timeline || {}) }]);
   };
 
   // ============================ 时间线 Timeline ============================ //

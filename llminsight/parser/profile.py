@@ -1,5 +1,7 @@
-"""Load the 8 Ascend profiler-output files into one ProfileData model.
+"""Load the Ascend profiler-output files into one ProfileData model.
 
+8 core files + 3 optional memory-level files (memory_record / npu_module_mem /
+operator_memory) that are only present when the profiler ran at memory level.
 Indexed conceptually by (rank, step). This sample is single-card (rank 0) /
 single-step (step5); the rank dimension is reserved for future multi-card data.
 """
@@ -62,6 +64,10 @@ class ProfileData:
     communication_raw: Dict[str, Any]
     communication_matrix: Dict[str, Any]
     trace_path: Optional[str]
+    # Optional memory-level files (empty DataFrame when the capture lacked them).
+    memory_record: pd.DataFrame = field(default_factory=pd.DataFrame)
+    npu_module_mem: pd.DataFrame = field(default_factory=pd.DataFrame)
+    operator_memory: pd.DataFrame = field(default_factory=pd.DataFrame)
     meta: Dict[str, Any] = field(default_factory=dict)
 
     # trace is never held in memory; stream on demand
@@ -129,6 +135,11 @@ def load_profile(data_dir: str) -> ProfileData:
     kernel_details = _read_csv(p("kernel_details.csv"), low_memory=False)
     operator_details = _read_csv(p("operator_details.csv"), low_memory=False)
 
+    # Memory-level files — optional; absent on captures without memory profiling.
+    memory_record = _read_csv(p("memory_record.csv"), low_memory=False)
+    npu_module_mem = _read_csv(p("npu_module_mem.csv"), low_memory=False)
+    operator_memory = _read_csv(p("operator_memory.csv"), low_memory=False)
+
     comm_raw = _load_json(p("communication.json"))
     comm_matrix = _load_json(p("communication_matrix.json"))
     communication = _normalize_communication(comm_raw)
@@ -163,7 +174,10 @@ def load_profile(data_dir: str) -> ProfileData:
             "kernels": int(kernel_details.shape[0]),
             "operators": int(operator_details.shape[0]),
             "comm_ops": len(communication),
+            "memory_samples": int(memory_record.shape[0]),
+            "memory_ops": int(operator_memory.shape[0]),
         },
+        "memory_level": not memory_record.empty,
         "file_sizes": {
             f: fsize(f)
             for f in (
@@ -175,7 +189,11 @@ def load_profile(data_dir: str) -> ProfileData:
                 "communication.json",
                 "communication_matrix.json",
                 "trace_view.json",
+                "memory_record.csv",
+                "npu_module_mem.csv",
+                "operator_memory.csv",
             )
+            if fsize(f) > 0
         },
     }
 
@@ -190,5 +208,8 @@ def load_profile(data_dir: str) -> ProfileData:
         communication_raw=comm_raw,
         communication_matrix=comm_matrix,
         trace_path=trace_path,
+        memory_record=memory_record,
+        npu_module_mem=npu_module_mem,
+        operator_memory=operator_memory,
         meta=meta,
     )
