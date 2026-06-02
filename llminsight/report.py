@@ -176,14 +176,32 @@ def _ibar(frac: Any, color: str = "") -> str:
 def _sec_header(meta: Dict, overview: Dict, theo: Dict,
                 eff: Dict, generated_at: datetime) -> str:
     settings = (meta or {}).get("settings", {}) or {}
-    model = settings.get("model", {}) or {}
+    cfg = (meta or {}).get("config", {}) or {}        # profiling-derived (parser.derive)
+    dm = cfg.get("model", {}) or {}
+    gs = cfg.get("guesses", {}) or {}
+    cap = cfg.get("capture", {}) or {}
     schip = settings.get("chip", {}) or {}
     echip = (eff or {}).get("chip", {}) or {}
 
-    name = model.get("name", "—")
-    par = (f"TP{model.get('tp','?')} / PP{model.get('pp','?')} / "
-           f"EP{model.get('ep','?')} / CP{model.get('cp','?')}")
-    moe = (f"{model.get('num_experts','?')} experts · top-{model.get('moe_router_topk','?')}")
+    def _glabel(key):                                 # 未知(猜X) label for underivable fields
+        return (gs.get(key, {}) or {}).get("label", "未知")
+
+    def _capval(key):
+        return (cap.get(key, {}) or {}).get("value")
+
+    arch_bits = [b for b in (
+        f"hidden {dm['hidden_size']}" if dm.get("hidden_size") else None,
+        f"{dm['num_attention_heads']} heads" if dm.get("num_attention_heads") else None,
+    ) if b]
+    arch = "MLA + MoE" + (" · " + " · ".join(arch_bits) if arch_bits else "")
+    dtype = dm.get("dtype") or "—"
+    par = f"EP={_glabel('ep_world_size')} · TP/PP/CP 未知（单卡不可得）"
+    moe = (f"experts {_glabel('num_experts')} · top-{dm.get('moe_router_topk', '?')}"
+           f" · 每卡 {dm.get('local_experts_per_rank', '?')} 专家 · 专家FFN {dm.get('moe_ffn_hidden_size', '?')}")
+    rc = _capval("recompute")
+    cap_txt = (f"recompute {rc if rc is not None else '未知'} · "
+               f"{'单卡' if _capval('single_card') else '多卡'} · "
+               f"blocking {'检出' if _capval('blocking') else '未检出（数据推断）'}")
     chip_name = echip.get("name") or schip.get("name") or "—"
     cube_peak = echip.get("cube_bf16_tflops") or echip.get("peak_bf16_tflops")
     eff_peak = echip.get("effective_peak_tflops")
@@ -197,10 +215,11 @@ def _sec_header(meta: Dict, overview: Dict, theo: Dict,
         peak_txt += " · 参考峰值"
 
     rows = [
-        ("模型", f"{_e(name)} · {_e(model.get('dtype','bf16'))}"),
+        ("模型结构", f"{_e(arch)} · {_e(dtype)}"),
         ("并行", _e(par)),
         ("MoE", _e(moe)),
-        ("序列 / 批", f"seq {_int(model.get('seq_length'))} · global-batch {_e(model.get('global_batch_size','?'))}"),
+        ("序列 / 批", f"seq {_int(dm.get('seq_length'))} · global-batch {_e(_glabel('global_batch_size'))}"),
+        ("训练 / 采集", _e(cap_txt)),
         ("参考芯片", f"{_e(chip_name)} · {peak_txt}"),
         ("采集", f"step {overview.get('step','—')} · device {overview.get('device_id','—')} · "
                  f"{_e(_mask_path(settings.get('data_dir')))}"),
@@ -997,7 +1016,7 @@ def _main(argv=None) -> int:
     from .config import SETTINGS
     from .parser import load_profile
     from .metrics import compute_all
-    from .rules import run_rules, read_capture_config
+    from .rules import run_rules
 
     ap = argparse.ArgumentParser(
         description="Export a self-contained LLMInsight HTML report (no server).")
@@ -1008,7 +1027,9 @@ def _main(argv=None) -> int:
     print(f"[report] loading profile from: {SETTINGS.data_dir}")
     prof = load_profile(SETTINGS.data_dir)
     m = compute_all(prof)
-    cards = run_rules(m, read_capture_config())
+    # compute_all derived the config from the profiling and stashed it on m.meta;
+    # reuse it so cards reflect the data (no launch-script dependency).
+    cards = run_rules(m, m.get("meta", {}).get("config"))
     html = build_report_html(m, cards)
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(html)
