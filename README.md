@@ -25,10 +25,10 @@
 
 ### 方式一 · 从 Release 下载 whl（推荐，开箱即用）
 
-到 [**Releases**](https://github.com/ai-v5/LLMInsight/releases/latest) 下载 `llminsight-0.1.0-py3-none-any.whl`，安装即可运行（whl 已内置 Web 前端与芯片配置，离线可用，无需克隆仓库）：
+到 [**Releases**](https://github.com/ai-v5/LLMInsight/releases/latest) 下载 `llminsight-0.2.0-py3-none-any.whl`，安装即可运行（whl 已内置 Web 前端与芯片配置，离线可用，无需克隆仓库）：
 
 ```bash
-pip install llminsight-0.1.0-py3-none-any.whl   # 自动装好 pandas / numpy / pyyaml
+pip install llminsight-0.2.0-py3-none-any.whl   # 自动装好 pandas / numpy / pyyaml
 
 python -m llminsight.server                      # 默认 http://127.0.0.1:8000，自动开浏览器
 python -m llminsight.server --port 8765 --no-browser
