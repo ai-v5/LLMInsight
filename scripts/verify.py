@@ -10,6 +10,15 @@ import os
 import sys
 import json
 
+# On Windows the default stdout encoding is GBK (cp936), which can't encode the
+# non-ASCII glyphs this script prints (e.g. « U+00AB) or its Chinese labels, so a
+# bare `python scripts/verify.py` dies mid-run with UnicodeEncodeError. Force
+# utf-8 so the report renders identically on every platform — no PYTHONIOENCODING.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from llminsight.config import SETTINGS, set_chip

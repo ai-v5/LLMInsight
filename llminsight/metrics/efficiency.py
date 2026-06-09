@@ -208,25 +208,40 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     vec_r = colf("aiv_vec_ratio")
     cube_u = colf("cube_utilization(%)")
 
-    # ---- pre-pass: observed BF16 ceiling -> calibrate the assumed peak --------
-    # A real kernel cannot exceed silicon peak. If the best clean matmul's achieved
-    # throughput exceeds the assumed ChipSpec peak, the assumption is simply too low
-    # for this SKU (910B bins vary), so reporting MFU > 100% would be nonsense.
-    # Calibrate the effective peak up to the observed ceiling (+2% headroom so the
-    # ceiling kernel reads ~98%, not a suspicious flat 100%), bounded at 2x the
-    # assumption so a stray shape mis-parse can't masquerade as a giant peak bump.
-    # Both assumed and observed peaks are surfaced in the UI; setting the real SKU
-    # peak in ChipSpec overrides this. Calibration only ever raises the peak.
+    # ---- pre-pass: observed bf16 ceiling -> calibrate an ASSUMED peak ---------
+    # A real kernel cannot exceed silicon peak. If the best clean bf16 GEMM's
+    # achieved throughput exceeds an *assumed* ChipSpec peak, the assumption is
+    # simply too low for this SKU (910B bins vary), so reporting MFU > 100% would
+    # be nonsense. Calibrate the effective peak up to the observed ceiling (+2%
+    # headroom so the ceiling kernel reads ~98%, not a suspicious flat 100%),
+    # bounded at 2x the assumption so a stray shape mis-parse can't masquerade as a
+    # giant peak bump. Calibration only ever raises the peak, and only the CUBE
+    # bf16 peak (GEMM runs on the cube); the vector peak is left as configured.
+    #
+    # Two guards stop this from inflating an ALREADY-CORRECT peak:
+    #   (1) only bf16/fp16 GEMMs set the ceiling. An fp8/fp4 GEMM does the same
+    #       2·M·N·K FLOPs in 1/2 (1/4) the time, so mixing it in would look like a
+    #       bf16 peak 2x (4x) too low and scale EVERY cube op's MFU denominator up
+    #       — that was the "950DT bf16 reads 864T (= 432x2)" bug.
+    #   (2) only assumed chips calibrate. A chip with real datasheet peaks
+    #       (assumed=false, e.g. 950DT) is trusted as-is — an fp8 run in the same
+    #       step must not rewrite its known-correct bf16 ceiling.
+    configured_peak = chip.peak_cube_flops("BF16")
     observed_peak = 0.0
     for i in range(len(kd)):
         if types[i] not in MATMUL_TYPES or float(dur[i]) <= 0:
             continue
+        # guard (1): skip non-bf16 GEMMs — i.e. those whose routed cube peak
+        # differs from the bf16 peak (fp8 -> 2x, fp4 -> 4x on a chip that configs
+        # them). dtype-unknown GEMMs fall back to bf16 and are kept, as before.
+        di = (parse_dtypes(in_dt[i])[:1] or [""])[0]
+        if chip.peak_cube_flops(di) != configured_peak:
+            continue
         f = _estimate_matmul_flops(parse_shapes(in_sh[i]))
         if f:
             observed_peak = max(observed_peak, f / (float(dur[i]) * 1e-6))
-    # Calibrate against the CUBE bf16 peak — GEMM runs on the cube unit.
-    configured_peak = chip.peak_cube_flops("BF16")
-    calibrated = observed_peak > configured_peak
+    # guard (2): trust real datasheet peaks; only an assumed peak gets calibrated.
+    calibrated = chip.assumed and observed_peak > configured_peak
     effective_peak = min(observed_peak * 1.02, configured_peak * 2.0) if calibrated else configured_peak
     peak_scale = effective_peak / configured_peak if configured_peak else 1.0  # >= 1.0 (cube only)
 
