@@ -16,6 +16,11 @@ from ..parser.shapes import parse_shapes, parse_dtypes, numel
 MATMUL_TYPES = {
     "MatMulV3", "MatMul", "GroupedMatmul", "GroupedMatmulAdd", "GemmV3", "Gemm",
     "BatchMatMul", "BatchMatMulV2",
+    # fp8 quantized matmul (routed-expert GEMMs in fp8 training). Same 2·M·N·K
+    # work; x and weight are the first two ≥2D operands, the trailing E8M0 scale
+    # tensors ([*,*,2]) are ignored by _estimate_matmul_flops. dtype FLOAT8_E4M3
+    # routes to the fp8 cube peak via peak_cube_flops().
+    "QuantBatchMatmulV3", "QuantBatchMatmulInplaceAdd",
 }
 
 # Fused attention kernels are matmul-dominated (QK^T + softmax·V on the cube), so
@@ -494,11 +499,19 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     # count and the Roofline scatter.
     flops_rows = [r for r in rows if r["flops"]]
     mm = [r for r in flops_rows if r["type"] in MATMUL_TYPES]
-    mm_time_s = sum(r["dur_us"] for r in mm) * 1e-6
     mm_flops = sum(r["flops"] for r in mm)
-    matmul_mfu = (mm_flops / mm_time_s / effective_peak) if mm_time_s else None
-    # the same number against the *assumed* peak (>1 is what triggered calibration)
-    matmul_mfu_assumed = (mm_flops / mm_time_s / configured_peak) if mm_time_s else None
+    # Divide by each matmul's OWN routed peak (cube + dtype-aware), summed as
+    # peak·time — the same convention as by_type. A single bf16 effective_peak
+    # here would divide an fp8 GEMM's ~2x throughput by the bf16 peak and read a
+    # non-physical >100% on any mixed bf16+fp8 step (which then misfires the
+    # peak_underestimated advisory in metrics/core.py).
+    mm_peak_time = sum(r["peak_flops"] * r["dur_us"] * 1e-6 for r in mm if r.get("peak_flops"))
+    matmul_mfu = (mm_flops / mm_peak_time) if mm_peak_time else None
+    # "assumed" strips the calibration scale (peak_scale) so a genuinely
+    # underestimated *assumed* peak still trips >1 (the calibration trigger) —
+    # now per-kernel vs each one's un-calibrated peak, not a single bf16 peak.
+    mm_assumed_peak_time = (mm_peak_time / peak_scale) if peak_scale else 0.0
+    matmul_mfu_assumed = (mm_flops / mm_assumed_peak_time) if mm_assumed_peak_time else None
 
     scatter.sort(key=lambda s: s["dur_us"], reverse=True)
     scatter = scatter[:1500]
