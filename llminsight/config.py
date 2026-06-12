@@ -334,7 +334,20 @@ DTYPE_BYTES = {
 def dtype_bytes(dtype: str) -> float:
     if not dtype:
         return 2
-    return DTYPE_BYTES.get(dtype.strip().upper(), 2)
+    d = dtype.strip().upper()
+    if d in DTYPE_BYTES:
+        return DTYPE_BYTES[d]
+    # msprof emits dtype strings the table doesn't list verbatim: a DT_ prefix
+    # and/or a sub-format suffix (e.g. DT_FLOAT8_E4M3FN, DT_FLOAT8_E8M0). Match by
+    # family so fp8 (1B) / fp4 (0.5B) aren't silently taken as the 2B default,
+    # which would over-state bytes -> MBU for quantized matmul ops.
+    if "FLOAT8" in d or "FP8" in d or "HIF8" in d:
+        return 1
+    if "FLOAT4" in d or "FP4" in d:
+        return 0.5
+    if d.startswith("DT_"):
+        return DTYPE_BYTES.get(d[3:], 2)
+    return 2
 
 
 SETTINGS = Settings()
