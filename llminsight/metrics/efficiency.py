@@ -52,7 +52,11 @@ def _op_class(op_type: str) -> Optional[str]:
     return None
 
 
-def _estimate_matmul_flops(shapes: List[List[int]]) -> Optional[float]:
+def _matmul_mnk(shapes: List[List[int]]):
+    """(M, N, K, batch) of a matmul from its first two >=2D operands, or None.
+    Single source of truth for both the FLOP count (2*M*N*K*batch) and the result
+    size M*N*batch — the latter caps oversized inplace-add accumulators in the
+    bytes model (see compute_efficiency)."""
     mats = [s for s in shapes if len(s) >= 2]
     if len(mats) < 2:
         return None
@@ -74,12 +78,19 @@ def _estimate_matmul_flops(shapes: List[List[int]]) -> Optional[float]:
         N = br
     else:
         N = bc
+    if min(M, N, K) <= 0:
+        return None
     # Batch comes from the activation side only. For GroupedMatmul the weight is
     # a 3-D [E,K,N] tensor but each token visits exactly one expert, so the token
     # dimension already totals the work — multiplying by E would over-count.
-    batch = abz
-    if min(M, N, K) <= 0:
+    return M, N, K, abz
+
+
+def _estimate_matmul_flops(shapes: List[List[int]]) -> Optional[float]:
+    mnk = _matmul_mnk(shapes)
+    if not mnk:
         return None
+    M, N, K, batch = mnk
     return 2.0 * M * N * K * batch
 
 
@@ -279,14 +290,33 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         dt_out = parse_dtypes(out_dt[i])
         dtype = dt_in[0] if dt_in else (dt_out[0] if dt_out else "BF16")
 
-        # bytes moved (read inputs + write outputs)
+        # bytes moved (read inputs + write outputs). For matmul kernels, cap any
+        # operand equal to the M*N result buffer: an inplace-add GEMM reports its
+        # whole accumulator (>> M*N) as both a residual input and the output, so a
+        # naive shape sum over-counts HBM traffic and pushes MBU past 100%. Only the
+        # M*N block is truly read-modified-written; the activation (M*K) and weight
+        # (K*N) stay intact. A plain GEMM has output == M*N, so this is a no-op.
+        mn_elems = 0
+        if types[i] in MATMUL_TYPES:
+            _mnk = _matmul_mnk(shapes_in)
+            if _mnk:
+                mn_elems = _mnk[0] * _mnk[1] * _mnk[3]   # M * N * batch
+        out_numels = {numel(s) for s in shapes_out}
         b_bytes = 0
         for j, sh in enumerate(shapes_in):
             dt = dt_in[j] if j < len(dt_in) else (dt_in[-1] if dt_in else dtype)
-            b_bytes += numel(sh) * dtype_bytes(dt)
+            ne = numel(sh)
+            # inplace residual: same size as the oversized output and larger than
+            # the M*N result -> only M*N is actually touched by the accumulate.
+            if mn_elems and ne > mn_elems and ne in out_numels:
+                ne = mn_elems
+            b_bytes += ne * dtype_bytes(dt)
         for j, sh in enumerate(shapes_out):
             dt = dt_out[j] if j < len(dt_out) else (dt_out[-1] if dt_out else dtype)
-            b_bytes += numel(sh) * dtype_bytes(dt)
+            ne = numel(sh)
+            if mn_elems and ne > mn_elems:
+                ne = mn_elems
+            b_bytes += ne * dtype_bytes(dt)
 
         is_matmul = types[i] in MATMUL_TYPES
         is_attention = types[i] in ATTENTION_TYPES
