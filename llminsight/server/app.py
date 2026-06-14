@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
 
-from ..config import SETTINGS, set_chip
+from ..config import SETTINGS, set_chip, save_last_dir, load_last_dir
 from ..parser import load_profile
 from ..metrics import compute_all
 from ..metrics import core as metrics_core
@@ -173,6 +173,7 @@ class AppState:
             self.metrics = compute_all(self.prof, self.capture)
             self.cards = run_rules(self.metrics, self.capture)
             self.loaded_dir = data_dir
+            save_last_dir(data_dir)        # remember for the next server start
             self.ready = True
             self.status = "ready"
         except Exception as exc:  # surface load failures to the UI
@@ -270,7 +271,8 @@ def _meta() -> Dict[str, Any]:
         "meta": STATE.metrics.get("meta"),
         "llm": get_provider().status(),
         "data_dir": STATE.loaded_dir,       # currently-loaded dir (null when idle)
-        "suggested_dir": SETTINGS.data_dir,  # default sample — seeds the dir picker
+        # the last loaded dir (persisted) seeds the picker; falls back to the sample
+        "suggested_dir": load_last_dir() or SETTINGS.data_dir,
         "sections": ["overview", "hotspots", "efficiency", "communication",
                      "hidden_overhead", "attribution", "memory", "theoretical",
                      "timeline", "smart_timeline", "insights"],
@@ -468,8 +470,9 @@ def serve(host: str = "127.0.0.1", port: int = 8000, open_browser: bool = True) 
     # LLMINSIGHT_AUTOLOAD=1 to eagerly (re)load the default / LLMINSIGHT_DATA_DIR
     # sample at startup in the background (the old one-shot behavior).
     if _autoload_enabled():
-        print(f"[LLMInsight] autoload (LLMINSIGHT_AUTOLOAD): {SETTINGS.data_dir}")
-        STATE.start_load(SETTINGS.data_dir)
+        target = load_last_dir() or SETTINGS.data_dir
+        print(f"[LLMInsight] autoload (LLMINSIGHT_AUTOLOAD): {target}")
+        STATE.start_load(target)
     else:
         print("[LLMInsight] idle — open the app and choose a profiling directory")
     print(f"[LLMInsight] LLM={'on' if get_provider().available else 'off (default)'}")

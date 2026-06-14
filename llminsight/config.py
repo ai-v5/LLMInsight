@@ -367,3 +367,36 @@ def set_chip(key: str) -> bool:
     SETTINGS.chip = spec
     SETTINGS.chip_key = _canonical_chip_key(key)
     return True
+
+
+# --------------------------------------------------------------------------- #
+# Persisted UI state: remember the last successfully-loaded profiling dir so the
+# directory picker (and optional autoload) default to it across server restarts.
+# Stored under ~/.llminsight (override with LLMINSIGHT_STATE_DIR).
+# --------------------------------------------------------------------------- #
+def _state_dir() -> str:
+    env = os.environ.get("LLMINSIGHT_STATE_DIR")
+    if env:
+        return env
+    return os.path.join(os.path.expanduser("~"), ".llminsight")
+
+
+def save_last_dir(data_dir: str) -> None:
+    """Persist the last loaded profiling dir (best-effort; never raises)."""
+    try:
+        d = _state_dir()
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "last_profile_dir.txt"), "w", encoding="utf-8") as fh:
+            fh.write(str(data_dir or "").strip())
+    except OSError:
+        pass
+
+
+def load_last_dir() -> Optional[str]:
+    """The last loaded dir if it still exists on disk, else None."""
+    try:
+        with open(os.path.join(_state_dir(), "last_profile_dir.txt"), "r", encoding="utf-8") as fh:
+            d = fh.read().strip()
+        return d if d and os.path.isdir(d) else None
+    except OSError:
+        return None
