@@ -420,6 +420,8 @@ def compute_msprof_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
     cube_occ = [0.0] * bins
     vec_occ = [0.0] * bins
     comm_occ = [0.0] * bins
+    p2p_occ = [0.0] * bins   # point-to-point (PP send/recv) AICPU blocking — a
+    # distinct kind of cross-rank wait that never expands into device sub-tasks.
 
     def spread(arr, s, e):
         s = max(s, t0); e = min(e, t1)
@@ -442,6 +444,9 @@ def compute_msprof_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
         stream = _stream_from_meta(ty, co)
         s = float(s); e = s + float(d)
         cu = co.upper()
+        nl = nm.lower()
+        if nl.startswith("hcom_send") or nl.startswith("hcom_receive"):
+            spread(p2p_occ, s, e)        # P2P/PP blocking (AICPU; not on device cube)
         if "VECTOR" in cu or "AIV" in cu:
             spread(vec_occ, s, e)
         elif "COMMUNICATION" in cu or stream == "comm":
@@ -470,6 +475,40 @@ def compute_msprof_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
         slices = kept
     slices.sort(key=lambda x: x["start_ms"])
 
+    # comm wait vs transfer per-bin, from the device HCCL sub-tasks in the db slice
+    # table (NOTIFY/EVENT_WAIT = cross-rank waiting, UBDMA/SDMA/MEMCPY = moving data).
+    # SQL start-bin aggregate (sub-tasks are short, so bin attribution is accurate);
+    # durations sum across cores/queues -> occupancy can exceed 1 and is clamped.
+    wait_occ = [0.0] * bins
+    xfer_occ = [0.0] * bins
+    db = ((getattr(prof, "meta", {}) or {}).get("msprof") or {}).get("db_path")
+    if db and bin_us > 0:
+        import sqlite3
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con.text_factory = lambda b: b.decode("utf-8", "replace") if isinstance(b, bytes) else b
+        try:
+            for bi, cat, dns in con.execute(
+                "SELECT CAST((s.timestamp/1e3 - ?)/? AS INT) b, "
+                "CASE WHEN s.name LIKE '%WAIT%' OR s.name LIKE '%NOTIFY%' THEN 'w' "
+                "     WHEN s.name LIKE '%DMA%' OR s.name LIKE '%MEMCPY%' THEN 'x' "
+                "     ELSE 'o' END c, SUM(s.duration) "
+                "FROM slice s JOIN thread t ON s.track_id=t.track_id "
+                "JOIN process p ON t.pid=p.pid "
+                "WHERE p.process_name='Ascend Hardware' AND s.name NOT LIKE 'aclnn%' "
+                "GROUP BY b, c", (t0, bin_us)):
+                if bi is None or not (0 <= int(bi) < bins):
+                    continue
+                us = float(dns or 0) / 1e3                 # ns -> us
+                if cat == "w":
+                    wait_occ[int(bi)] += us
+                elif cat == "x":
+                    xfer_occ[int(bi)] += us
+        except Exception:
+            wait_occ = [0.0] * bins
+            xfer_occ = [0.0] * bins
+        finally:
+            con.close()
+
     kindex = (eff or {}).get("kernel_index", {}) or {}
     out_slices: List[Dict[str, Any]] = []
     for s in slices:
@@ -486,6 +525,16 @@ def compute_msprof_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
         return [round(_clamp01(v / bin_us), 4) for v in arr] if bin_us > 0 else [0.0] * bins
     bin_us_r = round(bin_us, 1)
 
+    # comm composition per bin: wait vs transfer as a FRACTION of comm activity, so
+    # red+green=1 when comm is active and both=0 in compute gaps. Clamped occupancy
+    # hid the difference (both lanes saturated to 100% during comm); the fraction
+    # shows whether each moment is dominated by waiting or by actual transfer.
+    comm_tot = [wait_occ[b] + xfer_occ[b] for b in range(bins)]
+    wait_frac = [round(wait_occ[b] / comm_tot[b], 4) if comm_tot[b] > 0 else 0.0
+                 for b in range(bins)]
+    xfer_frac = [round(xfer_occ[b] / comm_tot[b], 4) if comm_tot[b] > 0 else 0.0
+                 for b in range(bins)]
+
     utilization = [
         {"key": "cube", "label": "Cube 占用率", "available": True, "unit": "%",
          "color": "#4f9fe0", "series": occ_series(cube_occ),
@@ -497,11 +546,21 @@ def compute_msprof_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
          "abs": [round(v, 1) for v in vec_occ], "abs_unit": "μs", "peak": bin_us_r,
          "peak_unit": "μs", "kind": "occupancy",
          "note": "AI_VECTOR_CORE 泳道每桶时间占用率"},
-        {"key": "comm", "label": "通信 占用率", "available": True, "unit": "%",
-         "color": "#f0655c", "series": occ_series(comm_occ),
-         "abs": [round(v, 1) for v in comm_occ], "abs_unit": "μs", "peak": bin_us_r,
+        {"key": "comm_wait", "label": "集合通信-卡间等待占比", "available": True, "unit": "%",
+         "color": "#f0655c", "series": wait_frac,
+         "abs": [round(v, 1) for v in wait_occ], "abs_unit": "μs", "peak": bin_us_r,
          "peak_unit": "μs", "kind": "occupancy",
-         "note": "COMMUNICATION 泳道每桶时间占用率（已剔除 Notify_Wait）"},
+         "note": "集合通信(allReduce/alltoall…)的 device 同步等待占比(NOTIFY/EVENT_WAIT)；红+绿=该桶集合通信构成、计算间隙为 0；悬停 abs 为绝对耗时(μs，跨核累加)"},
+        {"key": "comm_xfer", "label": "集合通信-有效传输占比", "available": True, "unit": "%",
+         "color": "#5ee0b8", "series": xfer_frac,
+         "abs": [round(v, 1) for v in xfer_occ], "abs_unit": "μs", "peak": bin_us_r,
+         "peak_unit": "μs", "kind": "occupancy",
+         "note": "集合通信的 device 搬数据占比(UBDMA/SDMA/MEMCPY)；悬停 abs 为绝对耗时(μs)"},
+        {"key": "comm_p2p", "label": "P2P/PP 通信阻塞", "available": True, "unit": "%",
+         "color": "#d29922", "series": occ_series(p2p_occ),
+         "abs": [round(v, 1) for v in p2p_occ], "abs_unit": "μs", "peak": bin_us_r,
+         "peak_unit": "μs", "kind": "occupancy",
+         "note": "点对点 hcom_send/receive 的 AICPU 阻塞占用——PP 流水的卡间等待，不经 device cube 展开(故不在上面两条集合通信里)；占用率(含跨核累加)"},
         {"key": "hbm_bw", "label": "HBM 利用率", "available": False,
          "reason": "msprof 轻量采集无 shape → 无字节模型，HBM 利用率不可用"},
         {"key": "hbm_cap", "label": "显存容量 (HBM)", "available": False,
