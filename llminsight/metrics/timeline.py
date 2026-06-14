@@ -164,6 +164,11 @@ def _build(prof) -> Dict[str, Any]:
 
 
 def compute_timeline(prof) -> Dict[str, Any]:
+    # msprof captures have no trace_view.json; build the timeline from the SQLite
+    # slice/counter tables instead (same output shape).
+    if (getattr(prof, "meta", {}) or {}).get("format") == "msprof":
+        from .msprof_timeline import compute_msprof_timeline
+        return compute_msprof_timeline(prof)
     if not prof.trace_path:
         return {"available": False, "reason": "trace_view.json missing"}
     sig = file_signature(prof.trace_path)
