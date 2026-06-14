@@ -22,9 +22,41 @@ def _pct(x: float, total: float) -> float:
 
 
 # --------------------------------------------------------------------------- #
+def _overview_msprof(ms: Dict[str, Any]) -> Dict[str, Any]:
+    """Overview for a msprof lightweight capture: no wall-clock step_trace, so we
+    surface SUMMED compute vs communication time as an accumulated-time split.
+    Labeled basis=accumulated so the UI doesn't read it as a step wall-clock."""
+    compute = _f(ms.get("compute_us"))
+    comm = _f(ms.get("comm_us"))
+    total = compute + comm
+    return {
+        "available": True,
+        "basis": "accumulated",
+        "note": ("msprof 轻量采集：无 wall-clock step 分解，下为算子累加耗时占比"
+                 "（计算/通信相互重叠，非 step 墙钟）。"),
+        "us": {"computing": compute, "communication": comm,
+               "comm_not_overlapped": comm, "overlapped": 0.0, "free": 0.0,
+               "stage": total, "bubble": 0.0, "preparing": 0.0},
+        "composition": [
+            {"name": "Computing", "us": compute, "pct": _pct(compute, total)},
+            {"name": "Communication", "us": comm, "pct": _pct(comm, total)},
+        ],
+        "ratios": {
+            "effective_compute_pct": _pct(compute, total),
+            "comm_pct": _pct(comm, total),
+            "comm_not_overlapped_pct": _pct(comm, total),
+            "free_pct": 0.0,
+            "step_time_s": round(total / 1e6, 4),
+        },
+    }
+
+
 def overview(prof) -> Dict[str, Any]:
     st = prof.step_trace
     if st.empty:
+        ms = (getattr(prof, "meta", {}) or {}).get("msprof")
+        if ms and (ms.get("compute_us") or ms.get("comm_us")):
+            return _overview_msprof(ms)
         return {"available": False}
     r = st.iloc[0]
     computing = _f(r.get("Computing"))
@@ -159,8 +191,13 @@ def communication(prof) -> Dict[str, Any]:
         for c in top
     ]
 
+    # msprof: device-level effective-transfer vs cross-rank-wait split (None on
+    # torch_npu, whose communication.json already carries Transit/Wait per op).
+    breakdown = ((getattr(prof, "meta", {}) or {}).get("msprof") or {}).get("comm_breakdown")
+
     return {
         "available": True,
+        "breakdown": breakdown,
         "count": len(comms),
         "total_elapse_ms": round(total_elapse, 2),
         "total_wait_ms": round(total_wait, 2),

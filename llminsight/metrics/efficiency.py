@@ -617,4 +617,8 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         "kernels_with_flops": len(flops_rows),
         "kernels_total": len(rows),
         "comm_kernels_excluded": skipped_comm,
+        # False on a msprof lightweight capture (shapes are N/A) -> no FLOPs can be
+        # modeled, so MFU/MBU/Roofline are unavailable; the UI shows a degradation
+        # banner instead of empty tables. True whenever any kernel had shapes.
+        "shapes_available": len(flops_rows) > 0,
     }
