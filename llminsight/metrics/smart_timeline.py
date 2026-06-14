@@ -375,6 +375,8 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]:
 
 def compute_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
     """Entry point: geometry (cached by trace signature) + chip overlay."""
+    if (getattr(prof, "meta", {}) or {}).get("format") == "msprof":
+        return compute_msprof_smart_timeline(prof, eff)
     if not getattr(prof, "trace_path", None):
         return {"available": False, "reason": "trace_view.json missing"}
     if not eff or not eff.get("available"):
@@ -386,3 +388,137 @@ def compute_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
            f"{SETTINGS.smart_timeline_bins}:{SETTINGS.timeline_max_slices}")
     geom = cached_json(key, lambda: _build_geometry(prof, kindex))
     return _apply_chip(geom, eff)
+
+
+def compute_msprof_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
+    """Smart timeline for msprof captures, built from kernel_details (there is no
+    trace_view.json). The operator Gantt and the Cube/Vector/通信 lanes are time
+    OCCUPANCY (no FLOP/byte model without shapes), so they read as "busy fraction"
+    rather than MFU/MBU; the HBM-rate lane degrades to unavailable. Per-slice
+    MFU/MBU are joined from kernel_index when a shape-recording capture has them."""
+    import pandas as pd
+    kd = getattr(prof, "kernel_details", None)
+    if kd is None or kd.empty:
+        return {"available": False, "reason": "no kernels"}
+    bins = SETTINGS.smart_timeline_bins
+    max_slices = SETTINGS.timeline_max_slices
+    start = pd.to_numeric(kd["Start Time(us)"], errors="coerce")
+    dur = pd.to_numeric(kd["Duration(us)"], errors="coerce")
+    names = kd["Name"].astype(str)
+    types = kd["Type"].astype(str)
+    cores = kd["Accelerator Core"].astype(str)
+    mask = start.notna() & (dur > 0)
+    if not mask.any():
+        return {"available": False, "reason": "no timed kernels"}
+    t0 = float(start[mask].min())
+    t1 = float((start + dur)[mask].max())
+    span = t1 - t0
+    if span <= 0:
+        return {"available": False, "reason": "empty span"}
+    bin_us = span / bins
+
+    cube_occ = [0.0] * bins
+    vec_occ = [0.0] * bins
+    comm_occ = [0.0] * bins
+
+    def spread(arr, s, e):
+        s = max(s, t0); e = min(e, t1)
+        if e <= s:
+            return
+        b0 = max(0, min(int((s - t0) / bin_us), bins - 1))
+        b1 = max(0, min(int((e - t0) / bin_us), bins - 1))
+        if b0 == b1:
+            arr[b0] += e - s; return
+        arr[b0] += (t0 + (b0 + 1) * bin_us) - s
+        for b in range(b0 + 1, b1):
+            arr[b] += bin_us
+        arr[b1] += e - (t0 + b1 * bin_us)
+
+    slices: List[Dict[str, Any]] = []
+    for nm, ty, co, s, d in zip(names[mask], types[mask], cores[mask],
+                                start[mask], dur[mask]):
+        if _is_notify_wait(nm):
+            continue
+        stream = _stream_from_meta(ty, co)
+        s = float(s); e = s + float(d)
+        cu = co.upper()
+        if "VECTOR" in cu or "AIV" in cu:
+            spread(vec_occ, s, e)
+        elif "COMMUNICATION" in cu or stream == "comm":
+            spread(comm_occ, s, e)
+        else:
+            spread(cube_occ, s, e)
+        slices.append({"name": nm, "stream": stream, "type": ty, "core": co,
+                       "dtype": None, "start_ms": (s - t0) / 1e3, "dur_ms": float(d) / 1e3})
+    if not slices:
+        return {"available": False, "reason": "no lane slices"}
+
+    total = len(slices)
+    if total > max_slices:
+        # per-stream quota: multi-second comm slices would otherwise crowd out every
+        # (shorter) compute kernel under a global longest-first cut, leaving an
+        # all-comm Gantt. Keep the longest few per lane so each stream is visible.
+        from collections import defaultdict
+        by_stream: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for s in slices:
+            by_stream[s["stream"]].append(s)
+        quota = max(1, max_slices // max(len(by_stream), 1))
+        kept: List[Dict[str, Any]] = []
+        for grp in by_stream.values():
+            grp.sort(key=lambda x: x["dur_ms"], reverse=True)
+            kept.extend(grp[:quota])
+        slices = kept
+    slices.sort(key=lambda x: x["start_ms"])
+
+    kindex = (eff or {}).get("kernel_index", {}) or {}
+    out_slices: List[Dict[str, Any]] = []
+    for s in slices:
+        ki = kindex.get(s["name"])
+        nm = s["name"]
+        out_slices.append({
+            "name": nm if len(nm) <= 90 else nm[:88] + "…",
+            "stream": s["stream"], "type": s["type"], "core": s["core"], "dtype": None,
+            "start_ms": round(s["start_ms"], 4), "dur_ms": round(s["dur_ms"], 4),
+            "mfu": ki.get("mfu") if ki else None, "mbu": ki.get("mbu") if ki else None,
+        })
+
+    def occ_series(arr):
+        return [round(_clamp01(v / bin_us), 4) for v in arr] if bin_us > 0 else [0.0] * bins
+    bin_us_r = round(bin_us, 1)
+
+    utilization = [
+        {"key": "cube", "label": "Cube 占用率", "available": True, "unit": "%",
+         "color": "#4f9fe0", "series": occ_series(cube_occ),
+         "abs": [round(v, 1) for v in cube_occ], "abs_unit": "μs", "peak": bin_us_r,
+         "peak_unit": "μs", "kind": "occupancy",
+         "note": "AI_CORE 泳道每桶时间占用率（msprof 无 shape → 按占用计，非 FLOP MFU）"},
+        {"key": "vector", "label": "Vector 占用率", "available": True, "unit": "%",
+         "color": "#4caf50", "series": occ_series(vec_occ),
+         "abs": [round(v, 1) for v in vec_occ], "abs_unit": "μs", "peak": bin_us_r,
+         "peak_unit": "μs", "kind": "occupancy",
+         "note": "AI_VECTOR_CORE 泳道每桶时间占用率"},
+        {"key": "comm", "label": "通信 占用率", "available": True, "unit": "%",
+         "color": "#f0655c", "series": occ_series(comm_occ),
+         "abs": [round(v, 1) for v in comm_occ], "abs_unit": "μs", "peak": bin_us_r,
+         "peak_unit": "μs", "kind": "occupancy",
+         "note": "COMMUNICATION 泳道每桶时间占用率（已剔除 Notify_Wait）"},
+        {"key": "hbm_bw", "label": "HBM 利用率", "available": False,
+         "reason": "msprof 轻量采集无 shape → 无字节模型，HBM 利用率不可用"},
+        {"key": "hbm_cap", "label": "显存容量 (HBM)", "available": False,
+         "reason": "待 memory 采集"},
+        {"key": "host_mem", "label": "主机内存", "available": False,
+         "reason": "待 memory 采集"},
+    ]
+
+    return {
+        "available": True, "t0_us": t0, "span_us": round(span, 1),
+        "span_s": round(span / 1e6, 4), "bins": bins, "bin_us": bin_us,
+        "lane_count": len(STREAMS),
+        "streams": [{"key": k, "label": l, "color": c} for (k, l, c) in STREAMS],
+        "slices": out_slices, "utilization": utilization, "modeled_pct": None,
+        "total_slices": total, "shown_slices": len(out_slices), "source": "msprof",
+        "note": ("msprof 智能时间线：算子按 stream 泳道铺成 Gantt；上方 Cube / Vector / 通信 "
+                 "为每桶时间占用率泳道（轻量采集无 shape，故非 FLOP MFU、HBM 利用率不可用）。"
+                 "Notify_Wait 同步等待已剔除。"
+                 f"切片共 {total} 个，按时长下采样保留最长 {len(out_slices)} 个。"),
+    }

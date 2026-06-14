@@ -70,7 +70,11 @@ _PROFILE_MARKERS = (
 
 def _looks_like_profile_dir(path: str) -> bool:
     try:
-        return any(os.path.isfile(os.path.join(path, f)) for f in _PROFILE_MARKERS)
+        if any(os.path.isfile(os.path.join(path, f)) for f in _PROFILE_MARKERS):
+            return True
+        # also accept the MindStudio msprof-export layout (insight DB / op_summary)
+        from ..parser.msprof import is_msprof_dir
+        return is_msprof_dir(path)
     except OSError:
         return False
 
@@ -185,8 +189,9 @@ class AppState:
         if not data_dir or not os.path.isdir(data_dir):
             return {"ok": False, "error": f"目录不存在：{data_dir}"}
         if not _looks_like_profile_dir(data_dir):
-            return {"ok": False, "error": ("该目录下找不到 profiling 文件"
-                    "（需含 kernel_details.csv / trace_view.json / step_trace_time.csv 等之一）")}
+            return {"ok": False, "error": ("该目录下找不到 profiling 文件（需含 "
+                    "kernel_details.csv / trace_view.json / step_trace_time.csv，或 "
+                    "msprof 的 mindstudio_insight_data.db / op_summary_*.csv 之一）")}
         with self._load_lock:
             if self.status == "loading":
                 return {"ok": False, "error": "正在加载中，请稍候"}
