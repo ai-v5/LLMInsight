@@ -184,6 +184,17 @@
   V.efficiency = async function (root) {
     const ef = await api("/api/efficiency");
     if (!ef.available) { root.innerHTML = `<div class="empty">无 kernel_details 数据</div>`; return; }
+    // msprof lightweight capture: shapes are N/A -> MFU/MBU/Roofline can't be
+    // modeled. Show a clear degradation banner + the op-time-by-type table rather
+    // than empty charts that would read as "0% everywhere".
+    if (ef.shapes_available === false) {
+      const rows = (ef.by_type || []).slice(0, 30).map(t =>
+        `<tr><td>${esc(t.type)}</td><td class="mono">${t.dtype ? esc(t.dtype) : "—"}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td></tr>`).join("");
+      root.innerHTML = `
+        ${banner("warn", "⚠️", `此 profiling 为 <strong>msprof 轻量采集</strong>，未记录算子 shape/dtype → <strong>MFU / MBU / Roofline 不可用</strong>（建模需要 shape）。下方仅按算子类型展示耗时分布；如需算力效率，请使用记录了 shape 的采集（op_summary 的 Input Shapes 非 N/A）。`)}
+        ${panel("按算子类型耗时", "msprof 轻量采集无 shape，仅能给出耗时分布", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>dtype</th><th>Count</th><th>耗时</th></tr></thead><tbody>${rows}</tbody></table></div>`)}`;
+      return;
+    }
     const chip = ef.chip;
     const top = ef.top_optimization.slice(0, 15);
     // optimization gain = reclaim_us (time recoverable by tuning to the kernel's
@@ -283,6 +294,14 @@
       `<tr><td>${esc(t.type)}</td><td>${fmt.int(t.count)}</td><td>${fmt.ms(t.elapse_ms)}</td><td>${fmt.ms(t.wait_ms)}</td><td>${fmt.pct(t.wait_pct)}</td><td>${fmt.ms(t.transit_ms)}</td><td>${t.transit_mb.toFixed(1)} MB</td></tr>`).join("");
     const topRows = cm.top.slice(0, 12).map(t =>
       `<tr><td class="mono">${esc(t.name)}</td><td>${esc(t.type)}</td><td>${fmt.ms(t.elapse_ms)}</td><td>${fmt.pct(t.wait_ratio * 100)}</td></tr>`).join("");
+    // msprof: effective-transfer vs cross-rank-wait split (device HCCL sub-tasks)
+    const bd = cm.breakdown;
+    const bdHtml = bd ? `
+      ${banner("warn", "🔍", `通信内部构成（device 子任务累加耗时，非墙钟）：<strong>卡间等待 ${bd.wait_pct}%</strong> vs <strong>有效传输 ${bd.transfer_pct}%</strong>。等待 ≫ 传输 → 瓶颈在同步 / 负载不均 / 通信未掩盖，而非链路带宽。`)}
+      <div class="grid cols-2">
+        ${panel("等待 vs 有效传输", "NOTIFY/EVENT_WAIT=等待；UBDMA/SDMA/MEMCPY/Reduce=有效传输（累加含跨核重叠）", `<div style="display:flex;height:30px;border-radius:6px;overflow:hidden;margin:6px 0;font-size:12px"><div style="width:${bd.wait_pct}%;background:#f0655c;display:flex;align-items:center;justify-content:center;color:#fff">等待 ${bd.wait_pct}%</div><div style="width:${bd.transfer_pct}%;background:#5ee0b8;display:flex;align-items:center;justify-content:center;color:#08210a">传输 ${bd.transfer_pct}%</div></div><div class="note">等待累加 ${fmt.us(bd.wait_us)} · 有效传输累加 ${fmt.us(bd.transfer_us)}</div>`)}
+        ${panel("Top 等待源 / 传输源", "", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>子任务</th><th>类别</th><th>累加耗时</th></tr></thead><tbody>${bd.top_wait.slice(0, 5).map(w => `<tr><td class="mono">${esc(w.name)}</td><td style="color:#f0655c">等待</td><td>${fmt.us(w.us)}</td></tr>`).join("") + bd.top_transfer.slice(0, 4).map(t => `<tr><td class="mono">${esc(t.name)}</td><td style="color:#2E7D32">传输</td><td>${fmt.us(t.us)}</td></tr>`).join("")}</tbody></table></div>`)}
+      </div>` : "";
     root.innerHTML = `
       <div class="grid cols-4">
         ${metric("集合通信次数", fmt.int(cm.count))}
@@ -290,6 +309,7 @@
         ${metric("平均等待占比", fmt.pct(cm.overall_wait_pct), { tone: "bad", barPct: cm.overall_wait_pct })}
         ${metric("总 Transit", cm.total_transit_mb.toFixed(1) + " MB", { foot: "单卡≈0" })}
       </div>
+      ${bdHtml}
       ${banner("info", "ℹ️", esc(cm.note))}
       <div class="grid cols-2">
         ${panel("按通信类型耗时 (Elapse ms)", "", `<div id="cm-bar" class="chart"></div>`)}
