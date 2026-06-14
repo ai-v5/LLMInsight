@@ -28,8 +28,16 @@ MATMUL_TYPES = {
 ATTENTION_FWD_TYPES = {
     "FlashAttentionScore", "PromptFlashAttention",
     "FusedInferAttentionScore", "IncreFlashAttention",
+    # DeepSeek-V3.2 sparse attention (DSA): sparse Flash-MLA, shared-KV sparse
+    # attention, and the lightning indexer. Routed to the cube peak + attention
+    # lane so they're not misfiled as generic compute / left out of attribution.
+    "SparseFlashMla", "SparseAttnSharedkv", "SparseLightningIndexer",
 }
-ATTENTION_GRAD_TYPES = {"FlashAttentionScoreGrad"}
+ATTENTION_GRAD_TYPES = {
+    "FlashAttentionScoreGrad",
+    "SparseFlashMlaGrad", "SparseLightningIndexerGrad",
+    "SparseLightningIndexerKllossGrad",
+}
 ATTENTION_TYPES = ATTENTION_FWD_TYPES | ATTENTION_GRAD_TYPES
 # DeepSeek-V3 attention is causal: FlashAttention skips the masked (upper-triangle)
 # blocks, so it does ~half the dense QK^T+PV work. Without this 0.5 the achieved
