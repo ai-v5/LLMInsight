@@ -144,6 +144,35 @@ def load_profile(data_dir: str) -> ProfileData:
     comm_matrix = _load_json(p("communication_matrix.json"))
     communication = _normalize_communication(comm_raw)
 
+    # --- lightweight-capture recovery -------------------------------------- #
+    # A torch_npu capture taken WITHOUT op-attr recording has Type/Core = N/A and
+    # often ships no op_statistic.csv / communication.json, leaving hotspots /
+    # by_type / communication dead. Recover what the kernel NAME allows, reusing
+    # the msprof loader's derivation (op type + core from the aclnn name, op-time
+    # aggregation, comm list from COMMUNICATION kernels). Only triggers when Type
+    # is mostly N/A, so a full capture is untouched.
+    if not kernel_details.empty and "Name" in kernel_details.columns:
+        _tcol = (kernel_details["Type"].astype(str)
+                 if "Type" in kernel_details.columns else None)
+        _type_na = _tcol is None or _tcol.str.upper().isin(
+            ("", "N/A", "NAN", "NONE")).mean() > 0.5
+        if _type_na:
+            from .msprof import (op_type_from_name, core_from_name,
+                                 _op_statistic_from_kd, _communication_from_kd)
+            kd = kernel_details
+            names = kd["Name"].astype(str)
+            kd["Type"] = names.map(op_type_from_name)
+            _cores = (kd["Accelerator Core"].astype(str)
+                      if "Accelerator Core" in kd.columns else ["N/A"] * len(kd))
+            kd["Accelerator Core"] = [core_from_name(n, c, t)
+                                      for n, c, t in zip(names, _cores, kd["Type"])]
+            kd["Duration(us)"] = pd.to_numeric(
+                kd["Duration(us)"], errors="coerce").fillna(0.0)
+            if op_statistic.empty:
+                op_statistic = _op_statistic_from_kd(kd)
+            if not communication:
+                communication = _communication_from_kd(kd)
+
     trace_path = p("trace_view.json")
     if not os.path.exists(trace_path):
         trace_path = None
