@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from .profile import ProfileData
+from ..cache import cached_json
 
 
 # --------------------------------------------------------------------------- #
@@ -289,26 +290,132 @@ def _comm_breakdown(db_path: str) -> Dict[str, Any]:
     }
 
 
+def _comm_breakdown_from_task_slices(data_dir: str) -> Dict[str, Any]:
+    """No-db msprof: device wait/transfer split from task_time_slice_*.csv — same shape
+    as _comm_breakdown (db). The kernel_type column carries the sub-task class
+    (NOTIFY_WAIT_SQE / UBDMA / SDMA / DAVID_EVENT_WAIT / ...); reuse _comm_task_cat on
+    it. Durations are summed across cores/queues (overlap-inclusive), so this is the
+    internal COMPOSITION of comm time, not a wall-clock figure. Cached by file sizes."""
+    files = sorted(glob.glob(os.path.join(data_dir, "task_time_slice_*.csv")))
+    if not files:
+        return {}
+    sig = "|".join(str(os.path.getsize(f)) for f in files)
+
+    def _build():
+        cats = {"wait": 0.0, "transfer": 0.0, "reduce": 0.0, "launch": 0.0, "other": 0.0}
+        per: Dict[str, Dict[str, Any]] = {}
+        for f in files:
+            try:
+                tdf = pd.read_csv(f, low_memory=False,
+                                  usecols=["kernel_type", "task_time(us)"])
+            except Exception:
+                continue
+            tt = pd.to_numeric(tdf["task_time(us)"], errors="coerce").fillna(0.0)
+            agg = (pd.DataFrame({"kt": tdf["kernel_type"].astype(str), "us": tt})
+                   .groupby("kt")["us"].agg(["sum", "count"]))
+            for kt, row in agg.iterrows():
+                cat = _comm_task_cat(kt)
+                cats[cat] += float(row["sum"])
+                if cat in ("wait", "transfer", "reduce"):
+                    e = per.setdefault(kt, {"name": str(kt)[:48], "cat": cat,
+                                            "count": 0, "us": 0.0})
+                    e["count"] += int(row["count"])
+                    e["us"] += float(row["sum"])
+        comm_total = cats["wait"] + cats["transfer"] + cats["reduce"]
+        if comm_total <= 0:
+            return {}
+        for e in per.values():
+            e["us"] = round(e["us"], 1)
+        top_wait = sorted((p for p in per.values() if p["cat"] == "wait"),
+                          key=lambda x: x["us"], reverse=True)[:8]
+        top_xfer = sorted((p for p in per.values() if p["cat"] in ("transfer", "reduce")),
+                          key=lambda x: x["us"], reverse=True)[:8]
+        return {
+            "basis": "accumulated",
+            "wait_us": round(cats["wait"], 1),
+            "transfer_us": round(cats["transfer"] + cats["reduce"], 1),
+            "launch_us": round(cats["launch"], 1),
+            "comm_total_us": round(comm_total, 1),
+            "wait_pct": round(100.0 * cats["wait"] / comm_total, 1),
+            "transfer_pct": round(100.0 * (cats["transfer"] + cats["reduce"]) / comm_total, 1),
+            "top_wait": top_wait,
+            "top_transfer": top_xfer,
+        }
+
+    return cached_json(f"msprof_ts_cb:{sig}", _build)
+
+
+def _kernel_details_from_op_summary(path: str) -> pd.DataFrame:
+    """Load kernels from op_summary_*.csv (msprof RAW export, no SQLite db). Same
+    output schema as _kernel_details_from_df; op type / core fall back to the name,
+    and Task Start Time is already in us here (not ns like the db)."""
+    df = pd.read_csv(path, low_memory=False)
+    n = len(df)
+    names = (df["Op Name"] if "Op Name" in df.columns else df.iloc[:, 4]).astype(str)
+    rawt = df["OP Type"].astype(str) if "OP Type" in df.columns else pd.Series([""] * n)
+    op_types = [t if t.strip().upper() not in ("", "N/A", "NAN", "NONE") else op_type_from_name(nm)
+                for nm, t in zip(names, rawt)]
+    rawc = df["Task Type"].astype(str) if "Task Type" in df.columns else pd.Series([""] * n)
+    cores = [core_from_name(nm, (c if c.strip().upper() not in ("", "N/A", "NAN", "NONE") else ""), t)
+             for nm, c, t in zip(names, rawc, op_types)]
+
+    def _col(c):
+        return df[c].astype(str) if c in df.columns else ["N/A"] * n
+
+    def _num(c):
+        return (pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+                if c in df.columns else pd.Series([0.0] * n))
+
+    return pd.DataFrame({
+        "Name": names, "Type": op_types, "Accelerator Core": cores,
+        "Duration(us)": _num("Task Duration(us)"),
+        "Input Shapes": _col("Input Shapes"), "Input Data Types": _col("Input Data Types"),
+        "Output Shapes": _col("Output Shapes"), "Output Data Types": _col("Output Data Types"),
+        "Task ID": (df["Task ID"] if "Task ID" in df.columns else pd.Series(range(n))),
+        "Start Time(us)": _num("Task Start Time(us)"),     # already us in op_summary
+    })
+
+
 def load_msprof_profile(data_dir: str) -> ProfileData:
     db_path = os.path.join(data_dir, "mindstudio_insight_data.db")
-    raw = _load_kernel_detail_db(db_path)
-    kd = _kernel_details_from_df(raw)
-    has_shapes = bool((~kd["Input Shapes"].astype(str).str.strip().str.upper()
-                       .isin(("", "N/A", "NAN", "NONE"))).any())
-    op_stat = _op_statistic_from_kd(kd)
-    communication = _communication_from_kd(kd)
-    overlap = _overlap_breakdown(db_path)
-    comm_breakdown = _comm_breakdown(db_path)
+    has_db = os.path.isfile(db_path)
+    if has_db:
+        raw = _load_kernel_detail_db(db_path)
+        kd = _kernel_details_from_df(raw)
+        dev = int(raw["deviceId"].iloc[0]) if not raw.empty else None
+        overlap = _overlap_breakdown(db_path)            # Overlap layer (step_trace)
+        comm_breakdown = _comm_breakdown(db_path)         # device wait/transfer
+    else:
+        # RAW export (torch_npu PROF_xxx/mindstudio_profiler_output): no db, only
+        # op_summary_*.csv. The Overlap layer + device comm sub-tasks live in the db,
+        # so step_trace degrades to accumulated and comm wait/transfer is unavailable;
+        # hotspots / efficiency / communication / smart-timeline still work off kd.
+        op_sum = _first(data_dir, "op_summary_*.csv")
+        kd = (_kernel_details_from_op_summary(op_sum) if op_sum
+              else pd.DataFrame(columns=["Name", "Type", "Accelerator Core", "Duration(us)",
+                                         "Input Shapes", "Input Data Types", "Output Shapes",
+                                         "Output Data Types", "Task ID", "Start Time(us)"]))
+        dev = 0
+        overlap = {}
+        comm_breakdown = _comm_breakdown_from_task_slices(data_dir)
+
+    empty_kd = kd.empty
+    has_shapes = (not empty_kd) and bool((~kd["Input Shapes"].astype(str).str.strip().str.upper()
+                                          .isin(("", "N/A", "NAN", "NONE"))).any())
+    op_stat = _op_statistic_from_kd(kd) if not empty_kd else pd.DataFrame()
+    communication = _communication_from_kd(kd) if not empty_kd else []
 
     # compute / comm wall-ish split (summed durations; not overlap-aware yet)
-    comm_us = float(kd.loc[kd["Accelerator Core"] == "COMMUNICATION", "Duration(us)"].sum())
-    compute_us = float(kd.loc[kd["Accelerator Core"] != "COMMUNICATION", "Duration(us)"].sum())
-    start = pd.to_numeric(kd["Start Time(us)"], errors="coerce")
-    dur = pd.to_numeric(kd["Duration(us)"], errors="coerce")
-    wall_us = float((start + dur).max() - start.min()) if start.notna().any() else 0.0
+    if not empty_kd:
+        comm_us = float(kd.loc[kd["Accelerator Core"] == "COMMUNICATION", "Duration(us)"].sum())
+        compute_us = float(kd.loc[kd["Accelerator Core"] != "COMMUNICATION", "Duration(us)"].sum())
+        start = pd.to_numeric(kd["Start Time(us)"], errors="coerce")
+        dur = pd.to_numeric(kd["Duration(us)"], errors="coerce")
+        wall_us = float((start + dur).max() - start.min()) if start.notna().any() else 0.0
+    else:
+        comm_us = compute_us = wall_us = 0.0
 
     trace_path = _first(data_dir, "msprof_*.json")
-    dev = int(raw["deviceId"].iloc[0]) if not raw.empty else None
     step_trace = _step_trace_from_overlap(overlap, dev) if overlap else pd.DataFrame()
 
     meta = {
@@ -329,7 +436,7 @@ def load_msprof_profile(data_dir: str) -> ProfileData:
             "comm_us": round(comm_us, 1),
             "wall_us": round(wall_us, 1),
             "comm_pct": round(100.0 * comm_us / (compute_us + comm_us), 1) if (compute_us + comm_us) else 0.0,
-            "db_path": db_path,
+            "db_path": db_path if has_db else None,
             "trace_path": trace_path,
             "overlap": {k: round(v, 1) for k, v in overlap.items()},
             "comm_breakdown": comm_breakdown,
