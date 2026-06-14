@@ -377,6 +377,17 @@ def compute_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
     """Entry point: geometry (cached by trace signature) + chip overlay."""
     if (getattr(prof, "meta", {}) or {}).get("format") == "msprof":
         return compute_msprof_smart_timeline(prof, eff)
+    # torch_npu WITHOUT shapes: Cube/HBM (FLOP/byte models) are dead and the
+    # trace+kernel_index geometry can't classify the ~98% of ops missing from the
+    # shape-scored index, so Cube/Vector come out empty. Fall back to the kd-occupancy
+    # timeline (Accelerator Core + Duration straight from kernel_details, like msprof)
+    # — it fills Cube/Vector and skips the multi-GB trace pass.
+    kd = getattr(prof, "kernel_details", None)
+    has_shapes = (kd is not None and not kd.empty and "Input Shapes" in kd.columns and
+                  bool((~kd["Input Shapes"].astype(str).str.strip().str.upper()
+                        .isin(("", "N/A", "NAN", "NONE"))).any()))
+    if not has_shapes:
+        return compute_msprof_smart_timeline(prof, eff)
     if not getattr(prof, "trace_path", None):
         return {"available": False, "reason": "trace_view.json missing"}
     if not eff or not eff.get("available"):
@@ -388,6 +399,48 @@ def compute_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
            f"{SETTINGS.smart_timeline_bins}:{SETTINGS.timeline_max_slices}")
     geom = cached_json(key, lambda: _build_geometry(prof, kindex))
     return _apply_chip(geom, eff)
+
+
+def _wait_xfer_from_task_slices(data_dir, t0, bin_us, bins):
+    """No-db msprof: per-bin comm wait vs transfer from task_time_slice_*.csv, whose
+    kernel_type column carries the device sub-tasks (NOTIFY_WAIT_SQE / UBDMA / SDMA /
+    DAVID_EVENT_WAIT / ...). Start-bin aggregate (sub-tasks are short, so it's
+    accurate); cached by the slice files' sizes. Returns (wait_occ, xfer_occ) in us."""
+    import glob
+    import os as _os
+    # msprof RAW export shards as task_time_slice_*.csv; torch_npu ships a single
+    # task_time.csv with the SAME columns (kernel_type / task_start(us) / task_time(us)).
+    files = (sorted(glob.glob(_os.path.join(data_dir, "task_time_slice_*.csv"))) or
+             sorted(glob.glob(_os.path.join(data_dir, "task_time.csv"))))
+    if not files:
+        return [0.0] * bins, [0.0] * bins
+    sig = "|".join(str(_os.path.getsize(f)) for f in files)
+
+    def _build():
+        import pandas as pd
+        wait = [0.0] * bins
+        xfer = [0.0] * bins
+        for f in files:
+            try:
+                tdf = pd.read_csv(f, low_memory=False,
+                                  usecols=["kernel_type", "task_start(us)", "task_time(us)"])
+            except Exception:
+                continue
+            kt = tdf["kernel_type"].astype(str)
+            ts = pd.to_numeric(tdf["task_start(us)"], errors="coerce")
+            tt = pd.to_numeric(tdf["task_time(us)"], errors="coerce").fillna(0.0)
+            bi = ((ts - t0) / bin_us).fillna(-1).astype("int64")
+            wmask = kt.str.contains("WAIT|NOTIFY", case=False, na=False, regex=True)
+            xmask = kt.str.contains("DMA|MEMCPY", case=False, na=False, regex=True)
+            for mask, occ in ((wmask, wait), (xmask, xfer)):
+                grp = tt[mask].groupby(bi[mask]).sum()
+                for b, v in grp.items():
+                    if 0 <= int(b) < bins:
+                        occ[int(b)] += float(v)
+        return {"wait": wait, "xfer": xfer}
+
+    res = cached_json(f"msprof_ts_wx:{sig}:{bins}:{int(t0)}:{int(round(bin_us))}", _build)
+    return res["wait"], res["xfer"]
 
 
 def compute_msprof_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
@@ -508,6 +561,12 @@ def compute_msprof_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
             xfer_occ = [0.0] * bins
         finally:
             con.close()
+    elif bin_us > 0:
+        # no db (msprof raw export under PROF_xxx): rebuild wait/transfer from
+        # task_time_slice_*.csv, whose kernel_type carries the same device sub-tasks
+        # (NOTIFY_WAIT_SQE / UBDMA / SDMA / ...). Cached by the slice files' sizes.
+        wait_occ, xfer_occ = _wait_xfer_from_task_slices(
+            (getattr(prof, "meta", {}) or {}).get("data_dir", ""), t0, bin_us, bins)
 
     kindex = (eff or {}).get("kernel_index", {}) or {}
     out_slices: List[Dict[str, Any]] = []
@@ -540,7 +599,7 @@ def compute_msprof_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
          "color": "#4f9fe0", "series": occ_series(cube_occ),
          "abs": [round(v, 1) for v in cube_occ], "abs_unit": "μs", "peak": bin_us_r,
          "peak_unit": "μs", "kind": "occupancy",
-         "note": "AI_CORE 泳道每桶时间占用率（msprof 无 shape → 按占用计，非 FLOP MFU）"},
+         "note": "AI_CORE 泳道每桶时间占用率（无 shape 采集 → 按占用计，非 FLOP MFU）"},
         {"key": "vector", "label": "Vector 占用率", "available": True, "unit": "%",
          "color": "#4caf50", "series": occ_series(vec_occ),
          "abs": [round(v, 1) for v in vec_occ], "abs_unit": "μs", "peak": bin_us_r,
@@ -562,22 +621,26 @@ def compute_msprof_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
          "peak_unit": "μs", "kind": "occupancy",
          "note": "点对点 hcom_send/receive 的 AICPU 阻塞占用——PP 流水的卡间等待，不经 device cube 展开(故不在上面两条集合通信里)；占用率(含跨核累加)"},
         {"key": "hbm_bw", "label": "HBM 利用率", "available": False,
-         "reason": "msprof 轻量采集无 shape → 无字节模型，HBM 利用率不可用"},
+         "reason": "无 shape 采集 → 无字节模型，HBM 利用率不可用"},
         {"key": "hbm_cap", "label": "显存容量 (HBM)", "available": False,
          "reason": "待 memory 采集"},
         {"key": "host_mem", "label": "主机内存", "available": False,
          "reason": "待 memory 采集"},
     ]
 
+    _is_msprof = ((getattr(prof, "meta", {}) or {}).get("format") == "msprof")
+    _cap = "msprof " if _is_msprof else "torch_npu 半采集 "
     return {
         "available": True, "t0_us": t0, "span_us": round(span, 1),
         "span_s": round(span / 1e6, 4), "bins": bins, "bin_us": bin_us,
         "lane_count": len(STREAMS),
         "streams": [{"key": k, "label": l, "color": c} for (k, l, c) in STREAMS],
         "slices": out_slices, "utilization": utilization, "modeled_pct": None,
-        "total_slices": total, "shown_slices": len(out_slices), "source": "msprof",
-        "note": ("msprof 智能时间线：算子按 stream 泳道铺成 Gantt；上方 Cube / Vector / 通信 "
-                 "为每桶时间占用率泳道（轻量采集无 shape，故非 FLOP MFU、HBM 利用率不可用）。"
-                 "Notify_Wait 同步等待已剔除。"
+        "total_slices": total, "shown_slices": len(out_slices),
+        "source": "msprof" if _is_msprof else "torch_npu",
+        "note": (f"{_cap}智能时间线：算子按 stream 泳道铺成 Gantt；上方 Cube / Vector / 通信 "
+                 "为每桶时间占用率泳道（无 shape 采集，按占用计、非 FLOP MFU，HBM 利用率不可用）。"
+                 "集合通信 device 子任务（等待 NOTIFY/EVENT_WAIT vs 传输 UBDMA/SDMA）取自 "
+                 "task_time(_slice).csv。Notify_Wait 同步等待已从算子泳道剔除。"
                  f"切片共 {total} 个，按时长下采样保留最长 {len(out_slices)} 个。"),
     }
