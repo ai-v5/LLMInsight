@@ -117,7 +117,7 @@ def _estimate_attention_flops(shapes_in, shapes_out, is_grad: bool) -> Optional[
             bns = (s[0], s[1], s[2])
             break
     if not bns:
-        return None
+        return _estimate_attention_flops_tnd(shapes_in, shapes_out, is_grad)
     B, N, S = bns
     base = B * N * S
     if base <= 0:
@@ -137,6 +137,32 @@ def _estimate_attention_flops(shapes_in, shapes_out, is_grad: bool) -> Optional[
     d_qk = head_dims[0]                                  # query is always first
     d_v = next((h for h in head_dims if h != d_qk), d_qk)  # MLA: differs; MHA: ==
     fwd = 2.0 * B * N * (S ** 2) * (d_qk + d_v) * _ATTN_CAUSAL_FACTOR
+    return fwd * (_ATTN_BWD_FWD_RATIO if is_grad else 1.0)
+
+
+def _estimate_attention_flops_tnd(shapes_in, shapes_out, is_grad: bool) -> Optional[float]:
+    """TND (packed variable-length) FlashAttention: q/k/v are 3-D [T, N, D] with T =
+    packed total tokens across all sequences, and the softmax stats are [T, N, k<=16] —
+    there is no 4-D [B,N,S,D] to read S from. Per-sequence lengths live only in the
+    actual_seq_qlen VALUES (not the recorded shapes), so Σs_i² is approximated by the
+    equal-length T²/num_seq, where num_seq = the 1-D actual_seq tensor's length. causal
+    iff a square [S,S] attention-mask tensor is present (ViT full-attention has none)."""
+    if not shapes_in or len(shapes_in[0]) != 3:
+        return None
+    T, N, d_qk = shapes_in[0]
+    if T <= 0 or N <= 0 or d_qk <= 0:
+        return None
+    allsh = list(shapes_in) + list(shapes_out)
+    # confirm fused attention: a 3-D softmax-stats tensor [T, N, k<=16] must be present
+    if not any(len(s) == 3 and s[0] == T and s[1] == N and 0 < s[2] <= 16 for s in allsh):
+        return None
+    # value head_dim (GQA: k/v carry fewer heads but the same head_dim as q)
+    d_v = shapes_in[2][2] if len(shapes_in) > 2 and len(shapes_in[2]) == 3 else d_qk
+    num_seq = next((s[0] for s in shapes_in if len(s) == 1 and s[0] >= 1), 1)
+    sigma_s2 = (T * T) / num_seq                          # equal-length approximation
+    causal = (_ATTN_CAUSAL_FACTOR if any(len(s) == 2 and s[0] == s[1] for s in shapes_in)
+              else 1.0)                                   # square mask present => causal
+    fwd = 2.0 * N * sigma_s2 * (d_qk + d_v) * causal
     return fwd * (_ATTN_BWD_FWD_RATIO if is_grad else 1.0)
 
 
@@ -550,6 +576,14 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     # now per-kernel vs each one's un-calibrated peak, not a single bf16 peak.
     mm_assumed_peak_time = (mm_peak_time / peak_scale) if peak_scale else 0.0
     matmul_mfu_assumed = (mm_flops / mm_assumed_peak_time) if mm_assumed_peak_time else None
+    # Model compute MFU = GEMM + fused attention combined, each divided by its OWN
+    # routed peak·time. matmul_mfu stays pure-GEMM (the calibration anchor); this adds
+    # attention so the headline reflects the whole model's compute, not just the GEMMs.
+    # (End-to-end/step MFU — incl. comm/idle — is theoretical.step_mfu, a different cut.)
+    mc = [r for r in flops_rows if r["type"] in MATMUL_TYPES or r["type"] in ATTENTION_TYPES]
+    mc_flops = sum(r["flops"] for r in mc)
+    mc_peak_time = sum(r["peak_flops"] * r["dur_us"] * 1e-6 for r in mc if r.get("peak_flops"))
+    model_mfu_compute = (mc_flops / mc_peak_time) if mc_peak_time else None
 
     scatter.sort(key=lambda s: s["dur_us"], reverse=True)
     scatter = scatter[:1500]
@@ -614,6 +648,8 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         "roofline_ridge_ai": effective_peak / SETTINGS.chip.hbm_bandwidth,
         "matmul_mfu": round(matmul_mfu, 4) if matmul_mfu else None,
         "matmul_mfu_assumed": round(matmul_mfu_assumed, 4) if matmul_mfu_assumed else None,
+        # GEMM + fused-attention combined compute MFU — the "model 算力 MFU" headline.
+        "model_mfu_compute": round(model_mfu_compute, 4) if model_mfu_compute else None,
         # Total executed useful FLOPs (matmul + fused attention) in the captured
         # step — numerator for the end-to-end (step) MFU computed in theoretical().
         "useful_flops_total": sum(r["flops"] for r in flops_rows),

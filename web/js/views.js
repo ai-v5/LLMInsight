@@ -238,7 +238,9 @@
         (chip.calibrated
           ? `　|　⚠️ 实测峰值 <strong>${chip.observed_peak_tflops.toFixed(0)} TFLOPS</strong> &gt; 假设值 → 已按实测校准（设真实 SKU 峰值可覆盖）`
           : `（${chip.assumed ? "参考峰值；顶部可切换芯片，或在 config.ChipSpec 校正" : "实测"}）`) +
-        `　|　matmul MFU ≈ <strong>${ef.matmul_mfu != null ? (ef.matmul_mfu*100).toFixed(0)+"%" : "—"}</strong>　|　建模 kernel ${fmt.int(ef.kernels_with_flops)}/${fmt.int(ef.kernels_total)}`)}
+        `　|　matmul MFU ≈ <strong>${ef.matmul_mfu != null ? (ef.matmul_mfu*100).toFixed(0)+"%" : "—"}</strong>` +
+        (ef.model_mfu_compute != null ? `　|　模型算力 MFU(GEMM+Attn) ≈ <strong>${(ef.model_mfu_compute*100).toFixed(0)}%</strong>` : "") +
+        `　|　建模 kernel ${fmt.int(ef.kernels_with_flops)}/${fmt.int(ef.kernels_total)}`)}
       ${ocNote}
       <div class="grid cols-2">
         ${panel("Roofline（dtype 归一化）", "点 = kernel；x = 归一化算术强度 (AI / 脊点，1 = 拐点)，y = MFU (占该算子 cube/vector 峰值 %)；单条屋顶线让不同 dtype 同台对照", `<div id="ef-roof" class="chart tall"></div>`)}
