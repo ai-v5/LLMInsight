@@ -45,6 +45,11 @@ ATTENTION_TYPES = ATTENTION_FWD_TYPES | ATTENTION_GRAD_TYPES
 # convenience. The backward pass recomputes ~2.5x the forward matmul FLOPs.
 _ATTN_CAUSAL_FACTOR = 0.5
 _ATTN_BWD_FWD_RATIO = 2.5
+# A modeled kernel whose MFU and MBU are BOTH below this is "overhead-bound": its time
+# is launch/scalar/dispatch, not on the compute or memory roofline, so the roofline
+# "reclaim to 100%" is physically meaningless. We zero its reclaim (keep it out of the
+# optimization ranking) and surface it in a separate table instead.
+_OVERHEAD_EFF = 0.02
 
 
 def _op_class(op_type: str) -> Optional[str]:
@@ -417,6 +422,14 @@ def compute_efficiency(prof) -> Dict[str, Any]:
             reclaim_us = 0.0
             bound = _bound_from_ratios(mac_r[i], mte2_r[i], vec_r[i])
 
+        # Overhead-bound: MFU & MBU both ~0 → time is launch/scalar/dispatch, not on the
+        # roofline, so its "reclaim to 100%" is bogus. Zero the reclaim (drops it from the
+        # optimization ranking) and surface it in overhead_bound_ops instead.
+        overhead_bound = bool(modeled and (mfu or 0.0) < _OVERHEAD_EFF
+                              and (mbu or 0.0) < _OVERHEAD_EFF)
+        if overhead_bound:
+            reclaim_us = 0.0
+
         rows.append(
             {
                 "name": names[i],
@@ -432,6 +445,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
                 "efficiency": efficiency,
                 "wasted_us": wasted_us,
                 "reclaim_us": reclaim_us,
+                "overhead_bound": overhead_bound,
                 "op_class": op_class,
                 "ceiling": ceiling,
                 "bound": bound,
@@ -504,6 +518,33 @@ def compute_efficiency(prof) -> Dict[str, Any]:
             }
         )
     type_rows.sort(key=lambda x: x["dur_us"], reverse=True)
+
+    # Overhead-bound ops (MFU & MBU both ~0): launch/scalar/dispatch dominated, so the
+    # roofline reclaim doesn't apply — they were given reclaim=0 above (kept out of the
+    # ranking). Aggregate by type so the time isn't silently dropped; it needs kernel-
+    # level work (fusion / larger tiles / fewer launches), not a roofline target.
+    ob_acc: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        if not r.get("overhead_bound"):
+            continue
+        a = ob_acc.get(r["type"])
+        if a is None:
+            a = ob_acc[r["type"]] = {"type": r["type"], "count": 0, "dur_us": 0.0,
+                                     "dtype": r["dtype"], "mfu_w": 0.0, "mbu_w": 0.0}
+        a["count"] += 1
+        a["dur_us"] += r["dur_us"]
+        a["mfu_w"] += (r["mfu"] or 0.0) * r["dur_us"]
+        a["mbu_w"] += (r["mbu"] or 0.0) * r["dur_us"]
+    overhead_bound_ops = []
+    for a in sorted(ob_acc.values(), key=lambda x: x["dur_us"], reverse=True)[:30]:
+        d = a["dur_us"]
+        overhead_bound_ops.append({
+            "type": a["type"], "count": a["count"], "dur_us": round(d, 1),
+            "dtype": a["dtype"],
+            "mfu": round(a["mfu_w"] / d, 4) if d else None,
+            "mbu": round(a["mbu_w"] / d, 4) if d else None,
+        })
+    overhead_bound_us = round(sum(a["dur_us"] for a in ob_acc.values()), 1)
 
     # Rank optimization candidates by ceiling-aware reclaimable time and drop the
     # ones already at/above their MFU ceiling (reclaim ~ 0): there's no point
@@ -657,6 +698,11 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         "by_type": type_rows[:40],
         "top_optimization": top_opt,
         "op_ceiling_opt": op_ceiling_opt,
+        # Overhead-bound ops (MFU & MBU both <2%): excluded from top_optimization
+        # because the roofline reclaim is physically bogus; listed separately so their
+        # time is visible and flagged for kernel-level work (not a roofline target).
+        "overhead_bound_ops": overhead_bound_ops,
+        "overhead_bound_us": overhead_bound_us,
         "scatter": scatter,
         "kernels_with_flops": len(flops_rows),
         "kernels_total": len(rows),
