@@ -43,7 +43,7 @@ STREAMS = [
 DEVICE_PROC = "Ascend Hardware"
 COMM_PROC = "Communication"
 
-_GEOM_VERSION = "v3"  # bump when geometry/stream logic changes (cache invalidation)
+_GEOM_VERSION = "v5"  # bump when geometry/stream logic changes (cache invalidation)
 
 
 def _is_notify_wait(name: str) -> bool:
@@ -122,7 +122,8 @@ def _build_geometry(prof, kindex: Dict[str, Any]) -> Dict[str, Any]:
     dev_pid = name_to_pid.get(DEVICE_PROC)
     comm_pid = name_to_pid.get(COMM_PROC)
 
-    flops_sum = [0.0] * bins
+    flops_sum = [0.0] * bins      # cube/GEMM compute FLOPs (fused attention excluded)
+    fa_flops_sum = [0.0] * bins   # fused-attention FLOPs — its own utilization lane
     bytes_sum = [0.0] * bins
     comm_occ = [0.0] * bins
     vec_occ = [0.0] * bins  # vector ops have no FLOP model → time occupancy
@@ -189,7 +190,13 @@ def _build_geometry(prof, kindex: Dict[str, Any]) -> Dict[str, Any]:
                 fpu = ki.get("flops_per_us")
                 if fpu is not None:
                     modeled_dev_us += dur
-                    spread(flops_sum, ts, ts + dur, fpu * dur)
+                    # Fused attention gets its own lane; vector ops report occupancy
+                    # (their tiny FLOPs misread against the cube peak), so only the
+                    # cube/matmul FLOPs feed the Cube-利用率 lane.
+                    if stream == "flash_attn":
+                        spread(fa_flops_sum, ts, ts + dur, fpu * dur)
+                    elif stream != "vector":
+                        spread(flops_sum, ts, ts + dur, fpu * dur)
                 bpu = ki.get("bytes_per_us")
                 if bpu is not None:
                     spread(bytes_sum, ts, ts + dur, bpu * dur)
@@ -214,11 +221,23 @@ def _build_geometry(prof, kindex: Dict[str, Any]) -> Dict[str, Any]:
                 "reason": "no device / communication slices in trace"}
 
     # down-sample: keep the longest bars (sub-bin slices are visually invisible),
-    # then restore chronological order for the Gantt.
+    # then restore chronological order for the Gantt. Use a PER-STREAM quota: a global
+    # longest-first cut lets the multi-100ms comm / dispatch slices crowd out every
+    # (short) compute kernel — e.g. on a 2.2M-kernel torch_npu trace, cube/vector ops
+    # got squeezed to a handful while their utilization lanes were fully busy. Keeping
+    # the longest few PER stream guarantees every Gantt lane stays populated.
     total_slices = len(slices)
     if total_slices > max_slices:
-        slices.sort(key=lambda s: s["dur_ms"], reverse=True)
-        slices = slices[:max_slices]
+        from collections import defaultdict
+        by_stream: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for s in slices:
+            by_stream[s["stream"]].append(s)
+        quota = max(1, max_slices // max(len(by_stream), 1))
+        kept: List[Dict[str, Any]] = []
+        for grp in by_stream.values():
+            grp.sort(key=lambda x: x["dur_ms"], reverse=True)
+            kept.extend(grp[:quota])
+        slices = kept
     slices.sort(key=lambda s: s["start_ms"])
     for s in slices:
         s["start_ms"] = round(s["start_ms"], 4)
@@ -233,6 +252,7 @@ def _build_geometry(prof, kindex: Dict[str, Any]) -> Dict[str, Any]:
         "bin_us": round(bin_us, 3),
         "slices": slices,
         "flops_sum": [round(v, 1) for v in flops_sum],
+        "fa_flops_sum": [round(v, 1) for v in fa_flops_sum],
         "bytes_sum": [round(v, 1) for v in bytes_sum],
         "comm_occ": [round(v, 3) for v in comm_occ],
         "vec_occ": [round(v, 3) for v in vec_occ],
@@ -249,7 +269,7 @@ def _clamp01(x: float) -> float:
     return 0.0 if x < 0 else (1.0 if x > 1.0 else x)
 
 
-def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]:
+def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any], prof=None) -> Dict[str, Any]:
     """Cheap chip-dependent overlay: utilization % + per-slice MFU/MBU."""
     if not geom.get("available"):
         return dict(geom)
@@ -263,6 +283,7 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]:
     bin_us = geom["bin_us"]
     bin_s = bin_us * 1e-6
     flops_sum = geom["flops_sum"]
+    fa_flops_sum = geom.get("fa_flops_sum", [0.0] * bins)
     bytes_sum = geom["bytes_sum"]
     comm_occ = geom["comm_occ"]
     vec_occ = geom.get("vec_occ", [0.0] * bins)
@@ -270,8 +291,11 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]:
     if effective_peak > 0 and bin_s > 0:
         compute_series = [round(_clamp01(flops_sum[b] / (bin_s * effective_peak)), 4)
                           for b in range(bins)]
+        fa_series = [round(_clamp01(fa_flops_sum[b] / (bin_s * effective_peak)), 4)
+                     for b in range(bins)]
     else:
         compute_series = [0.0] * bins
+        fa_series = [0.0] * bins
     if hbm_bw > 0 and bin_s > 0:
         hbm_series = [round(_clamp01(bytes_sum[b] / (bin_s * hbm_bw)), 4)
                       for b in range(bins)]
@@ -282,10 +306,48 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]:
     vector_series = ([round(_clamp01(vec_occ[b] / bin_us), 4) for b in range(bins)]
                      if bin_us > 0 else [0.0] * bins)
 
+    # Collective-comm internal split (device sub-tasks) + P2P — same lanes as the
+    # no-shape path. Reuses the trace t0/bin_us, verified to share the device-us base
+    # with task_time.csv / kernel_details. wait/transfer come from task_time.csv
+    # (NOTIFY/EVENT_WAIT vs UBDMA/SDMA), P2P from the hcom_send/receive kd ops.
+    t0 = geom.get("t0_us", 0.0)
+    wait_occ, xfer_occ = [0.0] * bins, [0.0] * bins
+    p2p_occ = [0.0] * bins
+    if prof is not None and bin_us > 0:
+        data_dir = (getattr(prof, "meta", {}) or {}).get("data_dir", "")
+        wait_occ, xfer_occ = _wait_xfer_from_task_slices(data_dir, t0, bin_us, bins)
+        # torch_npu captures usually ship communication.json + db but NO task_time.csv;
+        # fall back to per-op wait/transit (start-bin attribution) so the collective
+        # wait vs effective-transfer split still renders instead of "无法拆分".
+        if not any(wait_occ) and not any(xfer_occ):
+            wait_occ, xfer_occ = _wait_xfer_from_comm_ops(prof, t0, bin_us, bins)
+        import pandas as pd
+        kd = getattr(prof, "kernel_details", None)
+        if kd is not None and not kd.empty and "Start Time(us)" in kd.columns:
+            nm = kd["Name"].astype(str).str.lower()
+            mask = nm.str.startswith("hcom_send") | nm.str.startswith("hcom_receive")
+            sts = pd.to_numeric(kd["Start Time(us)"], errors="coerce")
+            dus = pd.to_numeric(kd["Duration(us)"], errors="coerce")
+            for s, dd in zip(sts[mask], dus[mask]):
+                if s == s and dd == dd and dd > 0:           # NaN guards
+                    b = int((float(s) - t0) / bin_us)
+                    if 0 <= b < bins:
+                        p2p_occ[b] += float(dd)
+    comm_tot = [wait_occ[b] + xfer_occ[b] for b in range(bins)]
+    wait_frac = [round(wait_occ[b] / comm_tot[b], 4) if comm_tot[b] > 0 else 0.0
+                 for b in range(bins)]
+    xfer_frac = [round(xfer_occ[b] / comm_tot[b], 4) if comm_tot[b] > 0 else 0.0
+                 for b in range(bins)]
+    p2p_series = ([round(_clamp01(p2p_occ[b] / bin_us), 4) for b in range(bins)]
+                  if bin_us > 0 else [0.0] * bins)
+    has_split = bool(any(comm_tot) or any(p2p_occ))
+
     # un-clamped absolute per-bin values for the hover tooltip (reveal >100% overshoot
     # that the clamped utilization % hides — e.g. overlapping streams pushing past peak)
     cube_abs = ([round(flops_sum[b] / bin_s / 1e12, 2) for b in range(bins)]
                 if bin_s > 0 else [0.0] * bins)        # achieved TFLOP/s
+    fa_abs = ([round(fa_flops_sum[b] / bin_s / 1e12, 2) for b in range(bins)]
+              if bin_s > 0 else [0.0] * bins)          # FA achieved TFLOP/s
     hbm_abs = ([round(bytes_sum[b] / bin_s / 1e9, 1) for b in range(bins)]
                if bin_s > 0 else [0.0] * bins)         # achieved GB/s
     vec_abs = [round(vec_occ[b], 1) for b in range(bins)]    # busy μs within bin
@@ -319,11 +381,16 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]:
                    if geom.get("span_us") else None)
 
     utilization = [
-        {"key": "cube", "label": "Cube 利用率", "available": True, "unit": "%",
+        {"key": "cube", "label": "Cube 利用率(GEMM)", "available": True, "unit": "%",
          "color": "#4f9fe0", "series": compute_series,
          "abs": cube_abs, "abs_unit": "TFLOP/s", "peak": peak_tflops,
          "peak_unit": "TFLOP/s", "kind": "rate",
-         "note": "Σ建模FLOPs /（桶时长 × Cube 有效峰值）"},
+         "note": "matmul/GEMM 的 ΣFLOPs /（桶时长 × Cube 有效峰值）；FlashAttention 见下一条独立泳道"},
+        {"key": "flash_attn", "label": "FlashAttention 利用率", "available": True, "unit": "%",
+         "color": "#a371f7", "series": fa_series,
+         "abs": fa_abs, "abs_unit": "TFLOP/s", "peak": peak_tflops,
+         "peak_unit": "TFLOP/s", "kind": "rate",
+         "note": "FlashAttention(fwd+grad)的 ΣFLOPs /（桶时长 × Cube 有效峰值）；FA 跑在 cube/MIX_AIC 上，单列以看其 MFU 占比"},
         {"key": "vector", "label": "Vector 利用率", "available": True, "unit": "%",
          "color": "#4caf50", "series": vector_series,
          "abs": vec_abs, "abs_unit": "μs", "peak": bin_us_r,
@@ -339,6 +406,24 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any]) -> Dict[str, Any]:
          "abs": comm_abs, "abs_unit": "μs", "peak": bin_us_r,
          "peak_unit": "μs", "kind": "occupancy",
          "note": "Communication 泳道每桶时间占用率（已剔除 Notify_Wait 同步等待）"},
+        {"key": "comm_wait", "label": "集合通信-卡间等待占比", "available": has_split, "unit": "%",
+         "color": "#f0655c", "series": wait_frac,
+         "abs": [round(v, 1) for v in wait_occ], "abs_unit": "μs", "peak": bin_us_r,
+         "peak_unit": "μs", "kind": "occupancy",
+         "reason": None if has_split else "无 task_time(_slice).csv 设备子任务，无法拆分",
+         "note": "集合通信 device 同步等待占比(NOTIFY/EVENT_WAIT)；红+绿=该桶集合通信构成；悬停 abs 为绝对耗时(μs，跨核累加)，取自 task_time.csv"},
+        {"key": "comm_xfer", "label": "集合通信-有效传输占比", "available": has_split, "unit": "%",
+         "color": "#5ee0b8", "series": xfer_frac,
+         "abs": [round(v, 1) for v in xfer_occ], "abs_unit": "μs", "peak": bin_us_r,
+         "peak_unit": "μs", "kind": "occupancy",
+         "reason": None if has_split else "无 task_time(_slice).csv 设备子任务，无法拆分",
+         "note": "集合通信 device 搬数据占比(UBDMA/SDMA/MEMCPY)；悬停 abs 为绝对耗时(μs)"},
+        {"key": "comm_p2p", "label": "P2P/PP 通信阻塞", "available": bool(any(p2p_occ)), "unit": "%",
+         "color": "#d29922", "series": p2p_series,
+         "abs": [round(v, 1) for v in p2p_occ], "abs_unit": "μs", "peak": bin_us_r,
+         "peak_unit": "μs", "kind": "occupancy",
+         "reason": None if any(p2p_occ) else "无 P2P(hcom_send/receive) —— 该 run 无 PP 流水阻塞",
+         "note": "点对点 hcom_send/receive 的 AICPU 阻塞占用——PP 流水的卡间等待，不经 device cube 展开"},
         {"key": "hbm_cap", "label": "显存容量 (HBM)", "available": False,
          "reason": "待 memory_record.csv 采集（与「显存洞察」页口径一致）"},
         {"key": "host_mem", "label": "主机内存", "available": False,
@@ -398,7 +483,7 @@ def compute_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
     key = (f"smarttl:{_GEOM_VERSION}:{sig}:"
            f"{SETTINGS.smart_timeline_bins}:{SETTINGS.timeline_max_slices}")
     geom = cached_json(key, lambda: _build_geometry(prof, kindex))
-    return _apply_chip(geom, eff)
+    return _apply_chip(geom, eff, prof)
 
 
 def _wait_xfer_from_task_slices(data_dir, t0, bin_us, bins):
@@ -441,6 +526,28 @@ def _wait_xfer_from_task_slices(data_dir, t0, bin_us, bins):
 
     res = cached_json(f"msprof_ts_wx:{sig}:{bins}:{int(t0)}:{int(round(bin_us))}", _build)
     return res["wait"], res["xfer"]
+
+
+def _wait_xfer_from_comm_ops(prof, t0, bin_us, bins):
+    """Fallback comm wait/transfer split (μs per bin) from the PARSED communication.json
+    ops — each carries start_us + wait_ms / transit_ms. Used on torch_npu captures that
+    ship communication.json + db but NO task_time.csv (the device-sub-task source). It's
+    op-level (coarser than device sub-tasks) but start-bin attribution is accurate for
+    the short collective/p2p ops. Returns (wait_occ, xfer_occ); both empty if the comm
+    op timestamps don't align with the trace t0 (degrades to 'no split')."""
+    wait = [0.0] * bins
+    xfer = [0.0] * bins
+    for c in (getattr(prof, "communication", None) or []):
+        if c.get("type") == "Total":
+            continue
+        st = c.get("start_us") or 0
+        if not st:
+            continue
+        b = int((float(st) - t0) / bin_us)
+        if 0 <= b < bins:
+            wait[b] += (c.get("wait_ms") or 0.0) * 1e3      # ms -> us
+            xfer[b] += (c.get("transit_ms") or 0.0) * 1e3
+    return wait, xfer
 
 
 def compute_msprof_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:

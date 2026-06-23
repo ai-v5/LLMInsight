@@ -39,9 +39,15 @@ set "CHECKHOST=%HOST%"
 if "%HOST%"=="0.0.0.0" set "CHECKHOST=127.0.0.1"
 
 REM --- pick a python interpreter ---------------------------------------------
+REM Prefer the project-local virtualenv (.venv) so the server runs with the repo's
+REM pinned deps without the caller having to "activate" first; fall back to any
+REM python/py/python3 on PATH. When uv/python aren't on PATH, that .venv (created
+REM with:  python -m venv .venv  then  .venv\Scripts\python -m pip install -r requirements.txt )
+REM is what makes restart work.
 set "PYTHON="
-for %%C in (python py python3) do if not defined PYTHON ( where %%C >nul 2>&1 && set "PYTHON=%%C" )
-if not defined PYTHON ( echo [restart_insight] ERROR: no python/py/python3 on PATH 1>&2 & exit /b 1 )
+if exist "%REPO_DIR%\.venv\Scripts\python.exe" set PYTHON="%REPO_DIR%\.venv\Scripts\python.exe"
+if not defined PYTHON for %%C in (python py python3) do if not defined PYTHON ( where %%C >nul 2>&1 && set "PYTHON=%%C" )
+if not defined PYTHON ( echo [restart_insight] ERROR: no .venv and no python/py/python3 on PATH. Create the venv:  python -m venv .venv  then  .venv\Scripts\python -m pip install -r requirements.txt 1>&2 & exit /b 1 )
 if "%PYTHON%"=="py" set "PYTHON=py -3"
 
 REM --- stop existing instance(s) ---------------------------------------------

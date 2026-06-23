@@ -232,6 +232,8 @@ def _sec_header(meta: Dict, overview: Dict, theo: Dict,
     r = (overview or {}).get("ratios", {}) or {}
     u = (overview or {}).get("us", {}) or {}
     step_mfu = (theo or {}).get("step_mfu")
+    step_hfu = (theo or {}).get("step_hfu")
+    rco_hero = (theo or {}).get("recompute") or {}
     comb = (theo or {}).get("whatif_combined") or {}
     cards = [
         _metric("Step 时长", _us(u.get("stage")),
@@ -248,7 +250,8 @@ def _sec_header(meta: Dict, overview: Dict, theo: Dict,
                 "Overlapped / Communication",
                 "bad" if (r.get("overlap_rate_pct") or 0) < 40 else ""),
         _metric("端到端 MFU", _mfu(step_mfu),
-                (f"全优化上界 {_mfu(comb.get('new_mfu'))}" if comb.get("new_mfu") else "达成算力 / 峰值")),
+                (f"HFU {_mfu(step_hfu)}（含重算）" if rco_hero.get("overhead_us")
+                 else (f"全优化上界 {_mfu(comb.get('new_mfu'))}" if comb.get("new_mfu") else "达成算力 / 峰值"))),
     ]
     return (
         '<header class="rep-head">'
@@ -407,7 +410,7 @@ def _sec_theoretical(theo: Dict) -> str:
 
     note = (f'<div class="note">{_e(theo.get("note"))}</div>'
             if theo.get("note") else "")
-    sub = "每项为达现实地板（业界可达上限）时单独可回收的收益（实测%→地板%）；底部「已启用组合」为三项叠加（导出快照）"
+    sub = "每项为达现实地板（业界可达上限）时单独可回收的收益（实测%→地板%）；底部「已启用组合」叠加各项（含重计算，导出快照）"
     return _panel("What-if 收益模拟 · 现实可达地板", sub,
                   tbl + cb_note + tip + note)
 
@@ -505,15 +508,19 @@ def _sec_efficiency(eff: Dict) -> str:
 def _sec_communication(comm: Dict) -> str:
     if not comm or not comm.get("available"):
         return ""
+    def _bw(v):
+        return f'{v:.1f} GB/s' if isinstance(v, (int, float)) else "—"
     rows = [[_e(t.get("type", "")), _int(t.get("count")),
              f'{t.get("elapse_ms","—")} ms', f'{t.get("wait_ms","—")} ms',
-             _pct(t.get("wait_pct"))] for t in (comm.get("by_type") or [])]
-    tbl = _table(["通信类型", "次数", "Elapse", "Wait", "等待占比"], rows)
+             _pct(t.get("wait_pct")), f'{t.get("transit_mb","—")} MB',
+             _bw(t.get("bandwidth_gbps"))] for t in (comm.get("by_type") or [])]
+    tbl = _table(["通信类型", "次数", "Elapse", "Wait", "等待占比", "流量", "有效带宽"], rows)
+    obw = comm.get("overall_bandwidth_gbps")
     sub = (f"{comm.get('count','—')} 次集合通信 · 总 Elapse {comm.get('total_elapse_ms','—')} ms · "
            f"平均等待占比 {_pct(comm.get('overall_wait_pct'))} · "
-           f"Transit {comm.get('total_transit_mb','—')} MB")
-    note = ('<div class="note">单卡采集：集合通信几乎全为 Wait / Synchronization，'
-            'Transit≈0 → 通信时间以「等待对端」为主，真实链路带宽需多卡数据。</div>')
+           f"Transit {comm.get('total_transit_mb','—')} MB · "
+           f"有效带宽 {_bw(obw)}")
+    note = f'<div class="note">{_e(comm.get("note", ""))}</div>'
     return _panel("通信分析", sub, tbl + note)
 
 

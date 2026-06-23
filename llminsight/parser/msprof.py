@@ -382,7 +382,8 @@ def load_msprof_profile(data_dir: str) -> ProfileData:
     if has_db:
         raw = _load_kernel_detail_db(db_path)
         kd = _kernel_details_from_df(raw)
-        dev = int(raw["deviceId"].iloc[0]) if not raw.empty else None
+        _d = raw["deviceId"].iloc[0] if not raw.empty else None
+        dev = int(_d) if pd.notna(_d) else None  # blank deviceId -> None, not int(NaN)
         overlap = _overlap_breakdown(db_path)            # Overlap layer (step_trace)
         comm_breakdown = _comm_breakdown(db_path)         # device wait/transfer
     else:

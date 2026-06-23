@@ -180,10 +180,17 @@ def load_profile(data_dir: str) -> ProfileData:
     device_id = None
     step_id = None
     if not step_trace.empty:
+        # Both cells can be blank/NaN — some captures emit step_trace_time.csv with
+        # an empty Step column (no step tagging / a single aggregated step), and
+        # int(NaN) raises. Keep None in that case rather than failing the load.
         if "Device_id" in step_trace.columns:
-            device_id = int(step_trace["Device_id"].iloc[0])
+            _dev = step_trace["Device_id"].iloc[0]
+            if pd.notna(_dev):
+                device_id = int(_dev)
         if "Step" in step_trace.columns:
-            step_id = int(step_trace["Step"].iloc[0])
+            _step = step_trace["Step"].iloc[0]
+            if pd.notna(_step):
+                step_id = int(_step)
 
     def fsize(f: str) -> int:
         try:
