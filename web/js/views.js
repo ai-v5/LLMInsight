@@ -301,15 +301,17 @@
     if (!cm.available) { root.innerHTML = `<div class="empty">无 communication.json 数据</div>`; return; }
     const bw = v => (v == null ? '<span style="color:var(--text-dim)">—</span>' : v.toFixed(1) + " GB/s");
     const rows = cm.by_type.map(t =>
-      `<tr><td>${esc(t.type)}</td><td>${fmt.int(t.count)}</td><td>${fmt.ms(t.elapse_ms)}</td><td>${fmt.ms(t.wait_ms)}</td><td>${fmt.pct(t.wait_pct)}</td><td>${fmt.ms(t.transit_ms)}</td><td>${t.transit_mb.toFixed(1)} MB</td><td>${bw(t.bandwidth_gbps)}</td></tr>`).join("");
+      `<tr><td>${esc(t.type)}</td><td>${fmt.int(t.count)}</td><td>${fmt.ms(t.elapse_ms)}</td><td>${fmt.ms(t.wait_ms)}</td><td>${fmt.pct(t.wait_pct)}</td><td>${fmt.ms(t.transit_ms)}</td><td>${t.transit_mb.toFixed(1)} MB</td><td>${bw(t.bandwidth_with_wait_gbps)}</td><td>${bw(t.bandwidth_gbps)}</td></tr>`).join("");
     const topRows = cm.top.slice(0, 12).map(t =>
-      `<tr><td class="mono">${esc(t.name)}</td><td>${esc(t.type)}</td><td>${fmt.ms(t.elapse_ms)}</td><td>${fmt.pct(t.wait_ratio * 100)}</td><td>${bw(t.bandwidth_gbps)}</td></tr>`).join("");
+      `<tr><td class="mono">${esc(t.name)}</td><td>${esc(t.type)}</td><td>${fmt.ms(t.elapse_ms)}</td><td>${fmt.pct(t.wait_ratio * 100)}</td><td>${bw(t.bandwidth_with_wait_gbps)}</td><td>${bw(t.bandwidth_gbps)}</td></tr>`).join("");
     // msprof: effective-transfer vs cross-rank-wait split (device HCCL sub-tasks)
     const bd = cm.breakdown;
+    const bdNo = bd && bd.wall_clock && bd.wall_clock.within_comm_not_overlapped;
+    const bdNoText = bdNo ? `<div class="note">未掩盖通信窗口 ${fmt.us(bdNo.window_us)}：等待墙钟 ${fmt.us(bdNo.wait_wall_us)} · 有效传输墙钟 ${fmt.us(bdNo.transfer_wall_us)}</div>` : "";
     const bdHtml = bd ? `
       ${banner("warn", "🔍", `通信内部构成（device 子任务累加耗时，非墙钟）：<strong>卡间等待 ${bd.wait_pct}%</strong> vs <strong>有效传输 ${bd.transfer_pct}%</strong>。等待 ≫ 传输 → 瓶颈在同步 / 负载不均 / 通信未掩盖，而非链路带宽。`)}
       <div class="grid cols-2">
-        ${panel("等待 vs 有效传输", "NOTIFY/EVENT_WAIT=等待；UBDMA/SDMA/MEMCPY/Reduce=有效传输（累加含跨核重叠）", `<div style="display:flex;height:30px;border-radius:6px;overflow:hidden;margin:6px 0;font-size:12px"><div style="width:${bd.wait_pct}%;background:#f0655c;display:flex;align-items:center;justify-content:center;color:#fff">等待 ${bd.wait_pct}%</div><div style="width:${bd.transfer_pct}%;background:#5ee0b8;display:flex;align-items:center;justify-content:center;color:#08210a">传输 ${bd.transfer_pct}%</div></div><div class="note">等待累加 ${fmt.us(bd.wait_us)} · 有效传输累加 ${fmt.us(bd.transfer_us)}</div>`)}
+        ${panel("等待 vs 有效传输", "NOTIFY/EVENT_WAIT=等待；UBDMA/SDMA/MEMCPY/Reduce=有效传输（累加含跨核重叠）", `<div style="display:flex;height:30px;border-radius:6px;overflow:hidden;margin:6px 0;font-size:12px"><div style="width:${bd.wait_pct}%;background:#f0655c;display:flex;align-items:center;justify-content:center;color:#fff">等待 ${bd.wait_pct}%</div><div style="width:${bd.transfer_pct}%;background:#5ee0b8;display:flex;align-items:center;justify-content:center;color:#08210a">传输 ${bd.transfer_pct}%</div></div><div class="note">等待累加 ${fmt.us(bd.wait_us)} · 有效传输累加 ${fmt.us(bd.transfer_us)}</div>${bdNoText}`)}
         ${panel("Top 等待源 / 传输源", "", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>子任务</th><th>类别</th><th>累加耗时</th></tr></thead><tbody>${bd.top_wait.slice(0, 5).map(w => `<tr><td class="mono">${esc(w.name)}</td><td style="color:#f0655c">等待</td><td>${fmt.us(w.us)}</td></tr>`).join("") + bd.top_transfer.slice(0, 4).map(t => `<tr><td class="mono">${esc(t.name)}</td><td style="color:#2E7D32">传输</td><td>${fmt.us(t.us)}</td></tr>`).join("")}</tbody></table></div>`)}
       </div>` : "";
     root.innerHTML = `
@@ -317,7 +319,8 @@
         ${metric("集合通信次数", fmt.int(cm.count))}
         ${metric("总 Elapse", fmt.ms(cm.total_elapse_ms), { foot: "wall-clock" })}
         ${metric("平均等待占比", fmt.pct(cm.overall_wait_pct), { tone: "bad", barPct: cm.overall_wait_pct })}
-        ${metric("有效带宽", cm.overall_bandwidth_gbps != null ? cm.overall_bandwidth_gbps + " GB/s" : "—", { foot: cm.overall_bandwidth_gbps != null ? "Σ Transit ÷ Σ Transit Time" : "Transit≈0（单卡/全等待）", tone: cm.overall_bandwidth_gbps != null ? "good" : undefined })}
+        ${metric("平均带宽(含等待)", cm.overall_bandwidth_with_wait_gbps != null ? cm.overall_bandwidth_with_wait_gbps + " GB/s" : "—", { foot: cm.overall_bandwidth_with_wait_gbps != null ? "Σ Transit ÷ Σ Elapse" : "Transit≈0（单卡/全等待）" })}
+        ${metric("有效带宽(去等待)", cm.overall_bandwidth_gbps != null ? cm.overall_bandwidth_gbps + " GB/s" : "—", { foot: cm.overall_bandwidth_gbps != null ? "Σ Transit ÷ Σ Transit Time" : "Transit≈0（单卡/全等待）", tone: cm.overall_bandwidth_gbps != null ? "good" : undefined })}
       </div>
       ${bdHtml}
       ${banner("info", "ℹ️", esc(cm.note))}
@@ -326,8 +329,8 @@
         ${panel("按类型等待占比", "Wait / Elapse（每 op 均值）", `<div id="cm-wait" class="chart"></div>`)}
       </div>
       <div class="grid cols-2">
-        ${panel("类型聚合明细", "有效带宽 = Transit Size ÷ Transit Time（单卡/全等待时 Transit≈0 → —）", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>Count</th><th>Elapse</th><th>Wait</th><th>Wait%</th><th>Transit</th><th>流量</th><th>有效带宽</th></tr></thead><tbody>${rows}</tbody></table></div>`)}
-        ${panel("Top 集合通信 (Elapse)", "", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Type</th><th>Elapse</th><th>Wait%</th><th>有效带宽</th></tr></thead><tbody>${topRows}</tbody></table></div>`)}
+        ${panel("类型聚合明细", "平均带宽含等待；有效带宽去除 Wait/Synchronization，仅看 Transit Time", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>Count</th><th>Elapse</th><th>Wait</th><th>Wait%</th><th>Transit</th><th>流量</th><th>平均带宽</th><th>有效带宽</th></tr></thead><tbody>${rows}</tbody></table></div>`)}
+        ${panel("Top 集合通信 (Elapse)", "", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Type</th><th>Elapse</th><th>Wait%</th><th>平均带宽</th><th>有效带宽</th></tr></thead><tbody>${topRows}</tbody></table></div>`)}
       </div>`;
     charts([
       { id: "cm-bar", option: hbar(cm.by_type.map(t => t.type), cm.by_type.map(t => t.elapse_ms), "ms", { fmt: v => fmt.ms(v) }) },

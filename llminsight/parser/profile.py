@@ -143,6 +143,18 @@ def load_profile(data_dir: str) -> ProfileData:
     comm_raw = _load_json(p("communication.json"))
     comm_matrix = _load_json(p("communication_matrix.json"))
     communication = _normalize_communication(comm_raw)
+    msprof_meta: Dict[str, Any] = {}
+    db_path = p("mindstudio_insight_data.db")
+    if os.path.exists(db_path):
+        try:
+            from .msprof import _comm_breakdown, _overlap_breakdown
+            msprof_meta = {
+                "format": "hybrid_torch_npu_with_mindstudio_db",
+                "overlap": {k: round(v, 1) for k, v in _overlap_breakdown(db_path).items()},
+                "comm_breakdown": _comm_breakdown(db_path),
+            }
+        except Exception:
+            msprof_meta = {"format": "hybrid_torch_npu_with_mindstudio_db"}
 
     # --- lightweight-capture recovery -------------------------------------- #
     # A torch_npu capture taken WITHOUT op-attr recording has Type/Core = N/A and
@@ -198,12 +210,22 @@ def load_profile(data_dir: str) -> ProfileData:
         except OSError:
             return 0
 
+    matrix_has_peer = any(
+        isinstance(st, dict) and (st.get("p2p") or st.get("collective"))
+        for st in (comm_matrix or {}).values()
+    ) if isinstance(comm_matrix, dict) else bool(comm_matrix)
+    comm_has_collective = any(c.get("type") != "Total" for c in communication)
+
     meta = {
         "data_dir": data_dir,
         "rank": 0,                      # reserved; single-card sample
         "device_id": device_id,
         "step": step_id,
-        "multi_card": bool(comm_matrix.get("step5", {}).get("collective")),
+        "multi_card": bool(matrix_has_peer or comm_has_collective),
+        "communication_matrix_has_peer": bool(matrix_has_peer),
+        "profile_scope": ("single_rank_or_matrix_missing"
+                          if (comm_has_collective and not matrix_has_peer)
+                          else ("multi_rank_matrix" if matrix_has_peer else "single_rank")),
         "counts": {
             "op_types": int(op_statistic.shape[0]),
             "api": int(api_statistic.shape[0]),
@@ -228,10 +250,13 @@ def load_profile(data_dir: str) -> ProfileData:
                 "memory_record.csv",
                 "npu_module_mem.csv",
                 "operator_memory.csv",
+                "mindstudio_insight_data.db",
             )
             if fsize(f) > 0
         },
     }
+    if msprof_meta:
+        meta["msprof"] = msprof_meta
 
     return ProfileData(
         data_dir=data_dir,

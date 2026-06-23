@@ -184,6 +184,9 @@ def communication(prof) -> Dict[str, Any]:
         # the per-category 有效带宽 the user wants surfaced alongside each type.
         t["bandwidth_gbps"] = (round(t["transit_mb"] / t["transit_ms"], 1)
                                if t["transit_ms"] > 0 else None)
+        t["bandwidth_with_wait_gbps"] = (round(t["transit_mb"] / t["elapse_ms"], 1)
+                                         if t["transit_mb"] > 0 and t["elapse_ms"] > 0
+                                         else None)
 
     total_elapse = sum(c["elapse_ms"] for c in comms)
     total_wait = sum(c["wait_ms"] for c in comms)
@@ -194,6 +197,9 @@ def communication(prof) -> Dict[str, Any]:
     total_transit_ms = sum(c["transit_ms"] for c in comms)
     overall_bandwidth_gbps = (round(total_transit_mb / total_transit_ms, 1)
                               if total_transit_ms > 0 else None)
+    overall_bandwidth_with_wait_gbps = (round(total_transit_mb / total_elapse, 1)
+                                        if total_transit_mb > 0 and total_elapse > 0
+                                        else None)
 
     def _op_transit_mb(c):
         return sum(l.get("transit_mb", 0) for l in c["links"].values())
@@ -210,6 +216,9 @@ def communication(prof) -> Dict[str, Any]:
             # per-op 有效带宽 = transit bytes / transit time (None when transit≈0)
             "bandwidth_gbps": (round(_op_transit_mb(c) / c["transit_ms"], 1)
                                if c["transit_ms"] > 0 else None),
+            "bandwidth_with_wait_gbps": (round(_op_transit_mb(c) / c["elapse_ms"], 1)
+                                         if _op_transit_mb(c) > 0 and c["elapse_ms"] > 0
+                                         else None),
         }
         for c in top
     ]
@@ -219,11 +228,12 @@ def communication(prof) -> Dict[str, Any]:
     breakdown = ((getattr(prof, "meta", {}) or {}).get("msprof") or {}).get("comm_breakdown")
 
     if total_transit_ms > 0:
-        note = ("有效带宽 = Σ Transit Size ÷ Σ Transit Time（每类/总体，MB/ms≡GB/s）；"
-                "Wait/Synchronization 为卡间等待，不计入带宽分母。")
+        note = ("平均带宽(含等待) = Σ Transit Size ÷ Σ Elapse；"
+                "有效带宽(去等待) = Σ Transit Size ÷ Σ Transit Time（MB/ms≡GB/s）。"
+                "Wait/Synchronization 为卡间等待，不计入去等待带宽分母。")
     else:
-        note = ("本采集 Transit≈0：集合通信几乎全为 Wait/Synchronization（多为单卡或全等待）→ "
-                "有效带宽 N/A；需多卡真实传输采集才能看链路带宽。")
+        note = ("本采集 Transit≈0：communication.json 无可用传输字节，平均/去等待带宽均 N/A；"
+                "若存在 MindStudio DB，则用 device 子任务分解等待与有效传输时间，但不能反推真实链路带宽。")
 
     return {
         "available": True,
@@ -236,6 +246,7 @@ def communication(prof) -> Dict[str, Any]:
         "total_transit_ms": round(total_transit_ms, 3),
         # overall 有效带宽 (None when transit≈0); per-category in by_type[].bandwidth_gbps
         "overall_bandwidth_gbps": overall_bandwidth_gbps,
+        "overall_bandwidth_with_wait_gbps": overall_bandwidth_with_wait_gbps,
         "by_type": type_rows,
         "top": top_out,
         "note": note,
@@ -538,7 +549,7 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
     flags = flags or {}
 
     def _mfu_at(new_step):
-        return (round(step_mfu * stage / new_step, 4)
+        return (round(min(step_mfu * stage / new_step, 1.0), 4)
                 if (step_mfu and new_step and new_step > 0) else None)
 
     def _exposed_floor(overlap):  # exposed comm left if overlap reaches `overlap`
@@ -796,7 +807,7 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         {
             "id": "comm_overlap",
             "scenario": "通信完全掩盖（未掩盖通信→0）",
-            "new_step_us": round(computing + free, 1),
+            "new_step_us": round(stage - comm_no, 1),
             "save_us": round(comm_no, 1),
             "save_pct": _pct(comm_no, stage),
             "basis": "把 Communication(Not Overlapped) 全部与计算重叠。",
@@ -804,7 +815,7 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         {
             "id": "free_zero",
             "scenario": "消除空泡（Free→0）",
-            "new_step_us": round(computing + comm_no, 1),
+            "new_step_us": round(stage - free, 1),
             "save_us": round(free, 1),
             "save_pct": _pct(free, stage),
             "basis": "理想下发与同步，Free 归零（上界估计）。",
@@ -870,23 +881,42 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
     step_mfu = (hfu * (1.0 - r_re)) if hfu is not None else None
     # Time-only levers (comm/free/op) keep useful FLOPs fixed, so post-opt MFU scales
     # as mfu × stage/new_step — the same factor for MFU or HFU.
+    physical_floor_us = (step_mfu * stage) if step_mfu else 0.0
     for w in whatif:
-        w["new_mfu"] = (round(step_mfu * stage / w["new_step_us"], 4)
-                        if (step_mfu and w.get("new_step_us")) else None)
+        raw_new_step = max(stage - float(w.get("save_us") or 0.0), 0.0)
+        new_step = max(raw_new_step, physical_floor_us) if step_mfu else raw_new_step
+        if new_step > raw_new_step + 1.0:
+            w["raw_new_step_us"] = round(raw_new_step, 1)
+            w["capped_by_physical_mfu"] = True
+        else:
+            w["capped_by_physical_mfu"] = False
+        w["new_step_us"] = round(new_step, 1)
+        w["new_mfu"] = (round(min(step_mfu * stage / new_step, 1.0), 4)
+                        if (step_mfu and new_step > 0) else None)
 
     # Combined what-if: every lever enabled at once. Since the levers are disjoint
     # slices of Stage their savings add, and the floor is pure Computing. This is the
     # true upper bound and the default for the UI's "已启用组合" row (all ticked).
-    combined_save_us = comm_no + free + op_reclaim + recompute_us
-    combined_step_us = max(stage - combined_save_us, 0.0)
+    raw_combined_save_us = comm_no + free + op_reclaim + recompute_us
+    raw_combined_step_us = max(stage - raw_combined_save_us, 0.0)
+    combined_step_us = (max(raw_combined_step_us, physical_floor_us)
+                        if step_mfu else raw_combined_step_us)
+    combined_save_us = max(stage - combined_step_us, 0.0)
+    combined_capped = combined_step_us > raw_combined_step_us + 1.0
     whatif_combined = {
         "save_us": round(combined_save_us, 1),
         "save_pct": _pct(combined_save_us, stage),
+        "raw_save_us": round(raw_combined_save_us, 1),
+        "raw_save_pct": _pct(raw_combined_save_us, stage),
         "new_step_us": round(combined_step_us, 1),
-        "new_mfu": (round(step_mfu * stage / combined_step_us, 4)
+        "raw_new_step_us": round(raw_combined_step_us, 1),
+        "physical_floor_us": round(physical_floor_us, 1) if physical_floor_us else None,
+        "capped_by_physical_mfu": combined_capped,
+        "new_mfu": (round(min(step_mfu * stage / combined_step_us, 1.0), 4)
                     if (step_mfu and combined_step_us > 0) else None),
         "basis": ("全部优化项叠加（通信掩盖 / 空泡 / 算子极致优化"
-                  + ("/ 关闭重计算" if recompute_us > 0 else "") + "互不重叠，收益可加）。"),
+                  + (" / 关闭重计算" if recompute_us > 0 else "")
+                  + " 互不重叠，收益可加）。"),
     }
 
     matmul_mfu = eff.get("matmul_mfu") if eff.get("available") else None

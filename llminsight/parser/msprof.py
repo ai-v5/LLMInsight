@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from .profile import ProfileData
-from ..cache import cached_json
+from ..cache import cached_json, file_signature
 
 
 # --------------------------------------------------------------------------- #
@@ -244,50 +244,161 @@ def _comm_task_cat(name: str) -> str:
     return "other"
 
 
+def _merge_len_ns(intervals) -> int:
+    """Union length of [start, end) intervals in ns."""
+    iv = sorted((int(a), int(b)) for a, b in intervals
+                if a is not None and b is not None and b > a)
+    if not iv:
+        return 0
+    total = 0
+    cur_a, cur_b = iv[0]
+    for a, b in iv[1:]:
+        if a <= cur_b:
+            cur_b = max(cur_b, b)
+        else:
+            total += cur_b - cur_a
+            cur_a, cur_b = a, b
+    return total + cur_b - cur_a
+
+
+def _intersect_len_ns(intervals, windows) -> int:
+    """Accumulated intersection length between intervals and windows in ns."""
+    iv = sorted((int(a), int(b)) for a, b in intervals
+                if a is not None and b is not None and b > a)
+    win = sorted((int(a), int(b)) for a, b in windows
+                 if a is not None and b is not None and b > a)
+    i = j = total = 0
+    while i < len(iv) and j < len(win):
+        s = max(iv[i][0], win[j][0])
+        e = min(iv[i][1], win[j][1])
+        if e > s:
+            total += e - s
+        if iv[i][1] < win[j][1]:
+            i += 1
+        else:
+            j += 1
+    return total
+
+
+def _clip_intervals(intervals, windows):
+    """Clip intervals to windows, preserving overlaps for later union."""
+    iv = sorted((int(a), int(b)) for a, b in intervals
+                if a is not None and b is not None and b > a)
+    win = sorted((int(a), int(b)) for a, b in windows
+                 if a is not None and b is not None and b > a)
+    out = []
+    i = j = 0
+    while i < len(iv) and j < len(win):
+        s = max(iv[i][0], win[j][0])
+        e = min(iv[i][1], win[j][1])
+        if e > s:
+            out.append((s, e))
+        if iv[i][1] < win[j][1]:
+            i += 1
+        else:
+            j += 1
+    return out
+
+
 def _comm_breakdown(db_path: str) -> Dict[str, Any]:
     """Split device communication/sync sub-tasks into effective transfer vs
     cross-rank waiting. A device HCCL op expands into NOTIFY_WAIT/EVENT_WAIT (waiting
     for the peer) and UBDMA/SDMA/MEMCPY (actually moving data) — classify by task
     name. Durations are SUMMED across cores/queues (overlap-inclusive), so this is
     the internal COMPOSITION of comm time, not a wall-clock figure."""
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    con.text_factory = _decode
-    try:
-        rows = con.execute(
-            "SELECT s.name, COUNT(*), SUM(s.duration) FROM slice s "
-            "JOIN thread t ON s.track_id=t.track_id JOIN process p ON t.pid=p.pid "
-            "WHERE p.process_name='Ascend Hardware' AND s.name NOT LIKE 'aclnn%' "
-            "GROUP BY s.name").fetchall()
-    except Exception:
+    if not os.path.isfile(db_path):
         return {}
-    finally:
-        con.close()
-    cats = {"wait": 0.0, "transfer": 0.0, "reduce": 0.0, "launch": 0.0, "other": 0.0}
-    per_name: List[Dict[str, Any]] = []
-    for name, cnt, dur in rows:
-        us = float(dur or 0) / 1e3                       # ns -> us
-        cat = _comm_task_cat(name)
-        cats[cat] += us
-        per_name.append({"name": str(name)[:48], "cat": cat,
-                         "count": int(cnt or 0), "us": round(us, 1)})
-    comm_total = cats["wait"] + cats["transfer"] + cats["reduce"]
-    if comm_total <= 0:
-        return {}
-    top_wait = sorted((p for p in per_name if p["cat"] == "wait"),
-                      key=lambda x: x["us"], reverse=True)[:8]
-    top_xfer = sorted((p for p in per_name if p["cat"] in ("transfer", "reduce")),
-                      key=lambda x: x["us"], reverse=True)[:8]
-    return {
-        "basis": "accumulated",
-        "wait_us": round(cats["wait"], 1),
-        "transfer_us": round(cats["transfer"] + cats["reduce"], 1),
-        "launch_us": round(cats["launch"], 1),
-        "comm_total_us": round(comm_total, 1),
-        "wait_pct": round(100.0 * cats["wait"] / comm_total, 1),
-        "transfer_pct": round(100.0 * (cats["transfer"] + cats["reduce"]) / comm_total, 1),
-        "top_wait": top_wait,
-        "top_transfer": top_xfer,
-    }
+
+    def _build():
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        con.text_factory = _decode
+        try:
+            rows = con.execute(
+                "SELECT s.name, s.timestamp, s.end_time, s.duration FROM slice s "
+                "JOIN thread t ON s.track_id=t.track_id JOIN process p ON t.pid=p.pid "
+                "WHERE p.process_name='Ascend Hardware' AND s.name NOT LIKE 'aclnn%'"
+            )
+            cats = {"wait": 0.0, "transfer": 0.0, "reduce": 0.0,
+                    "launch": 0.0, "other": 0.0}
+            intervals = {k: [] for k in cats}
+            per: Dict[str, Dict[str, Any]] = {}
+            for name, ts, end, dur in rows:
+                cat = _comm_task_cat(name)
+                us = float(dur or 0) / 1e3
+                cats[cat] += us
+                if ts is not None and end is not None and end > ts:
+                    intervals[cat].append((int(ts), int(end)))
+                e = per.setdefault(str(name), {"name": str(name)[:48],
+                                               "cat": cat, "count": 0, "us": 0.0})
+                e["count"] += 1
+                e["us"] += us
+
+            win_rows = con.execute(
+                "SELECT t.thread_name, s.timestamp, s.end_time FROM slice s "
+                "JOIN thread t ON s.track_id=t.track_id JOIN process p ON t.pid=p.pid "
+                "WHERE p.process_name LIKE '%Overlap%'"
+            ).fetchall()
+        except Exception:
+            return {}
+        finally:
+            con.close()
+
+        comm_total = cats["wait"] + cats["transfer"] + cats["reduce"]
+        if comm_total <= 0:
+            return {}
+
+        per_name = list(per.values())
+        for p in per_name:
+            p["us"] = round(p["us"], 1)
+        top_wait = sorted((p for p in per_name if p["cat"] == "wait"),
+                          key=lambda x: x["us"], reverse=True)[:8]
+        top_xfer = sorted((p for p in per_name if p["cat"] in ("transfer", "reduce")),
+                          key=lambda x: x["us"], reverse=True)[:8]
+
+        windows: Dict[str, List[tuple]] = {}
+        for name, ts, end in win_rows:
+            if ts is not None and end is not None and end > ts:
+                windows.setdefault(str(name), []).append((int(ts), int(end)))
+
+        xfer_intervals = intervals["transfer"] + intervals["reduce"]
+
+        def _wall_for(win_name: str) -> Dict[str, float]:
+            win = windows.get(win_name, [])
+            if not win:
+                return {}
+            return {
+                "wait_accum_us": round(_intersect_len_ns(intervals["wait"], win) / 1e3, 1),
+                "transfer_accum_us": round(_intersect_len_ns(xfer_intervals, win) / 1e3, 1),
+                "wait_wall_us": round(_merge_len_ns(_clip_intervals(intervals["wait"], win)) / 1e3, 1),
+                "transfer_wall_us": round(_merge_len_ns(_clip_intervals(xfer_intervals, win)) / 1e3, 1),
+                "window_us": round(_merge_len_ns(win) / 1e3, 1),
+            }
+
+        wait_wall = _merge_len_ns(intervals["wait"]) / 1e3
+        xfer_wall = _merge_len_ns(xfer_intervals) / 1e3
+        wall_sum = wait_wall + xfer_wall
+        return {
+            "basis": "accumulated",
+            "wait_us": round(cats["wait"], 1),
+            "transfer_us": round(cats["transfer"] + cats["reduce"], 1),
+            "launch_us": round(cats["launch"], 1),
+            "comm_total_us": round(comm_total, 1),
+            "wait_pct": round(100.0 * cats["wait"] / comm_total, 1),
+            "transfer_pct": round(100.0 * (cats["transfer"] + cats["reduce"]) / comm_total, 1),
+            "wall_clock": {
+                "basis": "union_intervals",
+                "wait_wall_us": round(wait_wall, 1),
+                "transfer_wall_us": round(xfer_wall, 1),
+                "wait_pct": round(100.0 * wait_wall / wall_sum, 1) if wall_sum else 0.0,
+                "transfer_pct": round(100.0 * xfer_wall / wall_sum, 1) if wall_sum else 0.0,
+                "within_communication": _wall_for("Communication"),
+                "within_comm_not_overlapped": _wall_for("Communication(Not Overlapped)"),
+            },
+            "top_wait": top_wait,
+            "top_transfer": top_xfer,
+        }
+
+    return cached_json(f"msprof_db_cb:v2:{file_signature(db_path)}", _build)
 
 
 def _comm_breakdown_from_task_slices(data_dir: str) -> Dict[str, Any]:

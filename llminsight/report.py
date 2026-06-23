@@ -513,15 +513,31 @@ def _sec_communication(comm: Dict) -> str:
     rows = [[_e(t.get("type", "")), _int(t.get("count")),
              f'{t.get("elapse_ms","—")} ms', f'{t.get("wait_ms","—")} ms',
              _pct(t.get("wait_pct")), f'{t.get("transit_mb","—")} MB',
+             _bw(t.get("bandwidth_with_wait_gbps")),
              _bw(t.get("bandwidth_gbps"))] for t in (comm.get("by_type") or [])]
-    tbl = _table(["通信类型", "次数", "Elapse", "Wait", "等待占比", "流量", "有效带宽"], rows)
+    tbl = _table(["通信类型", "次数", "Elapse", "Wait", "等待占比", "流量",
+                  "平均带宽(含等待)", "有效带宽(去等待)"], rows)
     obw = comm.get("overall_bandwidth_gbps")
+    obw_wait = comm.get("overall_bandwidth_with_wait_gbps")
     sub = (f"{comm.get('count','—')} 次集合通信 · 总 Elapse {comm.get('total_elapse_ms','—')} ms · "
            f"平均等待占比 {_pct(comm.get('overall_wait_pct'))} · "
            f"Transit {comm.get('total_transit_mb','—')} MB · "
-           f"有效带宽 {_bw(obw)}")
+           f"平均带宽(含等待) {_bw(obw_wait)} · 有效带宽(去等待) {_bw(obw)}")
+    bd = comm.get("breakdown") or {}
+    wc = (bd.get("wall_clock") or {}).get("within_comm_not_overlapped") or {}
+    bd_note = ""
+    if bd:
+        def _us_val(d, key):
+            v = d.get(key, "—")
+            return _e(f"{v} us")
+        bd_note = (f'<div class="note">device 子任务分解：等待累加 {_us_val(bd, "wait_us")} '
+                   f'({_pct(bd.get("wait_pct"))})，有效传输累加 {_us_val(bd, "transfer_us")} '
+                   f'({_pct(bd.get("transfer_pct"))})'
+                   + (f'；未掩盖通信窗口内等待墙钟 {_us_val(wc, "wait_wall_us")}，'
+                      f'传输墙钟 {_us_val(wc, "transfer_wall_us")}' if wc else "")
+                   + '</div>')
     note = f'<div class="note">{_e(comm.get("note", ""))}</div>'
-    return _panel("通信分析", sub, tbl + note)
+    return _panel("通信分析", sub, tbl + bd_note + note)
 
 
 def _sec_hidden(ho: Dict) -> str:

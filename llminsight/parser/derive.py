@@ -273,7 +273,7 @@ def derive_capture(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
     )
 
     # --- host-sync stall (the real host bottleneck, blocking or not) --------
-    ss_n, ss_t = _api_sum(api, equals="aclrtSynchronizeStream")
+    ss_n, ss_t = _api_sum(api, contains="Synchronize")
     _, total_api_t = _api_sum(api, contains="")  # everything
     share = (ss_t / total_api_t) if total_api_t else 0.0
     # likely root cause: the heaviest aclnn* call (dynamic-shape D2H sync)
@@ -286,7 +286,7 @@ def derive_capture(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
             root = str(top["API Name"])
     out["host_sync_stall"] = _fact(
         share >= 0.2,
-        f"aclrtSynchronizeStream 累计 {ss_t/1e6:.2f}s（{ss_n} 次），占 host API 时间 {share*100:.0f}%"
+        f"Synchronize APIs 累计 {ss_t/1e6:.2f}s（{ss_n} 次），占 host API 时间 {share*100:.0f}%"
         + (f"；最重 host 调用为 {root}（动态 shape D2H 同步）" if root else ""),
         "high" if total_api_t else "unknown",
     )
@@ -330,6 +330,18 @@ def derive_capture(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
         else "communication_matrix 含跨卡 collective → 多卡",
         "high",
     )
+
+    has_hcom = any(c.get("type") != "Total" for c in (prof.communication or []))
+    if has_peer:
+        out["single_card"] = _fact(False, "communication_matrix contains cross-rank collective entries", "high")
+    elif has_hcom:
+        out["single_card"] = _fact(
+            None,
+            "communication_matrix is empty, but communication.json contains HCCL collectives; this is a single-rank profile shard / missing matrix, not proof of single-card training",
+            "medium",
+        )
+    else:
+        out["single_card"] = _fact(True, "communication_matrix has no cross-rank entries and no HCCL collectives", "high")
 
     # --- swap-optimizer (low confidence single-card signal) -----------------
     mc_n, mc_t = _api_sum(api, contains="Memcpy")
