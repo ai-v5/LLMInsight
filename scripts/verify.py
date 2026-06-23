@@ -138,15 +138,26 @@ def main():
     theo_m = m["theoretical"]
     levers = theo_m.get("whatif", [])
     lever_ids = {w.get("id") for w in levers}
-    chk_true("theoretical what-if atomic levers (3, incl. op_ceiling)",
-             len(levers) == 3 and "op_ceiling" in lever_ids, f"(ids={lever_ids})")
+    # recompute is now a first-class lever (this sample is full recompute), and 算子余量
+    # is carved by (1−r_re) so the two stay disjoint in the combined.
+    _rre = (theo_m.get("recompute") or {}).get("flops_share") or 0.0
+    chk_true("theoretical what-if levers (comm/free/op + recompute)",
+             {"comm_overlap", "free_zero", "op_ceiling", "recompute_off"} <= lever_ids,
+             f"(ids={lever_ids})")
     chk_true("each what-if lever carries new_mfu",
              all(w.get("new_mfu") is not None for w in levers))
     op_lever = next((w for w in levers if w.get("id") == "op_ceiling"), None)
-    chk_true("op_ceiling lever save_us matches efficiency reclaim",
+    chk_true("op_ceiling lever = efficiency reclaim × (1−r_re) (disjoint from 重计算)",
              op_lever is not None
-             and abs((op_lever.get("save_us") or 0) - (oco.get("total_reclaim_us") or 0)) <= 1.0,
-             f"(lever={op_lever.get('save_us') if op_lever else None} reclaim={oco.get('total_reclaim_us')})")
+             and abs((op_lever.get("save_us") or 0)
+                     - (oco.get("total_reclaim_us") or 0) * (1 - _rre)) <= 1.0,
+             f"(lever={op_lever.get('save_us') if op_lever else None} "
+             f"reclaim={oco.get('total_reclaim_us')} r_re={_rre})")
+    rc_lever = next((w for w in levers if w.get("id") == "recompute_off"), None)
+    chk_true("recompute lever in combined (save==theo.recompute.save_us)",
+             rc_lever is not None
+             and abs((rc_lever.get("save_us") or 0) - ((theo_m.get("recompute") or {}).get("save_us") or 0)) <= 1.0,
+             f"(lever={rc_lever.get('save_us') if rc_lever else None})")
     comb = theo_m.get("whatif_combined") or {}
     chk_true("combined what-if present (with MFU)", comb.get("new_mfu") is not None,
              f"(combined={comb})")
@@ -156,6 +167,35 @@ def main():
              f"(combined={comb.get('save_us')} sum={sum(w.get('save_us') or 0 for w in levers)})")
     chk_true("end-to-end step MFU present", theo_m.get("step_mfu") is not None,
              f"(step_mfu={theo_m.get('step_mfu')})")
+
+    # MFU (model, recompute-stripped) vs HFU (executed FLOPs) + recompute what-if.
+    # This OLD sample is full recompute, so the split must be present and consistent.
+    _hfu = theo_m.get("step_hfu")
+    _mfu = theo_m.get("step_mfu")
+    _computing = m["overview"]["us"]["computing"]
+    chk_true("step_hfu present (hardware FLOPs util, incl. recompute)", _hfu is not None,
+             f"(step_hfu={_hfu})")
+    chk_true("HFU >= MFU (recompute inflates executed FLOPs)",
+             _hfu is not None and _mfu is not None and _hfu >= _mfu - 1e-9,
+             f"(hfu={_hfu} mfu={_mfu})")
+    rc_w = theo_m.get("recompute") or {}
+    chk_true("recompute what-if present (full-recompute sample)", bool(rc_w.get("overhead_us")),
+             f"(recompute={rc_w})")
+    chk("recompute flops_share ≈ 1/4 (full, R=2 textbook 1:2:1)", rc_w.get("flops_share"), 0.25, tol=0.03)
+    chk_true("MFU == HFU × (1 − recompute_share) (self-consistent)",
+             bool(_hfu) and _mfu is not None
+             and abs(_mfu - _hfu * (1.0 - (rc_w.get("flops_share") or 0))) <= 1e-3,
+             f"(mfu={_mfu} hfu={_hfu} share={rc_w.get('flops_share')})")
+    chk_true("turning recompute off raises MFU (new_mfu > mfu)",
+             (rc_w.get("new_mfu") or 0) > (rc_w.get("mfu") or 0),
+             f"(new_mfu={rc_w.get('new_mfu')} mfu={rc_w.get('mfu')})")
+    chk_true("recompute save within compute slice (save_us <= computing)",
+             (rc_w.get("save_us") or 0) <= _computing + 1.0,
+             f"(save_us={rc_w.get('save_us')} computing={_computing})")
+    chk_true("recompute overhead band ordered (lo <= headline <= hi)",
+             (rc_w.get("overhead_us_lo") or 0) <= (rc_w.get("overhead_us") or 0) + 1e-6
+             <= (rc_w.get("overhead_us_hi") or 0) + 1.0,
+             f"(lo={rc_w.get('overhead_us_lo')} us={rc_w.get('overhead_us')} hi={rc_w.get('overhead_us_hi')})")
 
     print("\n== what-if 现实地板 (realistic floor, derived from LOADED profile) ==")
     # The 严谨性分析 ("can it reach 0? if not, how far?") must be computed from the
@@ -169,8 +209,9 @@ def main():
     chk_true("realistic has comm+free(+op) levers",
              "comm_overlap" in rl_by and "free_zero" in rl_by,
              f"(ids={set(rl_by)})")
-    chk_true("no lever can reach 0 (every slice keeps an irreducible floor)",
-             rlevers and all(l.get("can_reach_zero") is False for l in rlevers))
+    chk_true("only 重计算 can reach 0 (comm/free/op keep an irreducible floor)",
+             rlevers and all(l.get("can_reach_zero") is False
+                             for l in rlevers if l.get("id") != "recompute_off"))
     # comm/free floors are formulas over the LOADED measured slices: 0 < floor < measured,
     # so the recoverable is a strict positive fraction, never the whole slice → 0.
     for lid in ("comm_overlap", "free_zero"):
@@ -185,10 +226,12 @@ def main():
                  f"(lo={lv.get('recoverable_lo_us')} mid={lv.get('recoverable_us')} hi={lv.get('recoverable_hi_us')})")
     # op-余量 lever mirrors the efficiency ceiling reclaim (compute is useful work, not →0)
     op_rl = rl_by.get("op_ceiling")
-    chk_true("op_ceiling realistic lever mirrors efficiency reclaim",
+    chk_true("op_ceiling realistic lever = efficiency reclaim × (1−r_re)",
              op_rl is not None
-             and abs((op_rl.get("recoverable_us") or 0) - (oco.get("total_reclaim_us") or 0)) <= 1.0,
-             f"(lever={op_rl.get('recoverable_us') if op_rl else None} reclaim={oco.get('total_reclaim_us')})")
+             and abs((op_rl.get("recoverable_us") or 0)
+                     - (oco.get("total_reclaim_us") or 0) * (1 - _rre)) <= 1.0,
+             f"(lever={op_rl.get('recoverable_us') if op_rl else None} "
+             f"reclaim={oco.get('total_reclaim_us')} r_re={_rre})")
     # scenario labels carry the realistic floor UP into the upper What-if table (web +
     # report): comm/free read 实测%→地板% (e.g. "未掩盖通信 26.1%→4.5%"), op is descriptive.
     # This is what the user asked for: replace the unachievable "→0" labels with the floor.
@@ -246,8 +289,9 @@ def main():
     chk_true("realistic combined recoverable == Σ lever recoverables (disjoint slices add)",
              abs((rcomb.get("recoverable_us") or 0) - sum(l.get("recoverable_us") or 0 for l in rlevers)) <= 1.0,
              f"(combined={rcomb.get('recoverable_us')} sum={sum(l.get('recoverable_us') or 0 for l in rlevers)})")
-    chk("realistic combined new_step us (~1.90s floor)", rcomb.get("new_step_us"), 1900187.0, 5000.0)
-    chk("realistic combined recoverable %", rcomb.get("recoverable_pct"), 39.23, 0.5)
+    # combined now includes the 重计算 lever (full-recompute sample) → deeper floor.
+    chk("realistic combined new_step us (incl. 重计算 lever)", rcomb.get("new_step_us"), 1483672.0, 6000.0)
+    chk("realistic combined recoverable %", rcomb.get("recoverable_pct"), 52.55, 0.6)
 
     print("\n== rule engine (insight cards) ==")
     # 11 under the default 950DT on this OLD sample (recompute=full). Composition vs the
@@ -316,6 +360,9 @@ def main():
              rc_b is not None and rc_b.get("source") != "训练脚本配置"
              and "profiling" in (rc_b.get("source") or ""),
              f"(got: {rc_b.get('source') if rc_b else None})")
+    chk_true("recompute bucket now QUANTIFIED (us > 0, was None)",
+             rc_b is not None and isinstance(rc_b.get("us"), (int, float)) and rc_b.get("us") > 0,
+             f"(us={rc_b.get('us') if rc_b else None})")
 
     print("\n== insight layer (LLM disabled by default) ==")
     res = generate_insights(m, cards, cap)

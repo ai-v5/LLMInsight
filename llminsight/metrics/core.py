@@ -17,6 +17,14 @@ def _f(x) -> float:
         return 0.0
 
 
+def _i(x) -> Optional[int]:
+    """Int from a possibly-blank cell. float(NaN) is a valid float (so _f lets it
+    through) but int(NaN) raises — a missing Step / Device_id should degrade to
+    None rather than blow up overview()."""
+    v = _f(x)
+    return int(v) if pd.notna(v) else None
+
+
 def _pct(x: float, total: float) -> float:
     return round(100.0 * x / total, 2) if total else 0.0
 
@@ -70,8 +78,8 @@ def overview(prof) -> Dict[str, Any]:
 
     return {
         "available": True,
-        "step": int(_f(r.get("Step"))),
-        "device_id": int(_f(r.get("Device_id"))),
+        "step": _i(r.get("Step")),
+        "device_id": _i(r.get("Device_id")),
         "us": {
             "computing": computing,
             "comm_not_overlapped": comm_no,
@@ -171,6 +179,11 @@ def communication(prof) -> Dict[str, Any]:
         t.pop("_wait_ratio_sum", None)
         for k in ("elapse_ms", "wait_ms", "sync_ms", "transit_ms", "transit_mb"):
             t[k] = round(t[k], 3)
+        # effective bus bandwidth = moved bytes / transit time (MB/ms ≡ GB/s). None
+        # when there is no real transit (single-card: all wait, transit≈0). This is
+        # the per-category 有效带宽 the user wants surfaced alongside each type.
+        t["bandwidth_gbps"] = (round(t["transit_mb"] / t["transit_ms"], 1)
+                               if t["transit_ms"] > 0 else None)
 
     total_elapse = sum(c["elapse_ms"] for c in comms)
     total_wait = sum(c["wait_ms"] for c in comms)
@@ -178,6 +191,12 @@ def communication(prof) -> Dict[str, Any]:
     total_transit_mb = sum(
         sum(l.get("transit_mb", 0) for l in c["links"].values()) for c in comms
     )
+    total_transit_ms = sum(c["transit_ms"] for c in comms)
+    overall_bandwidth_gbps = (round(total_transit_mb / total_transit_ms, 1)
+                              if total_transit_ms > 0 else None)
+
+    def _op_transit_mb(c):
+        return sum(l.get("transit_mb", 0) for l in c["links"].values())
 
     top = sorted(comms, key=lambda c: c["elapse_ms"], reverse=True)[:15]
     top_out = [
@@ -187,6 +206,10 @@ def communication(prof) -> Dict[str, Any]:
             "elapse_ms": round(c["elapse_ms"], 3),
             "wait_ms": round(c["wait_ms"], 3),
             "wait_ratio": round(c["wait_ratio"], 3),
+            "transit_mb": round(_op_transit_mb(c), 2),
+            # per-op 有效带宽 = transit bytes / transit time (None when transit≈0)
+            "bandwidth_gbps": (round(_op_transit_mb(c) / c["transit_ms"], 1)
+                               if c["transit_ms"] > 0 else None),
         }
         for c in top
     ]
@@ -194,6 +217,13 @@ def communication(prof) -> Dict[str, Any]:
     # msprof: device-level effective-transfer vs cross-rank-wait split (None on
     # torch_npu, whose communication.json already carries Transit/Wait per op).
     breakdown = ((getattr(prof, "meta", {}) or {}).get("msprof") or {}).get("comm_breakdown")
+
+    if total_transit_ms > 0:
+        note = ("有效带宽 = Σ Transit Size ÷ Σ Transit Time（每类/总体，MB/ms≡GB/s）；"
+                "Wait/Synchronization 为卡间等待，不计入带宽分母。")
+    else:
+        note = ("本采集 Transit≈0：集合通信几乎全为 Wait/Synchronization（多为单卡或全等待）→ "
+                "有效带宽 N/A；需多卡真实传输采集才能看链路带宽。")
 
     return {
         "available": True,
@@ -203,12 +233,12 @@ def communication(prof) -> Dict[str, Any]:
         "total_wait_ms": round(total_wait, 2),
         "overall_wait_pct": round(mean_wait_ratio * 100, 1),
         "total_transit_mb": round(total_transit_mb, 3),
+        "total_transit_ms": round(total_transit_ms, 3),
+        # overall 有效带宽 (None when transit≈0); per-category in by_type[].bandwidth_gbps
+        "overall_bandwidth_gbps": overall_bandwidth_gbps,
         "by_type": type_rows,
         "top": top_out,
-        "note": (
-            "单卡采集：集合通信几乎全部为 Wait/Synchronization，Transit≈0、带宽≈0 —— "
-            "通信时间以「等待对端」为主，需结合多卡数据才能看真实链路带宽。"
-        ),
+        "note": note,
     }
 
 
@@ -337,16 +367,28 @@ def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None) ->
     # 本次配置无此开销，不臆造（与「配置只来自 profiling、不依赖启动脚本」一致）。
     if recompute in ("full", "selective"):
         _rc_kind = "Full" if recompute == "full" else "Selective"
+        # Quantify the recompute time (computing × r_re from the FA ratio). domain=
+        # config + additive:False → a lens, NOT summed into device/host (it already
+        # lives inside Computing).
+        _computing = ov["us"]["computing"] if ov.get("available") else 0.0
+        _rc_ov = _recompute_overhead(_computing, cap_state.get("recompute"))
+        if _rc_ov:
+            _rc_detail = (
+                "profiling 反推重计算={g}（FA 前向/反向次数比）→ 反向重跑前向。"
+                "估算重算耗时 ≈ {us:,.0f}us（step 的 {pct}%，band {lo:,.0f}–{hi:,.0f}us）"
+                "= computing × {sh:.0%}；覆盖全部前向计算算子，非仅 FA。"
+            ).format(g=recompute, us=_rc_ov["us"], pct=_pct(_rc_ov["us"], stage),
+                     lo=_rc_ov["us_lo"], hi=_rc_ov["us_hi"], sh=_rc_ov["flops_share"])
+        else:
+            _rc_detail = (f"profiling 反推重计算={recompute}（FA 前向/反向次数比）→ 反向重跑前向；"
+                          "缺前向/反向计数，未能量化耗时。")
         buckets.append({
-            "key": "recompute", "domain": "config",
+            "key": "recompute", "domain": "config", "additive": False,
             "label": f"重计算开销 ({_rc_kind} Recompute)",
-            "us": None,
-            "detail": (
-                f"profiling 反推重计算={recompute}（由 FlashAttention 前向/反向次数比推断）→ 反向重跑前向。"
-                "本次采集未单独标注重计算耗时，估算见理论分析。"
-            ),
-            "source": "profiling 反推 (parser.derive)",
-            "suggestion": "评估「选择性重计算 / 减少重计算层」做显存↔耗时平衡。",
+            "us": _rc_ov["us"] if _rc_ov else None,
+            "detail": _rc_detail,
+            "source": "profiling 反推 (parser.derive) + 1:2:1 估算",
+            "suggestion": "评估「选择性重计算 / 减少重计算层」做显存↔耗时平衡；量化收益见 What-if 重计算项。",
         })
     device_total = sum(b["us"] for b in buckets
                        if b["domain"] == "device" and b.get("additive", True)
@@ -487,7 +529,7 @@ def _single_card(prof) -> bool:
 
 
 def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
-                      op_reclaim, step_mfu, blocking, single_card, flags):
+                      op_reclaim, step_mfu, blocking, single_card, flags, recompute=None):
     """Per-lever 「能否减到 0？不能则能减到多少」 analysis, derived from the LOADED
     profile's measured slices (never the static sample). Floors come from realistic
     ceilings applied to measured values; 失真 caveats are conditioned on this capture's
@@ -621,6 +663,36 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
             "caveats": [],
         })
 
+    # ---- ④ 重计算: turning recompute off removes the recomputed forward ENTIRELY.
+    # Disjoint from 算子余量 — the caller already carved the recomputed kernels' headroom
+    # out of op_reclaim (× (1−r_re)) — so it stacks into the combined like the others.
+    # Floor can reach 0 when memory allows full-off → recoverable = the whole recompute time.
+    if recompute and (recompute.get("us") or 0) > 0:
+        rc_us = min(float(recompute["us"]), computing)
+        rc_lo = min(float(recompute.get("us_lo") or rc_us), computing)   # conservative (smaller)
+        rc_hi = min(float(recompute.get("us_hi") or rc_us), computing)   # optimistic (larger)
+        levers.append({
+            "id": "recompute_off", "title": "重计算", "can_reach_zero": True,
+            "scenario": "关闭/减少重计算（反向不重跑前向）",
+            "measured_us": round(rc_us, 1), "measured_pct": _pct(rc_us, stage),
+            "floor_us": 0.0, "floor_pct": 0.0,
+            "recoverable_us": round(rc_us, 1), "recoverable_pct": _pct(rc_us, stage),
+            "recoverable_lo_us": round(rc_lo, 1), "recoverable_hi_us": round(rc_hi, 1),
+            "new_step_us": round(stage - rc_us, 1), "new_mfu": _mfu_at(stage - rc_us),
+            "floor_basis": "重算 = 反向重跑前向的额外计算（≈computing×{:.0%}，覆盖全部前向算子）；"
+                           "显存允许时可完全关闭 → 全部回收。".format(recompute.get("flops_share") or 0),
+            "methods": [
+                "显存有余量时减少/关闭重计算层（--recompute-num-layers↓ 或关 full）",
+                "选择性重计算（只重算激活大、计算省的算子）做显存↔吞吐平衡",
+                "配合 memory 采集确认显存 headroom 再调",
+            ],
+            "reasons": [
+                "重算是为省激活显存而多做的前向，非模型必需功 → 显存够则可全回收",
+                "回收上限 = 反向重跑前向的实测时间（HFU 与 MFU 之差的时间体现）",
+            ],
+            "caveats": ["关闭重计算抬高激活显存峰值，需先确认显存 headroom（见显存板块），否则 OOM。"],
+        })
+
     # ---- combined realistic floor (sum of disjoint recoverables) ----
     rec_total = sum(l["recoverable_us"] for l in levers)
     rec_total_lo = sum(l["recoverable_lo_us"] for l in levers)   # conservative
@@ -646,6 +718,57 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
 
 
 # --------------------------------------------------------------------------- #
+# Standard transformer FLOPs split: forward F, backward ≈ 2F (input-grad + weight-
+# grad). Full activation recompute reruns the forward before the backward (+F). The
+# measured FlashAttention fwd/grad ratio gives ρ=(fwd-grad)/fwd — HOW MUCH forward is
+# recomputed (full→0.5, off→0, selective between). Recomputed FLOPs as a fraction of
+# EXECUTED FLOPs: r_re = 2ρ/(1+R+2ρ), R=bwd/fwd. R=2 (textbook) with full ρ=0.5 → 1/4,
+# i.e. the classic 1:2:1 fwd:bwd:recompute split. Band over R∈[2,2.5].
+_RECOMPUTE_BWD_FWD = 2.0
+_RECOMPUTE_BWD_FWD_BAND = (2.0, 2.5)
+
+
+def _recompute_overhead(computing: float,
+                        recompute_fact: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Time the backward spends RE-running the forward (activation recompute), in μs,
+    estimated from the measured FA fwd/grad ratio applied to the WHOLE compute slice
+    (every recomputed forward op, not just FA). None when recompute is off/unknown."""
+    rf = recompute_fact or {}
+    gran = rf.get("value")
+    if gran not in ("full", "selective") or not computing or computing <= 0:
+        return None
+    fa_fwd = rf.get("fa_fwd")
+    fa_grad = rf.get("fa_grad")
+    ratio = rf.get("fwd_grad_ratio")
+    if fa_fwd and fa_grad is not None and fa_fwd > 0:
+        rho = max(0.0, (fa_fwd - fa_grad) / fa_fwd)          # measured recompute share
+    elif ratio and ratio > 0:
+        rho = max(0.0, (ratio - 1.0) / ratio)                # (fwd-grad)/fwd from the ratio
+    else:
+        rho = 0.5 if gran == "full" else 0.25                # fallback when raw counts absent
+    if rho <= 0:
+        return None
+
+    def _share(R: float) -> float:                           # recomputed FLOPs / executed FLOPs
+        return (2.0 * rho) / (1.0 + R + 2.0 * rho)
+    r_re = _share(_RECOMPUTE_BWD_FWD)
+    r_lo = _share(_RECOMPUTE_BWD_FWD_BAND[1])                 # larger R → smaller share (conservative)
+    r_hi = _share(_RECOMPUTE_BWD_FWD_BAND[0])                 # smaller R → larger share (optimistic)
+    return {
+        "us": round(computing * r_re, 1),
+        "us_lo": round(computing * r_lo, 1),
+        "us_hi": round(computing * r_hi, 1),
+        "flops_share": round(r_re, 4),                       # also = (HFU − MFU)/HFU
+        "rho": round(rho, 4),
+        "granularity": gran,
+        "basis": ("重算开销 = computing × r_re；r_re = 2ρ/(1+R+2ρ)，"
+                  "ρ={rho:.2f}（FA 实测前向重算占比），R=反向/前向 FLOPs≈2（band 2–2.5）。"
+                  "full(ρ≈0.5) → r_re≈¼（前向:反向:重算≈1:2:1）；覆盖全部前向计算算子，非仅 FA。"
+                  ).format(rho=rho),
+    }
+
+
+# --------------------------------------------------------------------------- #
 def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
                 capture: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not ov.get("available"):
@@ -655,6 +778,15 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
     computing = u["computing"]
     comm_no = u["comm_not_overlapped"]
     free = u["free"]
+
+    # Recompute overhead (full activation recompute re-runs the forward before backward),
+    # quantified from the FA fwd/grad ratio. r_re = recomputed-FLOPs share of executed
+    # FLOPs. Used to (a) strip HFU→MFU and (b) add the 重计算 optimization lever, with
+    # 算子余量 carved down by (1−r_re) so the two stay disjoint in the combined.
+    rc_state = ((capture or {}).get("capture", {}) or {}).get("recompute")
+    rc_ov = _recompute_overhead(computing, rc_state)
+    r_re = rc_ov["flops_share"] if rc_ov else 0.0
+    recompute_us = min(rc_ov["us"], computing) if rc_ov else 0.0
 
     # Atomic optimization levers (not preset combos): 未掩盖通信 and Free are the two
     # disjoint, independently-removable slices of Stage. Each row reports the gain of
@@ -685,7 +817,11 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
     # Kernels already at/above their ceiling are excluded (no further tuning), so the
     # gain is the honest ceiling-relative headroom, not a naive "everything→100%".
     oco = eff.get("op_ceiling_opt") if eff.get("available") else None
-    op_reclaim = min(float((oco or {}).get("total_reclaim_us") or 0.0), computing)
+    op_reclaim_full = min(float((oco or {}).get("total_reclaim_us") or 0.0), computing)
+    # carve the recomputed kernels' ceiling headroom out of 算子余量 so it is disjoint
+    # from the 重计算 lever (which removes those kernels wholesale). op_reclaim_full still
+    # feeds the matmul compute-bound footnote below.
+    op_reclaim = op_reclaim_full * (1.0 - r_re)
     if oco and op_reclaim > 0:
         cl = oco.get("ceilings") or {}
         def _ceil_pct(x):
@@ -696,22 +832,44 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
             "new_step_us": round(stage - op_reclaim, 1),
             "save_us": round(op_reclaim, 1),
             "save_pct": _pct(op_reclaim, stage),
-            "basis": "将 matmul/FA/FAG 优化到各自 MFU 天花板（matmul {m}% / FA {a}% / FAG {g}%）；"
-                     "已达天花板的 {n} 个算子不再优化。".format(
-                         m=_ceil_pct(cl.get("matmul")), a=_ceil_pct(cl.get("attention")),
-                         g=_ceil_pct(cl.get("attention_grad")), n=oco.get("n_capped", 0)),
+            "basis": ("将 matmul/FA/FAG 优化到各自 MFU 天花板（matmul {m}% / FA {a}% / FAG {g}%）；"
+                      "已达天花板的 {n} 个算子不再优化。".format(
+                          m=_ceil_pct(cl.get("matmul")), a=_ceil_pct(cl.get("attention")),
+                          g=_ceil_pct(cl.get("attention_grad")), n=oco.get("n_capped", 0))
+                     + ("（已扣除重算算子余量，与「重计算」项不重叠）" if r_re > 0 else "")),
+        })
+
+    # 重计算: full/selective recompute re-runs the forward; turning it off removes that
+    # whole time. Disjoint from 算子余量 (carved out above), so it joins the combined.
+    if recompute_us > 0:
+        whatif.append({
+            "id": "recompute_off",
+            "scenario": "关闭/减少重计算（反向不再重跑前向，需显存余量）",
+            "new_step_us": round(stage - recompute_us, 1),
+            "save_us": round(recompute_us, 1),
+            "save_pct": _pct(recompute_us, stage),
+            "basis": rc_ov["basis"],
         })
 
     # End-to-end (step) MFU + the MFU each what-if would unlock. Useful FLOPs and
     # the silicon peak are constant, so end-to-end MFU scales inversely with step
     # time: new_mfu = step_mfu × (stage / new_step). A shorter step ⇒ higher MFU,
     # which is exactly the payoff of hiding comm / removing bubbles.
-    step_mfu = None
+    hfu = None
     if eff.get("available"):
         useful_flops = eff.get("useful_flops_total")
         peak_tflops = (eff.get("chip") or {}).get("effective_peak_tflops")
         if useful_flops and peak_tflops and stage > 0:
-            step_mfu = useful_flops / (peak_tflops * 1e12 * (stage * 1e-6))
+            # executed-FLOPs step rate = HFU — it counts the forward FLOPs the
+            # backward RE-RAN under activation recompute (hardware utilization).
+            hfu = useful_flops / (peak_tflops * 1e12 * (stage * 1e-6))
+    # Strip recompute to get the textbook (model) MFU: recomputed forward FLOPs are
+    # hardware work, not model work. MFU = HFU × (1 − r_re). step_mfu (the headline) is
+    # now the MODEL MFU; step_hfu carries the executed-FLOPs figure. (rc_ov / r_re were
+    # computed at the top so the levers above could use them.)
+    step_mfu = (hfu * (1.0 - r_re)) if hfu is not None else None
+    # Time-only levers (comm/free/op) keep useful FLOPs fixed, so post-opt MFU scales
+    # as mfu × stage/new_step — the same factor for MFU or HFU.
     for w in whatif:
         w["new_mfu"] = (round(step_mfu * stage / w["new_step_us"], 4)
                         if (step_mfu and w.get("new_step_us")) else None)
@@ -719,7 +877,7 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
     # Combined what-if: every lever enabled at once. Since the levers are disjoint
     # slices of Stage their savings add, and the floor is pure Computing. This is the
     # true upper bound and the default for the UI's "已启用组合" row (all ticked).
-    combined_save_us = comm_no + free + op_reclaim
+    combined_save_us = comm_no + free + op_reclaim + recompute_us
     combined_step_us = max(stage - combined_save_us, 0.0)
     whatif_combined = {
         "save_us": round(combined_save_us, 1),
@@ -727,7 +885,8 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         "new_step_us": round(combined_step_us, 1),
         "new_mfu": (round(step_mfu * stage / combined_step_us, 4)
                     if (step_mfu and combined_step_us > 0) else None),
-        "basis": "全部优化项叠加（通信掩盖 / 空泡 / 算子极致优化互不重叠，收益可加）。",
+        "basis": ("全部优化项叠加（通信掩盖 / 空泡 / 算子极致优化"
+                  + ("/ 关闭重计算" if recompute_us > 0 else "") + "互不重叠，收益可加）。"),
     }
 
     matmul_mfu = eff.get("matmul_mfu") if eff.get("available") else None
@@ -752,8 +911,8 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
             compute_bound_note = {
                 "matmul_mfu_pct": round(matmul_mfu * 100, 2),
                 "peak_underestimated": False,
-                "ideal_matmul_us": round(computing - op_reclaim, 1),
-                "headroom_us": round(op_reclaim, 1),
+                "ideal_matmul_us": round(computing - op_reclaim_full, 1),
+                "headroom_us": round(op_reclaim_full, 1),
                 "ceiling_based": True,
                 "calibrated": bool(chipinfo.get("calibrated")),
                 "assumed_peak_tflops": chipinfo.get("peak_bf16_tflops"),
@@ -774,7 +933,35 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
     realistic = _whatif_realistic(
         stage, computing, comm_no, free,
         u.get("communication", 0.0) or 0.0, u.get("overlapped", 0.0) or 0.0,
-        op_reclaim, step_mfu, blocking, single_card, cap.get("flags"))
+        op_reclaim, step_mfu, blocking, single_card, cap.get("flags"), recompute=rc_ov)
+
+    # Recompute summary (for the rule card + the MFU/HFU foot). The optimization itself
+    # is now a first-class lever inside whatif / realistic.levers (id=recompute_off),
+    # counted in the combined; 算子余量 was carved by (1−r_re) to keep them disjoint.
+    recompute = None
+    if rc_ov:
+        rc_save = recompute_us
+        _new_step = max(stage - rc_save, 1.0)
+        recompute = {
+            "id": "recompute_off",
+            "granularity": rc_ov["granularity"],
+            "scenario": "关闭/减少重计算（反向不再重跑前向）",
+            "overhead_us": rc_ov["us"],
+            "overhead_us_lo": rc_ov["us_lo"],
+            "overhead_us_hi": rc_ov["us_hi"],
+            "overhead_pct": _pct(rc_ov["us"], stage),
+            "rho": rc_ov["rho"],
+            "flops_share": rc_ov["flops_share"],
+            "save_us": round(rc_save, 1),
+            "save_pct": _pct(rc_save, stage),
+            "new_step_us": round(_new_step, 1),
+            "new_mfu": (round(step_mfu * stage / _new_step, 4) if step_mfu else None),
+            "hfu": round(hfu, 4) if hfu else None,
+            "mfu": round(step_mfu, 4) if step_mfu else None,
+            "basis": rc_ov["basis"],
+            "note": "已作为「重计算」项纳入 What-if 优化组合（与算子余量 disjoint：算子余量已扣除重算算子余量）；"
+                    "关闭需显存有余量（见显存板块）。",
+        }
 
     return {
         "available": True,
@@ -783,6 +970,10 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         "whatif_combined": whatif_combined,
         "realistic": realistic,
         "compute_bound": compute_bound_note,
+        # step_mfu = MODEL MFU (recompute stripped); step_hfu = executed-FLOPs (HFU).
         "step_mfu": round(step_mfu, 4) if step_mfu else None,
-        "note": "What-if 为基于 step 时间构成的上界估算，用于优化排序，非精确预测。芯片峰值为假设值。",
+        "step_hfu": round(hfu, 4) if hfu else None,
+        "recompute": recompute,
+        "note": "端到端 MFU=模型理论FLOPs/(峰值×step)（不含重计算）；HFU 含重计算重复执行的 FLOPs，"
+                "HFU≥MFU、差值即重计算开销。What-if 为基于 step 时间构成的上界估算，用于优化排序，芯片峰值为假设值。",
     }

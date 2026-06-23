@@ -33,12 +33,20 @@ export PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONIOENCODING="utf-8"
 
 # --- pick a python interpreter ---------------------------------------------
-if command -v python3 >/dev/null 2>&1; then
+# Prefer the project-local virtualenv (.venv) so the server runs with the repo's
+# pinned deps without the caller having to "activate" first; fall back to any
+# python3/python on PATH. Handles both the POSIX (.venv/bin) and Windows
+# (.venv/Scripts) venv layouts so the same repo works under bash on either OS.
+if [[ -x "$REPO_DIR/.venv/bin/python" ]]; then
+    PYTHON="$REPO_DIR/.venv/bin/python"
+elif [[ -x "$REPO_DIR/.venv/Scripts/python.exe" ]]; then
+    PYTHON="$REPO_DIR/.venv/Scripts/python.exe"
+elif command -v python3 >/dev/null 2>&1; then
     PYTHON="python3"
 elif command -v python >/dev/null 2>&1; then
     PYTHON="python"
 else
-    echo "[restart_insight] ERROR: no python3/python on PATH" >&2
+    echo "[restart_insight] ERROR: no .venv and no python3/python on PATH. Create the venv:  python3 -m venv .venv  then  .venv/bin/python -m pip install -r requirements.txt" >&2
     exit 1
 fi
 

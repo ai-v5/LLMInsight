@@ -4,4 +4,4 @@ Single-card-deep first; the data model is indexed by (rank, step) with the rank
 dimension reserved for future multi-card support.
 """
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"

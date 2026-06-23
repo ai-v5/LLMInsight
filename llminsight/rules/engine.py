@@ -235,16 +235,37 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
         ))
 
     # 7. recompute ----------------------------------------------------------
-    rg = capture.get("flags", {}).get("recompute-granularity")
-    if rg == "full":
+    # Triggered from the PROFILING-DERIVED granularity (full|selective), not a launch
+    # flag — so selective captures fire too. The quantified overhead / MFU gain comes
+    # from theoretical.recompute (computing × r_re).
+    rc = _cstate("recompute")                                  # full | selective | off | None
+    rco = theo.get("recompute") or {}
+    if rc in ("full", "selective"):
+        _mp = lambda x: (f"{x * 100:.1f}%" if isinstance(x, (int, float)) else "—")
+        _rk = "全量" if rc == "full" else "选择性"
+        if rco.get("overhead_us"):
+            root = ("为省激活显存，反向重跑前向，额外计算 ≈ {us:,.0f}us（step 的 {pct}%，"
+                    "band {lo:,.0f}–{hi:,.0f}us，覆盖全部前向算子）。这是硬件多做的功，"
+                    "拉低 MFU：HFU {hfu} vs MFU {mfu}。").format(
+                        us=rco["overhead_us"], pct=rco.get("overhead_pct"),
+                        lo=rco.get("overhead_us_lo"), hi=rco.get("overhead_us_hi"),
+                        hfu=_mp(rco.get("hfu")), mfu=_mp(rco.get("mfu")))
+            gain = "关闭重计算可省 ≈ {us:,.0f}us → 端到端 MFU {m0}→{m1}（需显存余量）。".format(
+                        us=rco["save_us"], m0=_mp(rco.get("mfu")), m1=_mp(rco.get("new_mfu")))
+            sev = "medium"
+        else:
+            root = "为省激活显存，反向阶段重跑前向，增加计算耗时；本次缺前向/反向计数，未能量化。"
+            gain = "选择性重计算通常可回收部分前向重算时间（需显存余量）。"
+            sev = "low"
         cards.append(_card(
-            "recompute_full", "low", "显存-时间",
-            "全量重计算开启：--recompute-granularity full（反向重跑前向）",
-            "为省激活显存，反向阶段重跑前向，增加计算耗时；本次采集未单列重计算耗时。",
+            "recompute_full", sev, "显存-时间",
+            f"{_rk}重计算开启（profiling 反推 recompute={rc}，反向重跑前向）",
+            root,
             "若显存不紧张，改用选择性重计算 / 减少重计算层，换取吞吐；配合显存采集量化收益。",
-            "选择性重计算通常可回收部分前向重算时间（需显存余量）。",
+            gain,
             0.6,
-            {"recompute_granularity": rg, "recompute_num_layers": capture.get("flags", {}).get("recompute-num-layers")},
+            {"recompute": rc, "overhead_us": rco.get("overhead_us"),
+             "hfu": rco.get("hfu"), "mfu": rco.get("mfu"), "new_mfu": rco.get("new_mfu")},
         ))
 
     # 9. theoretical bound + what-if ---------------------------------------

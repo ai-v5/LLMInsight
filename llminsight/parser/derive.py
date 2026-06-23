@@ -293,7 +293,10 @@ def derive_capture(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
 
     # --- recompute granularity, from FlashAttention fwd/grad count ----------
     # Forward attention runs once per layer; full recompute reruns it in the
-    # backward, so fwd≈2×grad. recompute off → fwd≈grad.
+    # backward, so fwd≈2×grad. recompute off → fwd≈grad. The ratio also quantifies
+    # HOW MUCH forward is recomputed — ρ=(fwd-grad)/fwd (full→0.5, off→0, selective
+    # between) — so we carry the raw counts downstream for the recompute-overhead
+    # estimate in metrics (see core._recompute_overhead).
     fa_grad = _count_named(kd, "FlashAttentionScoreGrad")
     fa_all = _count_named(kd, "FlashAttentionScore")
     fa_fwd = fa_all - fa_grad
@@ -305,8 +308,13 @@ def derive_capture(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
             val, conf = "off", "high"
         else:
             val, conf = "selective", "medium"
-        out["recompute"] = _fact(
+        fact = _fact(
             val, f"FlashAttention 前向/反向次数比 = {r:.2f}（fwd {fa_fwd} / grad {fa_grad}）", conf)
+        # raw signals for the recompute-overhead quantifier (ρ = (fwd-grad)/fwd)
+        fact["fwd_grad_ratio"] = round(float(r), 4)
+        fact["fa_fwd"] = int(fa_fwd)
+        fact["fa_grad"] = int(fa_grad)
+        out["recompute"] = fact
     else:
         out["recompute"] = _fact(None, "无 FlashAttentionScoreGrad，无法判定", "unknown")
 

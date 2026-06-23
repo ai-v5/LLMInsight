@@ -15,13 +15,16 @@
     const [ov, theo] = await Promise.all([api("/api/overview"), api("/api/theoretical")]);
     if (!ov.available) { root.innerHTML = `<div class="empty">无 step_trace 数据</div>`; return; }
     const r = ov.ratios, u = ov.us;
-    const smfu = theo.available ? theo.step_mfu : null;  // end-to-end (step) MFU, 0–1
+    const smfu = theo.available ? theo.step_mfu : null;  // model MFU (recompute stripped), 0–1
+    const hfu = theo.available ? theo.step_hfu : null;   // hardware FLOPs util (incl. recompute)
+    const rco = theo.available ? (theo.recompute || null) : null;  // recompute what-if lever
+    const mfuFoot = (rco && hfu != null) ? `模型MFU · HFU ${fmt.mfu(hfu)}（含重算）` : "有效FLOPs /(峰值×step)";
     const cards = [
       metric("有效计算占比", fmt.pct(r.effective_compute_pct), { tone: r.effective_compute_pct >= 60 ? "good" : "warn", foot: "Computing / Stage", barPct: r.effective_compute_pct }),
       metric("未掩盖通信", fmt.pct(r.comm_not_overlapped_pct), { tone: "bad", foot: fmt.us(u.comm_not_overlapped), barPct: r.comm_not_overlapped_pct }),
       metric("空闲 Free", fmt.pct(r.free_pct), { tone: "warn", foot: fmt.us(u.free), barPct: r.free_pct }),
       metric("通信掩盖率", fmt.pct(r.overlap_rate_pct), { tone: r.overlap_rate_pct < 40 ? "bad" : "good", foot: "Overlapped / Communication", barPct: r.overlap_rate_pct }),
-      metric("端到端 MFU", fmt.mfu(smfu), { tone: smfu == null ? undefined : (smfu >= 0.5 ? "good" : smfu >= 0.3 ? "warn" : "bad"), foot: "有效FLOPs /(峰值×step)", barPct: smfu != null ? smfu * 100 : undefined }),
+      metric("端到端 MFU", fmt.mfu(smfu), { tone: smfu == null ? undefined : (smfu >= 0.5 ? "good" : smfu >= 0.3 ? "warn" : "bad"), foot: mfuFoot, barPct: smfu != null ? smfu * 100 : undefined }),
       metric("Step 时间", r.step_time_s + " s", { foot: "Stage = " + fmt.us(u.stage) }),
     ];
     // Upper table renders the REALISTIC floor (业界可达上限), not the physical →0 bound:
@@ -296,10 +299,11 @@
   V.communication = async function (root) {
     const cm = await api("/api/communication");
     if (!cm.available) { root.innerHTML = `<div class="empty">无 communication.json 数据</div>`; return; }
+    const bw = v => (v == null ? '<span style="color:var(--text-dim)">—</span>' : v.toFixed(1) + " GB/s");
     const rows = cm.by_type.map(t =>
-      `<tr><td>${esc(t.type)}</td><td>${fmt.int(t.count)}</td><td>${fmt.ms(t.elapse_ms)}</td><td>${fmt.ms(t.wait_ms)}</td><td>${fmt.pct(t.wait_pct)}</td><td>${fmt.ms(t.transit_ms)}</td><td>${t.transit_mb.toFixed(1)} MB</td></tr>`).join("");
+      `<tr><td>${esc(t.type)}</td><td>${fmt.int(t.count)}</td><td>${fmt.ms(t.elapse_ms)}</td><td>${fmt.ms(t.wait_ms)}</td><td>${fmt.pct(t.wait_pct)}</td><td>${fmt.ms(t.transit_ms)}</td><td>${t.transit_mb.toFixed(1)} MB</td><td>${bw(t.bandwidth_gbps)}</td></tr>`).join("");
     const topRows = cm.top.slice(0, 12).map(t =>
-      `<tr><td class="mono">${esc(t.name)}</td><td>${esc(t.type)}</td><td>${fmt.ms(t.elapse_ms)}</td><td>${fmt.pct(t.wait_ratio * 100)}</td></tr>`).join("");
+      `<tr><td class="mono">${esc(t.name)}</td><td>${esc(t.type)}</td><td>${fmt.ms(t.elapse_ms)}</td><td>${fmt.pct(t.wait_ratio * 100)}</td><td>${bw(t.bandwidth_gbps)}</td></tr>`).join("");
     // msprof: effective-transfer vs cross-rank-wait split (device HCCL sub-tasks)
     const bd = cm.breakdown;
     const bdHtml = bd ? `
@@ -313,7 +317,7 @@
         ${metric("集合通信次数", fmt.int(cm.count))}
         ${metric("总 Elapse", fmt.ms(cm.total_elapse_ms), { foot: "wall-clock" })}
         ${metric("平均等待占比", fmt.pct(cm.overall_wait_pct), { tone: "bad", barPct: cm.overall_wait_pct })}
-        ${metric("总 Transit", cm.total_transit_mb.toFixed(1) + " MB", { foot: "单卡≈0" })}
+        ${metric("有效带宽", cm.overall_bandwidth_gbps != null ? cm.overall_bandwidth_gbps + " GB/s" : "—", { foot: cm.overall_bandwidth_gbps != null ? "Σ Transit ÷ Σ Transit Time" : "Transit≈0（单卡/全等待）", tone: cm.overall_bandwidth_gbps != null ? "good" : undefined })}
       </div>
       ${bdHtml}
       ${banner("info", "ℹ️", esc(cm.note))}
@@ -322,8 +326,8 @@
         ${panel("按类型等待占比", "Wait / Elapse（每 op 均值）", `<div id="cm-wait" class="chart"></div>`)}
       </div>
       <div class="grid cols-2">
-        ${panel("类型聚合明细", "", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>Count</th><th>Elapse</th><th>Wait</th><th>Wait%</th><th>Transit</th><th>流量</th></tr></thead><tbody>${rows}</tbody></table></div>`)}
-        ${panel("Top 集合通信 (Elapse)", "", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Type</th><th>Elapse</th><th>Wait%</th></tr></thead><tbody>${topRows}</tbody></table></div>`)}
+        ${panel("类型聚合明细", "有效带宽 = Transit Size ÷ Transit Time（单卡/全等待时 Transit≈0 → —）", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>Count</th><th>Elapse</th><th>Wait</th><th>Wait%</th><th>Transit</th><th>流量</th><th>有效带宽</th></tr></thead><tbody>${rows}</tbody></table></div>`)}
+        ${panel("Top 集合通信 (Elapse)", "", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Type</th><th>Elapse</th><th>Wait%</th><th>有效带宽</th></tr></thead><tbody>${topRows}</tbody></table></div>`)}
       </div>`;
     charts([
       { id: "cm-bar", option: hbar(cm.by_type.map(t => t.type), cm.by_type.map(t => t.elapse_ms), "ms", { fmt: v => fmt.ms(v) }) },
@@ -772,22 +776,24 @@
           axisLine: { show: false }, axisTick: { show: false },
           axisLabel: { show: false }, splitLine: { show: false },
         }));
-        // visible area line (silent: lets the full-height catcher own the hover).
-        // smooth:false — utilization is a per-bin step quantity; splining it rounds
-        // off the real sawtooth bursts and can dip below the true value between peaks.
+        // STRICT per-bin bars (one rectangle per bin, height = utilization%) — NOT an
+        // area line. Each bar spans exactly [k,k+1]·binMs (bin-center x + 100% width),
+        // so every utilization bar aligns 1:1 with the time axis and the operator Gantt
+        // below; no spline / interpolation between bins (most accurate per-bin reading).
         series.push({
-          name: L.label, type: "line", xAxisIndex: i, yAxisIndex: i, silent: true,
-          showSymbol: false, smooth: false, lineStyle: { width: 1.4, color: L.color },
-          itemStyle: { color: L.color }, areaStyle: { opacity: .18, color: L.color },
-          data: L.series.map((v, k) => [+(k * binMs).toFixed(2), +(v * 100).toFixed(1)]),
+          name: L.label, type: "bar", xAxisIndex: i, yAxisIndex: i, silent: true,
+          barWidth: "100%", barGap: "-100%", z: 2,
+          itemStyle: { color: L.color, opacity: .85 },
+          data: L.series.map((v, k) => [+((k + 0.5) * binMs).toFixed(3), +(v * 100).toFixed(1)]),
         });
         // invisible full-lane-height bars: catch hovers anywhere in the lane (not just
-        // on the thin line) and carry the % + absolute value for the tooltip
+        // on a short bar) and carry the % + absolute value for the tooltip. Overlaid on
+        // the visible bars (same x, barGap -100%).
         series.push({
           name: L.label, type: "bar", xAxisIndex: i, yAxisIndex: i, barWidth: "100%",
-          itemStyle: { opacity: 0 }, emphasis: { disabled: true }, z: 1,
+          barGap: "-100%", itemStyle: { opacity: 0 }, emphasis: { disabled: true }, z: 1,
           data: L.series.map((v, k) => ({
-            value: [+(k * binMs).toFixed(2), 100],
+            value: [+((k + 0.5) * binMs).toFixed(3), 100],
             pct: +(v * 100).toFixed(1), abs: (L.abs || [])[k],
           })),
         });
