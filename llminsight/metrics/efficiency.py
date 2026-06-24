@@ -386,7 +386,9 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         achieved_flops = (flops / d_s) if flops else None
         achieved_bw = (b_bytes / d_s) if b_bytes else 0.0
         mfu = (achieved_flops / peak_flops) if achieved_flops else None
-        mbu = (achieved_bw / chip.hbm_bandwidth) if achieved_bw else None
+        mbu_raw = (achieved_bw / chip.hbm_bandwidth) if achieved_bw else None
+        mbu = min(mbu_raw, 1.0) if mbu_raw is not None else None
+        mbu_over_physical = bool(mbu_raw is not None and mbu_raw > 1.02)
 
         # We can only credibly model "ideal time" (and thus wasted time) when we
         # have a FLOP estimate (matmul / fused attention) OR the kernel is a
@@ -442,6 +444,8 @@ def compute_efficiency(prof) -> Dict[str, Any]:
                 "peak_flops": peak_flops,
                 "mfu": mfu,
                 "mbu": mbu,
+                "mbu_raw": mbu_raw,
+                "mbu_over_physical": mbu_over_physical,
                 "efficiency": efficiency,
                 "wasted_us": wasted_us,
                 "reclaim_us": reclaim_us,
@@ -503,7 +507,8 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     for t in by_type.values():
         d_s = t["dur_us"] * 1e-6
         mfu = (t["flops"] / t["peak_time"]) if t["peak_time"] else None
-        mbu = (t["bytes"] / d_s / SETTINGS.chip.hbm_bandwidth) if (d_s and t["bytes"]) else None
+        mbu_raw = (t["bytes"] / d_s / SETTINGS.chip.hbm_bandwidth) if (d_s and t["bytes"]) else None
+        mbu = min(mbu_raw, 1.0) if mbu_raw is not None else None
         dom_dtype = max(t["dt_dur"].items(), key=lambda kv: kv[1])[0] if t["dt_dur"] else None
         type_rows.append(
             {
@@ -513,6 +518,8 @@ def compute_efficiency(prof) -> Dict[str, Any]:
                 "dtype": dom_dtype,
                 "mfu": round(mfu, 4) if mfu is not None else None,
                 "mbu": round(mbu, 4) if mbu is not None else None,
+                "mbu_raw": round(mbu_raw, 4) if mbu_raw is not None else None,
+                "mbu_over_physical": bool(mbu_raw is not None and mbu_raw > 1.02),
                 "wasted_us": round(t["wasted_us"], 1),
                 "reclaim_us": round(t["reclaim_us"], 1),
             }
@@ -563,7 +570,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         cap = r.get("ceiling") or 1.0
         r["mfu_after"] = min(r["mfu"] * scale, cap) if r.get("mfu") else None
         r["mbu_after"] = min(r["mbu"] * scale, 1.0) if r.get("mbu") else None
-        for k in ("flops", "bytes", "mfu", "mbu", "ai", "achieved_tflops",
+        for k in ("flops", "bytes", "mfu", "mbu", "mbu_raw", "ai", "achieved_tflops",
                   "mfu_after", "mbu_after", "reclaim_us", "wasted_us"):
             if isinstance(r.get(k), float):
                 r[k] = round(r[k], 4) if r[k] and r[k] < 1 else (round(r[k], 1) if r[k] else r[k])

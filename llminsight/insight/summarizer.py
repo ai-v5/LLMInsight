@@ -99,17 +99,27 @@ def build_summary(m: Dict[str, Any],
             "kernels_with_flops": eff.get("kernels_with_flops"),
             "top_optimization": [
                 {"name": r["name"][:40], "bound": r["bound"], "wasted_us": r["wasted_us"],
-                 "dur_us": r["dur_us"], "mfu": r.get("mfu"), "mbu": r.get("mbu")}
+                 "dur_us": r["dur_us"], "mfu": r.get("mfu"), "mbu": r.get("mbu"),
+                 "mbu_raw": r.get("mbu_raw"),
+                 "mbu_over_physical": r.get("mbu_over_physical")}
                 for r in eff.get("top_optimization", [])[:6]
             ],
         } if eff.get("available") else None,
         "communication": {
             "count": comm.get("count"),
             "total_elapse_ms": comm.get("total_elapse_ms"),
+            "total_wait_ms": comm.get("total_wait_ms"),
             "overall_wait_pct": comm.get("overall_wait_pct"),
+            "total_transit_mb": comm.get("total_transit_mb"),
+            "total_transit_ms": comm.get("total_transit_ms"),
+            "overall_bandwidth_gbps_without_wait": comm.get("overall_bandwidth_gbps"),
+            "overall_bandwidth_gbps_with_wait": comm.get("overall_bandwidth_with_wait_gbps"),
+            "device_task_breakdown": comm.get("breakdown"),
             "by_type": [
                 {"type": t["type"], "count": t["count"], "elapse_ms": t["elapse_ms"],
-                 "wait_pct": t["wait_pct"]}
+                 "wait_pct": t["wait_pct"],
+                 "bandwidth_gbps_without_wait": t.get("bandwidth_gbps"),
+                 "bandwidth_gbps_with_wait": t.get("bandwidth_with_wait_gbps")}
                 for t in comm.get("by_type", [])
             ],
         } if comm.get("available") else None,
@@ -129,6 +139,7 @@ def build_summary(m: Dict[str, Any],
         "theoretical": {
             "current_step_us": theo.get("current_step_us"),
             "whatif": theo.get("whatif"),
+            "whatif_combined": theo.get("whatif_combined"),
             "compute_bound": theo.get("compute_bound"),
         } if theo.get("available") else None,
         "rule_cards": [
