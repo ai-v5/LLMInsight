@@ -25,26 +25,35 @@ MATMUL_TYPES = {
 
 # Fused attention kernels are matmul-dominated (QK^T + softmax·V on the cube), so
 # their useful FLOPs should count toward MFU even though the op isn't a plain GEMM.
+LIGHTNING_INDEXER_FWD_TYPES = {"LightningIndexer", "SparseLightningIndexer"}
+LIGHTNING_INDEXER_KL_GRAD_TYPES = {
+    "SparseLightningIndexerGradKLLoss",
+    "SparseLightningIndexerKllossGrad",
+}
+DSA_INDEXER_TYPES = LIGHTNING_INDEXER_FWD_TYPES | LIGHTNING_INDEXER_KL_GRAD_TYPES
+
 ATTENTION_FWD_TYPES = {
     "FlashAttentionScore", "PromptFlashAttention",
     "FusedInferAttentionScore", "IncreFlashAttention",
     # DeepSeek-V3.2 sparse attention (DSA): sparse Flash-MLA, shared-KV sparse
     # attention, and the lightning indexer. Routed to the cube peak + attention
     # lane so they're not misfiled as generic compute / left out of attribution.
-    "SparseFlashMla", "SparseAttnSharedkv", "SparseLightningIndexer",
+    "SparseFlashMla", "SparseAttnSharedkv",
     # Generic sparse attention used by current MindSpeed/GLM profiles.  Its
     # token-wise causal useful Cube FLOPs are modeled only when the recorded
     # shapes prove the supported 950DT schema; all other layouts fail closed.
     "SparseFlashAttention",
-}
+} | LIGHTNING_INDEXER_FWD_TYPES
 ATTENTION_GRAD_TYPES = {
     "FlashAttentionScoreGrad",
     "SparseFlashMlaGrad", "SparseLightningIndexerGrad",
-    "SparseLightningIndexerKllossGrad",
     "SparseFlashAttentionGrad",
-}
+} | LIGHTNING_INDEXER_KL_GRAD_TYPES
 ATTENTION_TYPES = ATTENTION_FWD_TYPES | ATTENTION_GRAD_TYPES
 SPARSE_ATTENTION_TYPES = {"SparseFlashAttention", "SparseFlashAttentionGrad"}
+# These fused kernels perform repeated sparse gather/scatter work that cannot be
+# reconstructed from the one-time input/output tensor footprint in profiler CSV.
+SPARSE_DISCRETE_TRAFFIC_TYPES = SPARSE_ATTENTION_TYPES | DSA_INDEXER_TYPES
 # DeepSeek-V3 attention is causal: FlashAttention skips the masked (upper-triangle)
 # blocks, so it does ~half the dense QK^T+PV work. Without this 0.5 the achieved
 # rate would exceed silicon peak — i.e. the factor is physically required, not a
@@ -146,6 +155,15 @@ def _estimate_matmul_flops(
     return 2.0 * M * N * K * batch
 
 
+def _right_down_causal_pairs(sq: int, sk: int, limit: Optional[int] = None) -> int:
+    """Valid token pairs for right-down causal attention, optionally capped per row."""
+    total = 0
+    for q_idx in range(sq):
+        causal_prefix = max(0, min(sk, sk - sq + q_idx + 1))
+        total += min(limit, causal_prefix) if limit is not None else causal_prefix
+    return total
+
+
 def _estimate_sparse_flash_attention_flops(
     shapes_in: List[List[int]], shapes_out: List[List[int]], is_grad: bool,
     sparse_mode: Optional[int] = None, sparse_block_size: Optional[int] = None,
@@ -212,15 +230,93 @@ def _estimate_sparse_flash_attention_flops(
 
     # right-down causal: the first query can see Sk-Sq+1 keys; equal-length
     # training reduces to min(topk, q+1).  Multiply by B and KV-head patterns.
-    valid_per_pattern = 0
-    for q_idx in range(Sq):
-        causal_prefix = max(0, min(Sk, Sk - Sq + q_idx + 1))
-        valid_per_pattern += min(topk, causal_prefix)
+    valid_per_pattern = _right_down_causal_pairs(Sq, Sk, topk)
     selected_head_pairs = B * Hkv * group * valid_per_pattern
     d_qk = Dq + q_rope[3]
     if is_grad:
         return 2.0 * selected_head_pairs * (3 * d_qk + 2 * Dv)
     return 2.0 * selected_head_pairs * (d_qk + Dv)
+
+
+def _estimate_lightning_indexer_flops(
+    shapes_in: List[List[int]], shapes_out: List[List[int]],
+    sparse_mode: Optional[int] = None,
+) -> Optional[float]:
+    """Useful Cube FLOPs for fused LightningIndexer.
+
+    The fused op first evaluates every causally valid index-query/index-key dot
+    product, then performs ReLU, head weighting and TopK on the vector side.  Only
+    the QK matmul belongs in the BF16 Cube numerator.
+    """
+    if sparse_mode != 3 or len(shapes_in) < 3 or not shapes_out:
+        return None
+    q, k, weights = shapes_in[:3]
+    indices = shapes_out[0]
+    if not (len(q) == len(k) == len(indices) == 4 and len(weights) == 3):
+        return None
+    B, Sq, Hq, Dq = q
+    Bk, Sk, Hkv, Dk = k
+    Bi, Si, Hi, topk = indices
+    if (
+        min(B, Sq, Hq, Dq, Sk, Hkv, topk) <= 0
+        or (Bk, Bi) != (B, B)
+        or (Si, Hi) != (Sq, Hkv)
+        or Dq != Dk
+        or weights != [B, Sq, Hq]
+        or Hq % Hkv != 0
+        or topk > Sk
+        or any(out != indices for out in shapes_out[1:2])
+    ):
+        return None
+    causal_pairs = _right_down_causal_pairs(Sq, Sk)
+    return 2.0 * B * Hq * causal_pairs * Dq
+
+
+def _estimate_sparse_lightning_indexer_grad_kl_loss_flops(
+    shapes_in: List[List[int]], shapes_out: List[List[int]],
+    sparse_mode: Optional[int] = None,
+) -> Optional[float]:
+    """Useful Cube FLOPs for fused SparseLightningIndexerGradKLLoss.
+
+    CANN executes four Cube products: main-attention QK (including RoPE), index
+    QK, dQ-index and dK-index.  KL/softmax/ReLU/dW and sparse gather/scatter are
+    vector/memory work and deliberately excluded from this Cube numerator.
+    """
+    if sparse_mode != 3 or len(shapes_in) < 10 or len(shapes_out) < 4:
+        return None
+    q, k, q_index, k_index, weights, indices = shapes_in[:6]
+    softmax_max, softmax_sum, q_rope, k_rope = shapes_in[6:10]
+    if any(len(s) != 4 for s in (q, k, q_index, k_index, indices, q_rope, k_rope)):
+        return None
+    if len(weights) != 3:
+        return None
+    B, Sq, Hq, Dq = q
+    Bk, Sk, Hkv, Dk = k
+    Bqi, Sqi, Hqi, Dqi = q_index
+    Bki, Ski, Hkvi, Dki = k_index
+    Bi, Si, Hi, topk = indices
+    if (
+        min(B, Sq, Hq, Dq, Sk, Hkv, Dk, Hqi, Dqi, topk) <= 0
+        or (Bk, Bqi, Bki, Bi) != (B, B, B, B)
+        or (Sqi, Ski, Si) != (Sq, Sk, Sq)
+        or (Hkvi, Hi) != (Hkv, Hkv)
+        or Dq != Dk or Dqi != Dki
+        or Hq % Hkv != 0 or Hqi % Hkv != 0
+        or weights != [B, Sq, Hqi]
+        or topk > Sk
+        or q_rope[:3] != [B, Sq, Hq]
+        or k_rope[:3] != [B, Sk, Hkv]
+        or q_rope[3] <= 0 or q_rope[3] != k_rope[3]
+        or softmax_max != [B, Hkv, Sq, Hq // Hkv]
+        or softmax_sum != softmax_max
+        or shapes_out[:3] != [q_index, k_index, weights]
+        or numel(shapes_out[3]) != 1
+    ):
+        return None
+    selected_pairs = B * _right_down_causal_pairs(Sq, Sk, topk)
+    main_qk = Hq * (Dq + q_rope[3])
+    index_qk_and_grads = 3 * Hqi * Dqi
+    return 2.0 * selected_pairs * (main_qk + index_qk_and_grads)
 
 
 def _estimate_attention_flops(shapes_in, shapes_out, is_grad: bool) -> Optional[float]:
@@ -354,6 +450,77 @@ def _bound_from_ratios(mac, mte2, vec) -> str:
     return "other"
 
 
+def _estimate_matmul_training_flops(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Split repeated 2-D linear forwards from their gradient permutations.
+
+    For one linear projection the forward, dX and dW GEMMs share the same three
+    dimensions in different M/N/K order.  Activation checkpointing makes exactly
+    the forward orientation more frequent.  Equal orientation counts therefore
+    prove no replay (for example a terminal LM head), while a unique excess count
+    measures replay directly. Ambiguous/square/grouped families retain the R=2
+    fallback instead of being guessed.
+    """
+    mm_rows = [r for r in rows if r["type"] in MATMUL_TYPES and r.get("flops")]
+    executed = sum(float(r["flops"]) for r in mm_rows)
+    if executed <= 0:
+        return {"available": False, "reason": "no modeled matmul rows"}
+
+    groups: Dict[Any, Dict[Any, List[float]]] = {}
+    for row in mm_rows:
+        mnk = row.get("matmul_mnk")
+        if not mnk:
+            continue
+        M, N, K, batch = mnk
+        if batch != 1:
+            continue
+        key = tuple(sorted((int(M), int(N), int(K))))
+        groups.setdefault(key, {}).setdefault((int(M), int(N), int(K)), []).append(
+            float(row["flops"])
+        )
+
+    matched_flops = 0.0
+    exact_recompute = 0.0
+    exact_groups = 0
+    ambiguous_groups = 0
+    for orientations in groups.values():
+        if len(orientations) < 2:
+            continue
+        values = [v for rows_v in orientations.values() for v in rows_v]
+        if max(values) > min(values) * (1.0 + 1e-9):
+            ambiguous_groups += 1
+            continue
+        counts = sorted((len(v) for v in orientations.values()), reverse=True)
+        if len(set(counts)) == 1:
+            replay_count = 0
+        elif counts[0] > counts[1] and len(set(counts[1:])) == 1:
+            replay_count = counts[0] - counts[1]
+        else:
+            ambiguous_groups += 1
+            continue
+        per_call = values[0]
+        matched_flops += sum(values)
+        exact_recompute += replay_count * per_call
+        exact_groups += 1
+
+    unmatched_flops = max(executed - matched_flops, 0.0)
+    fallback_recompute = unmatched_flops / 4.0       # m=1, R=2
+    fallback_recompute_lo = unmatched_flops / 4.5    # m=1, R=2.5
+    return {
+        "available": True,
+        "source": "linear_orientation_counts_plus_training_fallback",
+        "executed_flops": executed,
+        "exact_group_count": exact_groups,
+        "ambiguous_group_count": ambiguous_groups,
+        "exact_group_flops": matched_flops,
+        "exact_recompute_forward_flops": exact_recompute,
+        "fallback_flops": unmatched_flops,
+        "recompute_forward_flops": exact_recompute + fallback_recompute,
+        "recompute_forward_flops_lo": exact_recompute + fallback_recompute_lo,
+        "recompute_forward_flops_hi": exact_recompute + fallback_recompute,
+        "exact_coverage_pct": 100.0 * matched_flops / executed,
+    }
+
+
 def compute_efficiency(prof) -> Dict[str, Any]:
     kd = prof.kernel_details
     chip = SETTINGS.chip
@@ -460,10 +627,19 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         # M*N block is truly read-modified-written; the activation (M*K) and weight
         # (K*N) stay intact. A plain GEMM has output == M*N, so this is a no-op.
         mn_elems = 0
+        matmul_mnk = None
+        matmul_phase_eligible = False
         if types[i] in MATMUL_TYPES:
-            _mnk = _matmul_mnk(shapes_in, shapes_out)
-            if _mnk:
-                mn_elems = _mnk[0] * _mnk[1] * _mnk[3]   # M * N * batch
+            matmul_mnk = _matmul_mnk(shapes_in, shapes_out)
+            if matmul_mnk:
+                mn_elems = matmul_mnk[0] * matmul_mnk[1] * matmul_mnk[3]
+                mats_in = [s for s in shapes_in if len(s) >= 2]
+                matmul_phase_eligible = bool(
+                    matmul_mnk[3] == 1
+                    and len(mats_in) >= 2
+                    and len(mats_in[0]) == len(mats_in[1]) == 2
+                    and any(len(s) == 2 for s in shapes_out)
+                )
         out_numels = {numel(s) for s in shapes_out}
         b_bytes = 0
         for j, sh in enumerate(shapes_in):
@@ -483,7 +659,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
 
         is_matmul = types[i] in MATMUL_TYPES
         is_attention = types[i] in ATTENTION_TYPES
-        is_sparse_attention = types[i] in SPARSE_ATTENTION_TYPES
+        is_sparse_discrete = types[i] in SPARSE_DISCRETE_TRAFFIC_TYPES
         core_u = str(core[i]).upper()
         is_vector = "VECTOR" in core_u or "AIV" in core_u
         if is_matmul:
@@ -495,6 +671,14 @@ def compute_efficiency(prof) -> Dict[str, Any]:
                 types[i] in ATTENTION_GRAD_TYPES,
                 sparse_mode=SETTINGS.sparse_attention_mode,
                 sparse_block_size=(1 if chip.name == "Ascend 950DT" else None),
+            )
+        elif types[i] in LIGHTNING_INDEXER_FWD_TYPES:
+            flops = _estimate_lightning_indexer_flops(
+                shapes_in, shapes_out, sparse_mode=SETTINGS.sparse_attention_mode,
+            )
+        elif types[i] in LIGHTNING_INDEXER_KL_GRAD_TYPES:
+            flops = _estimate_sparse_lightning_indexer_grad_kl_loss_flops(
+                shapes_in, shapes_out, sparse_mode=SETTINGS.sparse_attention_mode,
             )
         elif is_attention:
             flops = _estimate_attention_flops(
@@ -513,7 +697,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         # gathered repeatedly and gradient scatter traffic is hidden inside the
         # fused kernel.  Treating the one-time tensor footprint as bytes moved
         # would invent an MBU and an unattainable roofline speedup.
-        if is_sparse_attention:
+        if is_sparse_discrete:
             b_bytes = 0
 
         # Peak routing: matmul / fused-attention kernels run on the CUBE unit;
@@ -537,7 +721,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         # have a FLOP estimate (matmul / fused attention) OR the kernel is a
         # vector-core memory op. Other cube/MIX ops without a FLOP model would
         # look 100% wasted under a memory-only roofline — so we leave them unscored.
-        modeled = ((flops is not None) or (is_vector and b_bytes > 0)) and not is_sparse_attention
+        modeled = ((flops is not None) or (is_vector and b_bytes > 0)) and not is_sparse_discrete
         t_compute = (flops / peak_flops) if flops else 0.0
         t_mem = (b_bytes / chip.hbm_bandwidth) if b_bytes else 0.0
         # Ceiling-aware reclaim: matmul / FA / FAG have a realistic MFU ceiling
@@ -546,7 +730,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         # at/above it (running at MFU>=ceiling means dur <= compute_time/ceiling).
         # Non-ceiling modeled ops optimize toward the 100% roofline, so their
         # reclaim == wasted_us.
-        op_class = _op_class(types[i]) if flops is not None and not is_sparse_attention else None
+        op_class = _op_class(types[i]) if flops is not None and not is_sparse_discrete else None
         ceiling = chip.mfu_ceiling(op_class)
         if modeled:
             ideal_us = max(t_compute, t_mem) * 1e6
@@ -589,6 +773,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
                 "mbu": mbu,
                 "mbu_raw": mbu_raw,
                 "mbu_over_physical": mbu_over_physical,
+                "matmul_mnk": matmul_mnk if matmul_phase_eligible else None,
                 "efficiency": efficiency,
                 "wasted_us": wasted_us,
                 "reclaim_us": reclaim_us,
@@ -758,6 +943,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     flops_rows = [r for r in rows if r["flops"]]
     mm = [r for r in flops_rows if r["type"] in MATMUL_TYPES]
     mm_flops = sum(r["flops"] for r in mm)
+    matmul_training_flops = _estimate_matmul_training_flops(rows)
     # Divide by each matmul's OWN routed peak (cube + dtype-aware), summed as
     # peak·time — the same convention as by_type. A single bf16 effective_peak
     # here would divide an fp8 GEMM's ~2x throughput by the bf16 peak and read a
@@ -793,22 +979,30 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     attention_modeled_us = sum(r["dur_us"] for r in attention_rows if r.get("flops"))
     attention_coverage = (attention_modeled_us / attention_total_us) if attention_total_us else None
 
-    # Exact SparseFlashAttention training FLOP anchor.  The fwd/grad call ratio
-    # identifies repeated activation-recompute forwards; the modeled per-call
-    # FLOPs then gives the actual backward/forward ratio R instead of assuming
-    # textbook R=2.  Restrict this to a uniform, fully modeled SFA-only family so
-    # mixed attention implementations or heterogeneous shapes fail closed.
+    # Exact sparse-training phase anchor.  SFA fwd/grad counts identify repeated
+    # activation forwards.  LightningIndexer follows the same pattern, but its
+    # fused GradKLLoss call is real auxiliary-loss/backward work and must not be
+    # stripped merely because checkpointing executes it in a grad-enabled replay.
     attention_training_flops: Dict[str, Any] = {
         "available": False,
-        "reason": "requires uniform, fully modeled SparseFlashAttention fwd/grad rows",
+        "reason": "requires uniform, fully modeled sparse-attention phase rows",
     }
     sparse_fwd_rows = [r for r in attention_rows if r["type"] == "SparseFlashAttention"]
     sparse_grad_rows = [r for r in attention_rows if r["type"] == "SparseFlashAttentionGrad"]
+    indexer_fwd_rows = [r for r in attention_rows if r["type"] in LIGHTNING_INDEXER_FWD_TYPES]
+    indexer_grad_rows = [
+        r for r in attention_rows if r["type"] in LIGHTNING_INDEXER_KL_GRAD_TYPES
+    ]
+    sparse_training_types = SPARSE_ATTENTION_TYPES | DSA_INDEXER_TYPES
     only_sparse_family = bool(attention_rows) and all(
-        r["type"] in SPARSE_ATTENTION_TYPES for r in attention_rows
+        r["type"] in sparse_training_types for r in attention_rows
     )
-    all_sparse_modeled = all(r.get("flops") for r in sparse_fwd_rows + sparse_grad_rows)
-    if only_sparse_family and sparse_fwd_rows and sparse_grad_rows and all_sparse_modeled:
+    all_sparse_modeled = all(r.get("flops") for r in attention_rows)
+    indexer_phase_complete = bool(indexer_fwd_rows) == bool(indexer_grad_rows)
+    if (
+        only_sparse_family and sparse_fwd_rows and sparse_grad_rows
+        and all_sparse_modeled and indexer_phase_complete
+    ):
         fwd_values = [float(r["flops"]) for r in sparse_fwd_rows]
         grad_values = [float(r["flops"]) for r in sparse_grad_rows]
         fwd_uniform = max(fwd_values) <= min(fwd_values) * (1.0 + 1e-9)
@@ -816,22 +1010,51 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         fwd_count = len(fwd_values)
         grad_count = len(grad_values)
         pass_ratio = fwd_count / grad_count
-        if fwd_uniform and grad_uniform and pass_ratio >= 1.0:
+        indexer_fwd_values = [float(r["flops"]) for r in indexer_fwd_rows]
+        indexer_grad_values = [float(r["flops"]) for r in indexer_grad_rows]
+        indexer_uniform = bool(
+            not indexer_fwd_values
+            or (
+                max(indexer_fwd_values) <= min(indexer_fwd_values) * (1.0 + 1e-9)
+                and max(indexer_grad_values) <= min(indexer_grad_values) * (1.0 + 1e-9)
+            )
+        )
+        indexer_pass_ratio = (
+            len(indexer_fwd_values) / len(indexer_grad_values)
+            if indexer_grad_values else 1.0
+        )
+        if (
+            fwd_uniform and grad_uniform and pass_ratio >= 1.0
+            and indexer_uniform and indexer_pass_ratio >= 1.0
+        ):
             fwd_per_call = fwd_values[0]
             grad_per_call = grad_values[0]
             recompute_multiplier = pass_ratio - 1.0
             bwd_fwd_ratio = grad_per_call / fwd_per_call
             executed_fwd_flops = sum(fwd_values)
             executed_bwd_flops = sum(grad_values)
-            recompute_fwd_flops = max(fwd_count - grad_count, 0) * fwd_per_call
+            sfa_recompute_flops = max(fwd_count - grad_count, 0) * fwd_per_call
+            indexer_fwd_flops = sum(indexer_fwd_values)
+            indexer_grad_flops = sum(indexer_grad_values)
+            indexer_recompute_flops = (
+                max(len(indexer_fwd_values) - len(indexer_grad_values), 0)
+                * indexer_fwd_values[0]
+                if indexer_fwd_values else 0.0
+            )
+            recompute_fwd_flops = sfa_recompute_flops + indexer_recompute_flops
+            executed_attention_flops = sum(float(r["flops"]) for r in attention_rows)
+            indexer_model_flops = (
+                indexer_fwd_flops + indexer_grad_flops - indexer_recompute_flops
+            )
             recompute_share = (
-                recompute_multiplier / (1.0 + bwd_fwd_ratio + recompute_multiplier)
-                if recompute_multiplier > 0 else 0.0
+                recompute_fwd_flops / executed_attention_flops
+                if executed_attention_flops > 0 else 0.0
             )
             attention_training_flops = {
                 "available": True,
-                "scope": "SparseFlashAttention",
-                "source": "modeled_fwd_grad_flops_and_call_counts",
+                "scope": ("SparseFlashAttention+DSAIndexer"
+                          if indexer_fwd_values else "SparseFlashAttention"),
+                "source": "modeled_sparse_training_phase_counts",
                 "forward_count": fwd_count,
                 "backward_count": grad_count,
                 "forward_pass_ratio": pass_ratio,
@@ -841,7 +1064,14 @@ def compute_efficiency(prof) -> Dict[str, Any]:
                 "backward_forward_flop_ratio": bwd_fwd_ratio,
                 "executed_forward_flops": executed_fwd_flops,
                 "executed_backward_flops": executed_bwd_flops,
-                "executed_attention_flops": executed_fwd_flops + executed_bwd_flops,
+                "executed_attention_flops": executed_attention_flops,
+                "sfa_recompute_forward_flops": sfa_recompute_flops,
+                "indexer_forward_count": len(indexer_fwd_values),
+                "indexer_grad_loss_count": len(indexer_grad_values),
+                "indexer_forward_flops": indexer_fwd_flops,
+                "indexer_grad_loss_flops": indexer_grad_flops,
+                "indexer_recompute_forward_flops": indexer_recompute_flops,
+                "indexer_model_flops": indexer_model_flops,
                 "recompute_forward_flops": recompute_fwd_flops,
                 "attention_recompute_flops_share": recompute_share,
             }
@@ -863,6 +1093,10 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     sparse_flops_modeled = any(
         r["type"] in SPARSE_ATTENTION_TYPES and r.get("flops") for r in model_rows
     )
+    dsa_indexer_present = any(r["type"] in DSA_INDEXER_TYPES for r in model_rows)
+    dsa_indexer_modeled = any(
+        r["type"] in DSA_INDEXER_TYPES and r.get("flops") for r in model_rows
+    )
     flop_model_notes = []
     if sparse_flops_modeled:
         flop_model_notes.append(
@@ -876,6 +1110,18 @@ def compute_efficiency(prof) -> Dict[str, Any]:
             "profiler CSV 未记录 SparseFlashAttention 的 sparse_mode；默认不猜测。"
             "确认本次运行后可显式设置 LLMINSIGHT_SPARSE_MODE=3；仅在 950DT "
             "token-wise（sparse_block_size=1）语义下启用有效 FLOPs。"
+        )
+    if dsa_indexer_modeled:
+        flop_model_notes.append(
+            "LightningIndexer 计入 causal dense Index-QK；"
+            "SparseLightningIndexerGradKLLoss 计入主 Attention QK、Index-QK、dQ、dK。"
+            "KL/Softmax/ReLU/dW 与离散 Gather/Scatter 不计入 Cube FLOPs，且因物理访存"
+            "不可由 CSV 重建，这两类算子的 MBU、roofline 与可回收时延保持 unavailable。"
+        )
+    elif dsa_indexer_present:
+        flop_model_notes.append(
+            "检测到 LightningIndexer/GradKLLoss，但 shape 或 sparse_mode 不足以闭合"
+            " useful Cube FLOPs；相关 MFU 按 fail-closed 保持 unavailable。"
         )
 
     scatter.sort(key=lambda s: s["dur_us"], reverse=True)
@@ -978,6 +1224,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         "attention_flop_coverage_pct": (round(attention_coverage * 100.0, 1)
                                         if attention_coverage is not None else None),
         "attention_training_flops": attention_training_flops,
+        "matmul_training_flops": matmul_training_flops,
         "model_compute_total_us": round(model_total_us, 1),
         "model_compute_modeled_us": round(model_modeled_us, 1),
         "attention_total_us": round(attention_total_us, 1),

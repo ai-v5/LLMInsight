@@ -787,6 +787,9 @@ def _recompute_overhead(
     attn_flops = float(components.get("attention_flops") or 0.0)
     model_flops = float(components.get("model_flops") or 0.0)
     attn_recompute_flops = float(components.get("attention_recompute_flops") or 0.0)
+    mm_recompute_explicit = components.get("matmul_recompute_flops")
+    mm_recompute_lo_explicit = components.get("matmul_recompute_flops_lo")
+    mm_recompute_hi_explicit = components.get("matmul_recompute_flops_hi")
     component_total = mm_flops + attn_flops
     components_close = bool(
         model_flops > 0
@@ -802,13 +805,35 @@ def _recompute_overhead(
         # established [2,2.5] uncertainty band for non-attention matmuls, while
         # using the exact modeled SFA recompute FLOPs instead of applying SFA's
         # larger backward ratio to every compute kernel.
-        mm_recompute = mm_flops * _share(_RECOMPUTE_BWD_FWD)
-        mm_recompute_lo = mm_flops * _share(_RECOMPUTE_BWD_FWD_BAND[1])
+        explicit_mm_valid = bool(
+            mm_recompute_explicit is not None
+            and 0 <= float(mm_recompute_explicit) <= mm_flops
+        )
+        if explicit_mm_valid:
+            mm_recompute = float(mm_recompute_explicit)
+            mm_recompute_lo = float(
+                mm_recompute_lo_explicit
+                if mm_recompute_lo_explicit is not None else mm_recompute
+            )
+            mm_recompute_hi = float(
+                mm_recompute_hi_explicit
+                if mm_recompute_hi_explicit is not None else mm_recompute
+            )
+            if not (0 <= mm_recompute_lo <= mm_recompute_hi <= mm_flops):
+                explicit_mm_valid = False
+        if not explicit_mm_valid:
+            mm_recompute = mm_flops * _share(_RECOMPUTE_BWD_FWD)
+            mm_recompute_lo = mm_flops * _share(_RECOMPUTE_BWD_FWD_BAND[1])
+            mm_recompute_hi = mm_recompute
         r_re = (mm_recompute + attn_recompute_flops) / component_total
         r_lo = (mm_recompute_lo + attn_recompute_flops) / component_total
-        r_hi = r_re
+        r_hi = (mm_recompute_hi + attn_recompute_flops) / component_total
         R = exact_ratio
-        ratio_source = "component_weighted_matmul_R2_sparse_attention_exact"
+        ratio_source = (
+            "component_weighted_matmul_phase_split_sparse_attention_exact"
+            if explicit_mm_valid
+            else "component_weighted_matmul_R2_sparse_attention_exact"
+        )
     else:
         # A SFA-only ratio must never be projected onto unclosed model FLOPs.
         # Fall back to the standard training band until every modeled component
@@ -824,14 +849,17 @@ def _recompute_overhead(
         "us_lo": round(computing * r_lo, 1),
         "us_hi": round(computing * r_hi, 1),
         "flops_share": round(r_re, 4),                       # also = (HFU − MFU)/HFU
+        "flops_share_lo": round(r_lo, 4),
+        "flops_share_hi": round(r_hi, 4),
         "rho": round(rho, 4),
         "recompute_forward_multiplier": round(multiplier, 4),
         "bwd_fwd_flop_ratio": round(R, 4),
         "flop_ratio_source": ratio_source,
         "granularity": gran,
         "basis": ("重算开销 = computing × r_re；m={m:.2f}（融合 Attention 调用数推导的"
-                  "重复前向倍数）。SFA 使用建模前后向 FLOPs 与精确重复前向 FLOPs；"
-                  "其余 matmul 使用 R=2（band 2–2.5）后按执行 FLOPs 加权。"
+                  "重复前向倍数）。稀疏 Attention/Indexer 使用建模 FLOPs 与精确调用计数；"
+                  "matmul 优先使用可配对线性层的方向/次数相位拆分，未配对部分使用"
+                  "R=2（band 2–2.5）。"
                   "SFA R={R:.4f}，source={source}。"
                   ).format(m=multiplier, R=R, source=ratio_source),
     }
@@ -854,6 +882,7 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
     # 算子余量 carved down by (1−r_re) so the two stay disjoint in the combined.
     rc_state = ((capture or {}).get("capture", {}) or {}).get("recompute")
     attn_flops = eff.get("attention_training_flops") or {}
+    matmul_flops = eff.get("matmul_training_flops") or {}
     exact_attn_flops = bool(attn_flops.get("available") and eff.get("efficiency_reliable"))
     component_flops = None
     if exact_attn_flops:
@@ -862,6 +891,9 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
             "attention_flops": eff.get("attention_flops_total"),
             "model_flops": eff.get("useful_flops_total"),
             "attention_recompute_flops": attn_flops.get("recompute_forward_flops"),
+            "matmul_recompute_flops": matmul_flops.get("recompute_forward_flops"),
+            "matmul_recompute_flops_lo": matmul_flops.get("recompute_forward_flops_lo"),
+            "matmul_recompute_flops_hi": matmul_flops.get("recompute_forward_flops_hi"),
         }
     rc_ov = _recompute_overhead(
         computing,
@@ -873,6 +905,8 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         component_flops=component_flops,
     )
     r_re = rc_ov["flops_share"] if rc_ov else 0.0
+    r_re_lo = rc_ov["flops_share_lo"] if rc_ov else 0.0
+    r_re_hi = rc_ov["flops_share_hi"] if rc_ov else 0.0
     recompute_us = min(rc_ov["us"], computing) if rc_ov else 0.0
 
     # Atomic optimization levers (not preset combos): 未掩盖通信 and Free are the two
@@ -956,6 +990,8 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
     # now the MODEL MFU; step_hfu carries the executed-FLOPs figure. (rc_ov / r_re were
     # computed at the top so the levers above could use them.)
     step_mfu = (hfu * (1.0 - r_re)) if hfu is not None else None
+    step_mfu_lo = (hfu * (1.0 - r_re_hi)) if hfu is not None else None
+    step_mfu_hi = (hfu * (1.0 - r_re_lo)) if hfu is not None else None
     # Time-only levers (comm/free/op) keep useful FLOPs fixed, so post-opt MFU scales
     # as mfu × stage/new_step — the same factor for MFU or HFU.
     physical_floor_us = (step_mfu * stage) if step_mfu else 0.0
@@ -1075,6 +1111,8 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
             "overhead_pct": _pct(rc_ov["us"], stage),
             "rho": rc_ov["rho"],
             "flops_share": rc_ov["flops_share"],
+            "flops_share_lo": rc_ov["flops_share_lo"],
+            "flops_share_hi": rc_ov["flops_share_hi"],
             "recompute_forward_multiplier": rc_ov["recompute_forward_multiplier"],
             "bwd_fwd_flop_ratio": rc_ov["bwd_fwd_flop_ratio"],
             "flop_ratio_source": rc_ov["flop_ratio_source"],
@@ -1084,6 +1122,8 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
             "new_mfu": (round(step_mfu * stage / _new_step, 4) if step_mfu else None),
             "hfu": round(hfu, 4) if hfu else None,
             "mfu": round(step_mfu, 4) if step_mfu else None,
+            "mfu_lo": round(step_mfu_lo, 4) if step_mfu_lo else None,
+            "mfu_hi": round(step_mfu_hi, 4) if step_mfu_hi else None,
             "basis": rc_ov["basis"],
             "note": "已作为「重计算」项纳入 What-if 优化组合（与算子余量 disjoint：算子余量已扣除重算算子余量）；"
                     "关闭需显存有余量（见显存板块）。",
@@ -1098,10 +1138,13 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         "compute_bound": compute_bound_note,
         # step_mfu = MODEL MFU (recompute stripped); step_hfu = executed-FLOPs (HFU).
         "step_mfu": round(step_mfu, 4) if step_mfu else None,
+        "step_mfu_lo": round(step_mfu_lo, 4) if step_mfu_lo else None,
+        "step_mfu_hi": round(step_mfu_hi, 4) if step_mfu_hi else None,
         "step_hfu": round(hfu, 4) if hfu else None,
         "recompute": recompute,
         "note": ("端到端 MFU=模型理论FLOPs/(峰值×step)（不含重计算）；HFU 含重计算重复执行的 FLOPs。"
-                 "SFA 前后向完整建模时，重计算扣除按 SFA 精确 FLOPs 与 matmul R=2 分量加权；"
+                 "稀疏 Attention/Indexer 按前后向调用计数拆分；matmul 优先按线性层方向/次数拆分，"
+                 "无法配对的部分保留 R=2–2.5 训练估计；"
                  "当主导算子 FLOP 模型不完整或峰值口径不一致时，MFU/HFU 与算子收益保持 unavailable；"
                  "通信、空泡和重计算仍按各自证据单独估算。"),
     }
