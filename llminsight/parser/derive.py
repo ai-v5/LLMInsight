@@ -331,9 +331,10 @@ def derive_capture(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
     # --- recompute granularity, from fused-attention fwd/grad count ----------
     # Forward attention runs once per layer; full recompute reruns it in the
     # backward, so fwd≈2×grad. recompute off → fwd≈grad. The ratio also quantifies
-    # HOW MUCH forward is recomputed — ρ=(fwd-grad)/fwd (full→0.5, off→0, selective
-    # between) — so we carry the raw counts downstream for the recompute-overhead
-    # estimate in metrics (see core._recompute_overhead).
+    # HOW MUCH forward is recomputed.  Let m=fwd/grad−1 be the number of repeated
+    # forward passes per model forward (full→1, off→0, selective between), and
+    # ρ=m/(1+m)=(fwd−grad)/fwd.  Carry both forms downstream so MFU can use the
+    # exact m/(1+R+m) recompute-FLOP share rather than a fixed 1:2:1 split.
     fwd_types = (
         "FlashAttentionScore", "SparseFlashAttention", "SparseFlashMla",
         "PromptFlashAttention", "FusedInferAttentionScore",
@@ -353,8 +354,9 @@ def derive_capture(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
             val, conf = "selective", "medium"
         fact = _fact(
             val, f"融合 Attention 前向/反向次数比 = {r:.2f}（fwd {fa_fwd} / grad {fa_grad}）", conf)
-        # raw signals for the recompute-overhead quantifier (ρ = (fwd-grad)/fwd)
+        # Raw signals for the recompute-overhead quantifier (m=fwd/grad−1).
         fact["fwd_grad_ratio"] = round(float(r), 4)
+        fact["recompute_forward_multiplier"] = round(max(float(r) - 1.0, 0.0), 4)
         fact["fa_fwd"] = int(fa_fwd)
         fact["fa_grad"] = int(fa_grad)
         out["recompute"] = fact

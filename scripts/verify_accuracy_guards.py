@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from llminsight.insight.summarizer import build_summary
 from llminsight.config import SETTINGS
-from llminsight.metrics.core import _single_card, theoretical
+from llminsight.metrics.core import _recompute_overhead, _single_card, theoretical
 from llminsight.metrics.efficiency import (
     ATTENTION_TYPES,
     MATMUL_TYPES,
@@ -129,6 +129,15 @@ def check_sparse_attention_and_capture() -> None:
     ), eff
     assert "SparseFlashAttention" not in eff["unmodeled_flop_types"], eff
     assert any("有效稀疏 Cube FLOPs" in x for x in eff["flop_model_notes"]), eff
+    training_flops = eff["attention_training_flops"]
+    assert training_flops["available"] is True, training_flops
+    assert training_flops["forward_flops_per_call"] == 7488.0, training_flops
+    assert training_flops["backward_flops_per_call"] == 19136.0, training_flops
+    expected_bwd_fwd = 19136.0 / 7488.0
+    assert math.isclose(
+        training_flops["backward_forward_flop_ratio"], expected_bwd_fwd,
+        rel_tol=1e-12,
+    ), training_flops
     sparse_types = {
         row["type"]: row for row in eff["by_type"]
         if row["type"] in {"SparseFlashAttention", "SparseFlashAttentionGrad"}
@@ -143,9 +152,9 @@ def check_sparse_attention_and_capture() -> None:
     ov = {
         "available": True,
         "us": {
-            "stage": 1000.0, "computing": 700.0,
-            "comm_not_overlapped": 200.0, "free": 100.0,
-            "communication": 300.0, "overlapped": 100.0,
+            "stage": 1.0, "computing": 0.7,
+            "comm_not_overlapped": 0.2, "free": 0.1,
+            "communication": 0.3, "overlapped": 0.1,
         },
         "ratios": {
             "comm_not_overlapped_pct": 20.0, "free_pct": 10.0,
@@ -155,6 +164,32 @@ def check_sparse_attention_and_capture() -> None:
     cfg = derive_config(prof)
     theo = theoretical(prof, ov, eff, cfg)
     assert theo["step_mfu"] is not None and theo["step_hfu"] is not None, theo
+    expected_attention_recompute = 7488.0
+    expected_matmul_recompute = expected_grouped / 4.0
+    expected_recompute_share = (
+        expected_attention_recompute + expected_matmul_recompute
+    ) / (expected_sparse + expected_grouped)
+    expected_hfu = (expected_sparse + expected_grouped) / (432e12 * 1e-6)
+    assert theo["step_hfu"] == round(expected_hfu, 4), theo
+    assert theo["step_mfu"] == round(expected_hfu * (1 - expected_recompute_share), 4), theo
+    assert theo["recompute"]["flops_share"] == round(expected_recompute_share, 4), theo
+    assert theo["recompute"]["flop_ratio_source"] == \
+        "component_weighted_matmul_R2_sparse_attention_exact", theo
+    unclosed = _recompute_overhead(
+        0.7,
+        capture["recompute"],
+        bwd_fwd_flop_ratio=expected_bwd_fwd,
+        recompute_forward_multiplier=1.0,
+        component_flops={
+            "matmul_flops": expected_grouped,
+            "attention_flops": expected_sparse,
+            "model_flops": expected_grouped + expected_sparse + 1.0,
+            "attention_recompute_flops": expected_attention_recompute,
+        },
+    )
+    assert unclosed["flop_ratio_source"] == \
+        "fallback_training_band_component_mismatch", unclosed
+    assert unclosed["flops_share"] == 0.25, unclosed
     # Sparse attention contributes useful FLOPs/MFU, but not a roofline What-if:
     # its repeated Gather/Scatter traffic is not reconstructible from tensor shapes.
     assert "op_ceiling" not in {x["id"] for x in theo["whatif"]}, theo["whatif"]
