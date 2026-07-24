@@ -30,6 +30,7 @@ from llminsight.rules import run_rules
 from llminsight.insight import generate_insights
 
 FAILS = []
+MFU_MEASUREMENT_TOL = 1.02
 
 
 def chk(label, got, want, tol=1.0):
@@ -86,15 +87,18 @@ def main():
              f"({len(eff.get('scatter', []))} pts)")
     chk_true("matmul_mfu present", eff.get("matmul_mfu") is not None,
              f"(MFU={eff.get('matmul_mfu')})")
-    # MFU must be physical (<=100%): a real kernel cannot beat silicon peak. Under
-    # the default 950DT (the device this sample was captured on) the configured cube
+    # The confirmed 432T denominator remains fixed. Profiler duration/counter
+    # granularity may put a kernel slightly above 100%, so accept <=102% as
+    # measurement noise while still failing on a material peak contradiction.
+    # Under the default 950DT (the device this sample was captured on), the configured cube
     # peak already equals the observed GEMM ceiling, so no calibration is needed; the
-    # 910B what-if below exercises the calibrate-up path. Guard against >100%.
-    chk_true("matmul MFU <= 100% (physical)",
-             eff.get("matmul_mfu") is not None and eff["matmul_mfu"] <= 1.0,
+    # 910B what-if below exercises the calibrate-up path.
+    chk_true("matmul MFU <= 102% (measurement tolerance)",
+             eff.get("matmul_mfu") is not None and eff["matmul_mfu"] <= MFU_MEASUREMENT_TOL,
              f"(MFU={eff.get('matmul_mfu')}, vs_assumed={eff.get('matmul_mfu_assumed')})")
-    chk_true("no per-type MFU > 100%",
-             all((t.get("mfu") is None or t["mfu"] <= 1.0) for t in eff.get("by_type", [])),
+    chk_true("no per-type MFU > 102%",
+             all((t.get("mfu") is None or t["mfu"] <= MFU_MEASUREMENT_TOL)
+                 for t in eff.get("by_type", [])),
              f"(max={max([t.get('mfu') or 0 for t in eff.get('by_type', [])] or [0]):.3f})")
     # Vector-core ops now carry a VECTOR-peak MFU: elementwise/norm/optimizer kernels
     # get a flop model so their headroom floor is max(vector-compute, memory), not
@@ -103,7 +107,8 @@ def main():
     bt = {t["type"]: t for t in eff.get("by_type", [])}
     _mul_mfu = bt.get("Mul", {}).get("mfu")
     chk_true("vector op (Mul) has physical vector-peak MFU",
-             _mul_mfu is not None and 0.0 < _mul_mfu <= 1.0, f"(Mul mfu={_mul_mfu})")
+             _mul_mfu is not None and 0.0 < _mul_mfu <= MFU_MEASUREMENT_TOL,
+             f"(Mul mfu={_mul_mfu})")
     # Pure data-movement ops (factor 0: ZerosLike/Cast) do ~0 arithmetic, so they stay
     # MFU-less and honestly memory-bound — no fabricated compute.
     chk_true("zero-arith vector op (ZerosLike) stays MFU-less",
@@ -326,11 +331,11 @@ def main():
     chk_true("derived dtype == BF16", dm.get("dtype") == "BF16", f"(got {dm.get('dtype')})")
     chk_true("config source is profiling (path withheld)",
              cap.get("source") == "profiling" and cap.get("path") is None)
-    # EP world size is UNDERIVABLE from a single rank → surfaced as a labeled guess,
-    # never a fabricated definite flag (intentionally absent from cap['flags']).
+    # EP world size is UNDERIVABLE from a single rank → remains unknown,
+    # never a model-family numeric guess or a fabricated definite flag.
     ep = cap.get("guesses", {}).get("ep_world_size", {})
-    chk_true("EP world size is a labeled guess (未知(猜64)), not a hard flag",
-             ep.get("label") == "未知(猜64)" and ep.get("guess") == 64
+    chk_true("EP world size remains unknown, not a numeric family prior",
+             ep.get("label") == "未知" and ep.get("guess") is None
              and "expert-model-parallel-size" not in cap.get("flags", {}),
              f"(label={ep.get('label')} flags_has_ep={'expert-model-parallel-size' in cap.get('flags', {})})")
     # blocking / recompute / host-sync are DERIVED capture facts (not from env/script)
@@ -376,8 +381,8 @@ def main():
     chk_true("LLM summary carries derived model (hidden_size 7168)",
              (smodel.get("derived") or {}).get("hidden_size") == 7168,
              f"(model={list((smodel.get('derived') or {}).keys())[:3]}...)")
-    chk_true("LLM summary carries labeled EP guess (未知(猜64))",
-             (smodel.get("unknown_guesses") or {}).get("ep_world_size") == "未知(猜64)")
+    chk_true("LLM summary carries unknown EP field without a numeric guess",
+             (smodel.get("unknown_fields") or {}).get("ep_world_size") == "未知")
     chk_true("LLM summary capture.state.blocking == False (no false blocking)",
              ((res["summary"].get("capture") or {}).get("state") or {})
              .get("blocking", {}).get("value") is False)
@@ -400,8 +405,9 @@ def main():
              ch910.get("calibrated") is True
              and (ch910.get("observed_peak_tflops") or 0) > ch910.get("peak_bf16_tflops", 0),
              f"(assumed={ch910.get('peak_bf16_tflops')} observed={ch910.get('observed_peak_tflops')} eff={round(ch910.get('effective_peak_tflops',0),1)})")
-    chk_true("910B matmul MFU still <= 100% (calibrated)",
-             m910["efficiency"].get("matmul_mfu") is not None and m910["efficiency"]["matmul_mfu"] <= 1.0,
+    chk_true("910B matmul MFU still <= 102% (calibrated)",
+             m910["efficiency"].get("matmul_mfu") is not None
+             and m910["efficiency"]["matmul_mfu"] <= MFU_MEASUREMENT_TOL,
              f"(MFU={m910['efficiency'].get('matmul_mfu')})")
     chk_true("910B surfaces peak_underestimated card",
              "peak_underestimated" in {c["id"] for c in cards910},

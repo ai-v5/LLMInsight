@@ -50,6 +50,10 @@
       + `<td style="color:var(--accent-2)">-${fmt.pct(w.recoverable_pct)}</td>`
       + `<td style="color:var(--accent)">${dmfu(w.new_mfu)}</td></tr>`).join("");
     const cb = theo.available && theo.compute_bound;
+    const hasOpLever = levers.some(w => w.id === "op_ceiling");
+    const opFloorText = hasOpLever
+      ? "、算子按各自 MFU 天花板（matmul 95% / FA 85% / FAG 70%）收口"
+      : "；算子 FLOP/峰值口径不完整时不展示算子收益";
     // "已启用组合" row recomputed from whichever levers are ticked. 未掩盖通信 and Free
     // are disjoint slices of Stage, so savings add; MFU = smfu · stage / new_step.
     const recomputeCombined = () => {
@@ -73,10 +77,12 @@
         ${panel("What-if 收益模拟 · 现实可达地板", "每项为达现实地板（业界可达上限）时单独可回收的收益（实测%→地板%）；勾选后底部「已启用组合」实时叠加",
           `<table class="tbl"><thead><tr><th style="width:38px">启用</th><th>优化项</th><th>单独节省(s)</th><th>单独节省(%)</th><th>端到端 MFU</th></tr></thead>`
           + `<tbody>${theo.available ? (baseRow + leverRows + `<tr id="wi-combined" style="border-top:2px solid rgba(94,224,184,.35)"></tr>`) : `<tr><td colspan=5 class="empty">—</td></tr>`}</tbody></table>
-           ${cb ? (cb.peak_underestimated
+           ${cb ? (cb.peak_inconsistent
+             ? banner("warn","⚠️", "观测吞吐超过所选芯片/精度峰值；MFU 与算子 What-if 已停用，请核对 active chip、dtype 与 shape 语义。")
+             : cb.peak_underestimated
              ? banner("warn","⚠️", `matmul 实测 MFU <strong>${cb.matmul_mfu_pct}%</strong> &gt; 100% → 假设芯片峰值偏低，请在 config.ChipSpec 校正。`)
              : `<div class="note">matmul MFU ≈ <strong>${cb.matmul_mfu_pct}%</strong>${cb.ceiling_based ? "（≈ 天花板）" : ""}；算子达天花板后计算 ${fmt.us(cb.ideal_matmul_us)}，可回收 ${fmt.us(cb.headroom_us)}。${cb.calibrated ? `（芯片峰值按实测 ${cb.observed_peak_tflops} TFLOPS 校准，假设 ${cb.assumed_peak_tflops != null ? cb.assumed_peak_tflops.toFixed(0) : "—"}）` : ""}</div>`) : ""}
-           <div class="note" style="font-size:11px;line-height:1.55;margin-top:8px;border-top:1px solid rgba(255,255,255,.06);padding-top:6px">💡 此表为<strong>现实可达地板</strong>（非「→0」物理上界）：通信重叠至 80–90% 留残留、Free 留 step 2–5%、算子按各自 MFU 天花板（matmul 95% / FA 85% / FAG 70%）收口——单项收益小而精，而非冲到 100% 的虚高。优先级：先做计算-通信重叠（--moe-fb-overlap / 异步通信），再压同步空泡；底部「已启用组合」随勾选实时叠加。${ub.new_mfu != null ? ` <span style="color:var(--text-dim)">📐 物理上界（全部 →0，理论不可达）参考：step ${fmt.us(ub.new_step_us)} / 端到端 MFU ${fmt.mfu(ub.new_mfu)} / 省 ${fmt.pct(ub.save_pct)}。</span>` : ""}　⚠️ 「未掩盖通信」与算子页 <strong>HcclLaunchAicpuKernel</strong> 是同一段集合通信（单卡几乎全是 Wait，非下发延迟），勿重复计入。</div>`)}
+           <div class="note" style="font-size:11px;line-height:1.55;margin-top:8px;border-top:1px solid rgba(255,255,255,.06);padding-top:6px">💡 此表为<strong>现实可达地板</strong>（非「→0」物理上界）：通信重叠至 80–90% 留残留、Free 留 step 2–5%${opFloorText}。优先级：先做计算-通信重叠（--moe-fb-overlap / 异步通信），再压同步空泡；底部「已启用组合」随勾选实时叠加。${ub.new_mfu != null ? ` <span style="color:var(--text-dim)">📐 物理上界（全部 →0，理论不可达）参考：step ${fmt.us(ub.new_step_us)} / 端到端 MFU ${fmt.mfu(ub.new_mfu)} / 省 ${fmt.pct(ub.save_pct)}。</span>` : ""}　⚠️ 「未掩盖通信」与算子页 <strong>HcclLaunchAicpuKernel</strong> 是同一段集合通信（当前 rank 中可能以 Wait 为主，非下发延迟），勿重复计入。</div>`)}
       </div>
       ${theo.available ? `<div style="margin-top:16px">${whatifFloor(theo)}</div>` : ""}
       <div class="note">${esc(theo.available ? theo.note : "")}</div>`;
@@ -234,10 +240,19 @@
     // saturated (filtered out of the ranking) + total reclaimable-to-ceiling time.
     const oco = ef.op_ceiling_opt;
     const ceilPct = x => Math.round((x || 0) * 100);
-    const ocNote = (oco && oco.ceilings)
+    const ocNote = (oco && oco.complete && oco.ceilings)
       ? `<div class="note" style="margin-top:8px">🎯 算子 MFU 天花板：matmul <strong>${ceilPct(oco.ceilings.matmul)}%</strong> / FA <strong>${ceilPct(oco.ceilings.attention)}%</strong> / FAG <strong>${ceilPct(oco.ceilings.attention_grad)}%</strong>　·　已达天花板 <strong>${oco.n_capped}/${oco.n_modeled}</strong> 个算子（不再优化）　·　全部提升至天花板可回收 <strong>${fmt.us(oco.total_reclaim_us)}</strong>。下方「优化候选 / 排行」已据此筛选。</div>`
       : "";
+    const fidelity = !ef.flop_model_complete
+      ? banner("warn", "⚠️", `模型 FLOP 覆盖仅 <strong>${fmt.pct(ef.flop_coverage_pct)}</strong>；未建模：<strong>${esc(Object.keys(ef.unmodeled_flop_types || {}).join("、") || "未知主导算子")}</strong>。完整 MFU/HFU 与算子 What-if 已停用。`)
+      : "";
+    const peakWarning = ef.peak_inconsistent
+      ? banner("warn", "⚠️", "观测吞吐超过所选芯片/精度峰值；请核对 active chip、dtype 与 shape 语义。当前 MFU 不作为有效结论。")
+      : "";
+    const modelNotes = (ef.flop_model_notes || []).map(note =>
+      banner("info", "🧮", esc(note))).join("");
     root.innerHTML = `
+      ${fidelity}${peakWarning}${modelNotes}
       ${banner(chip.calibrated ? "warn" : "info", "🎯",
         `芯片：<strong>${esc(chip.name)}</strong> · CUBE BF16 <strong>${(chip.cube_bf16_tflops||chip.peak_bf16_tflops).toFixed(0)}</strong> / VECTOR BF16 <strong>${(chip.vector_bf16_tflops||0).toFixed(0)}</strong> TFLOPS · HBM <strong>${chip.hbm_tbps.toFixed(2)} TB/s</strong>` +
         (chip.hbm_capacity_gb ? ` · 显存 <strong>${chip.hbm_capacity_gb.toFixed(0)} GB</strong>` : "") +

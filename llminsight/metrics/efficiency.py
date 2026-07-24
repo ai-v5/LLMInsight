@@ -15,7 +15,7 @@ from ..parser.shapes import parse_shapes, parse_dtypes, numel
 
 MATMUL_TYPES = {
     "MatMulV3", "MatMul", "GroupedMatmul", "GroupedMatmulAdd", "GemmV3", "Gemm",
-    "BatchMatMul", "BatchMatMulV2",
+    "BatchMatMul", "BatchMatMulV2", "BatchMatMulV3",
     # fp8 quantized matmul (routed-expert GEMMs in fp8 training). Same 2·M·N·K
     # work; x and weight are the first two ≥2D operands, the trailing E8M0 scale
     # tensors ([*,*,2]) are ignored by _estimate_matmul_flops. dtype FLOAT8_E4M3
@@ -32,19 +32,29 @@ ATTENTION_FWD_TYPES = {
     # attention, and the lightning indexer. Routed to the cube peak + attention
     # lane so they're not misfiled as generic compute / left out of attribution.
     "SparseFlashMla", "SparseAttnSharedkv", "SparseLightningIndexer",
+    # Generic sparse attention used by current MindSpeed/GLM profiles.  Its
+    # token-wise causal useful Cube FLOPs are modeled only when the recorded
+    # shapes prove the supported 950DT schema; all other layouts fail closed.
+    "SparseFlashAttention",
 }
 ATTENTION_GRAD_TYPES = {
     "FlashAttentionScoreGrad",
     "SparseFlashMlaGrad", "SparseLightningIndexerGrad",
     "SparseLightningIndexerKllossGrad",
+    "SparseFlashAttentionGrad",
 }
 ATTENTION_TYPES = ATTENTION_FWD_TYPES | ATTENTION_GRAD_TYPES
+SPARSE_ATTENTION_TYPES = {"SparseFlashAttention", "SparseFlashAttentionGrad"}
 # DeepSeek-V3 attention is causal: FlashAttention skips the masked (upper-triangle)
 # blocks, so it does ~half the dense QK^T+PV work. Without this 0.5 the achieved
 # rate would exceed silicon peak — i.e. the factor is physically required, not a
 # convenience. The backward pass recomputes ~2.5x the forward matmul FLOPs.
 _ATTN_CAUSAL_FACTOR = 0.5
 _ATTN_BWD_FWD_RATIO = 2.5
+# Datasheet peaks and profiler durations can differ by a small amount because of
+# clock/counter granularity.  Do not rewrite a confirmed peak for this noise, but
+# still fail closed on a material contradiction.
+_PEAK_MEASUREMENT_TOL = 1.02
 # A modeled kernel whose MFU and MBU are BOTH below this is "overhead-bound": its time
 # is launch/scalar/dispatch, not on the compute or memory roofline, so the roofline
 # "reclaim to 100%" is physically meaningless. We zero its reclaim (keep it out of the
@@ -65,8 +75,15 @@ def _op_class(op_type: str) -> Optional[str]:
     return None
 
 
-def _matmul_mnk(shapes: List[List[int]]):
-    """(M, N, K, batch) of a matmul from its first two >=2D operands, or None.
+def _matmul_mnk(shapes: List[List[int]], shapes_out: Optional[List[List[int]]] = None):
+    """(M, N, K, batch) of a matmul, using the output to resolve transposes.
+
+    The first two >=2-D inputs are the multiplicands.  When an output matrix is
+    available, enumerate the four transpose combinations and require its trailing
+    [M,N] dimensions to match.  This is essential for weight-gradient/addmm forms
+    such as [K,M] x [K,N] -> [M,N], which a shape-only forward-GEMM heuristic
+    over-counts by up to 2x.
+
     Single source of truth for both the FLOP count (2*M*N*K*batch) and the result
     size M*N*batch — the latter caps oversized inplace-add accumulators in the
     bytes model (see compute_efficiency)."""
@@ -83,28 +100,127 @@ def _matmul_mnk(shapes: List[List[int]]):
             batch *= d
         return s[-2], s[-1], batch
 
-    M, K, abz = mk(a)
-    br, bc, bbz = mk(b)
-    if br == K:
-        N = bc
-    elif bc == K:
-        N = br
-    else:
-        N = bc
-    if min(M, N, K) <= 0:
-        return None
-    # Batch comes from the activation side only. For GroupedMatmul the weight is
-    # a 3-D [E,K,N] tensor but each token visits exactly one expert, so the token
-    # dimension already totals the work — multiplying by E would over-count.
-    return M, N, K, abz
+    ar, ac, abz = mk(a)
+    br, bc, _ = mk(b)
+
+    # A can be [M,K] or [K,M]; B can be [K,N] or [N,K].  Keep only
+    # algebraically valid combinations, then use the output to disambiguate.
+    candidates = set()
+    for M, K_a in ((ar, ac), (ac, ar)):
+        for K_b, N in ((br, bc), (bc, br)):
+            if K_a == K_b and min(M, N, K_a) > 0:
+                candidates.add((M, N, K_a, abz))
+
+    out_matrix = next((s for s in (shapes_out or []) if len(s) >= 2), None)
+    if out_matrix is not None:
+        out_m, out_n = out_matrix[-2], out_matrix[-1]
+        matched = [c for c in candidates if c[0] == out_m and c[1] == out_n]
+        # Multiple transpose paths with the same M/N/K are equivalent.  Different
+        # K values are genuinely ambiguous and must not set a peak denominator.
+        unique = set(matched)
+        if len(unique) == 1:
+            return unique.pop()
+        if matched and len({c[2] for c in matched}) == 1:
+            return matched[0]
+        if candidates:
+            return None
+
+    # Old exports can omit output shapes.  Preserve only an unambiguous standard
+    # A[M,K] x B[K,N] interpretation; otherwise fail closed instead of guessing a
+    # transpose from equal dimensions.
+    standard = (ar, bc, ac, abz) if ac == br and min(ar, bc, ac) > 0 else None
+    if standard:
+        return standard
+    if len(candidates) == 1:
+        return candidates.pop()
+    return None
 
 
-def _estimate_matmul_flops(shapes: List[List[int]]) -> Optional[float]:
-    mnk = _matmul_mnk(shapes)
+def _estimate_matmul_flops(
+    shapes: List[List[int]], shapes_out: Optional[List[List[int]]] = None,
+) -> Optional[float]:
+    mnk = _matmul_mnk(shapes, shapes_out)
     if not mnk:
         return None
     M, N, K, batch = mnk
     return 2.0 * M * N * K * batch
+
+
+def _estimate_sparse_flash_attention_flops(
+    shapes_in: List[List[int]], shapes_out: List[List[int]], is_grad: bool,
+    sparse_mode: Optional[int] = None, sparse_block_size: Optional[int] = None,
+) -> Optional[float]:
+    """Useful BF16 cube FLOPs for token-wise causal SparseFlashAttention.
+
+    CANN SparseFlashAttention uses sparse_indices[B,Sq,Nkv,K] and, on 950DT,
+    sparse_block_size=1 (one selected token per index).  MindSpeed training uses
+    right-down causal mode.  For query row q, the number of valid selected tokens
+    is min(K, max(0, Sk-Sq+q+1)); -1 padding is therefore excluded.
+
+    The returned numerator counts only the matmul-dominated useful work:
+      fwd = 2 * G * C * (Dqk + Dv)
+      bwd = 2 * G * C * (3*Dqk + 2*Dv)
+    where Dqk includes the separate RoPE dimension and G=Hq/Hkv.  Softmax,
+    gather/scatter, invalid tiling lanes and other vector/memory work are not cube
+    FLOPs.  The CSV cannot reconstruct their repeated/discrete memory traffic, so
+    this op is deliberately excluded from MBU, roofline and reclaim estimates.
+    """
+    # Neither attribute is present in kernel_details.csv.  Only compute the
+    # causal token count after the caller supplies verified semantics.
+    if sparse_mode != 3 or sparse_block_size != 1:
+        return None
+    if len(shapes_in) < 6 or len(shapes_out) < (3 if is_grad else 1):
+        return None
+    q, k, v, sparse_indices = shapes_in[:4]
+    if any(len(s) != 4 for s in (q, k, v, sparse_indices)):
+        return None
+    B, Sq, Hq, Dq = q
+    Bk, Sk, Hkv, Dk = k
+    Bv, Sv, Hv, Dv = v
+    Bi, Si, Hi, topk = sparse_indices
+    if (
+        min(B, Sq, Hq, Dq, Sk, Hkv, Dk, Dv, topk) <= 0
+        or (Bk, Bv, Bi) != (B, B, B)
+        or (Sv, Si) != (Sk, Sq)
+        or (Hv, Hi) != (Hkv, Hkv)
+        or Dq != Dk
+        or Hq % Hkv != 0
+        or topk > Sk
+    ):
+        return None
+
+    q_rope, k_rope = shapes_in[-2:]
+    if (
+        len(q_rope) != 4 or len(k_rope) != 4
+        or q_rope[:3] != [B, Sq, Hq]
+        or k_rope[:3] != [B, Sk, Hkv]
+        or q_rope[3] <= 0 or q_rope[3] != k_rope[3]
+    ):
+        return None
+    group = Hq // Hkv
+    if not is_grad:
+        if shapes_out[0] != [B, Sq, Hq, Dv]:
+            return None
+        # Softmax stats [B,Nkv,Sq,G] prove the sparse pattern is shared by the G
+        # query heads associated with each KV head.
+        stats = shapes_out[1:3]
+        if len(stats) < 2 or any(s != [B, Hkv, Sq, group] for s in stats):
+            return None
+    else:
+        if shapes_out[:3] != [q, k, v]:
+            return None
+
+    # right-down causal: the first query can see Sk-Sq+1 keys; equal-length
+    # training reduces to min(topk, q+1).  Multiply by B and KV-head patterns.
+    valid_per_pattern = 0
+    for q_idx in range(Sq):
+        causal_prefix = max(0, min(Sk, Sk - Sq + q_idx + 1))
+        valid_per_pattern += min(topk, causal_prefix)
+    selected_head_pairs = B * Hkv * group * valid_per_pattern
+    d_qk = Dq + q_rope[3]
+    if is_grad:
+        return 2.0 * selected_head_pairs * (3 * d_qk + 2 * Dv)
+    return 2.0 * selected_head_pairs * (d_qk + Dv)
 
 
 def _estimate_attention_flops(shapes_in, shapes_out, is_grad: bool) -> Optional[float]:
@@ -292,13 +408,21 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         di = (parse_dtypes(in_dt[i])[:1] or [""])[0]
         if chip.peak_cube_flops(di) != configured_peak:
             continue
-        f = _estimate_matmul_flops(parse_shapes(in_sh[i]))
+        f = _estimate_matmul_flops(parse_shapes(in_sh[i]), parse_shapes(out_sh[i]))
         if f:
             observed_peak = max(observed_peak, f / (float(dur[i]) * 1e-6))
     # guard (2): trust real datasheet peaks; only an assumed peak gets calibrated.
     calibrated = chip.assumed and observed_peak > configured_peak
     effective_peak = min(observed_peak * 1.02, configured_peak * 2.0) if calibrated else configured_peak
     peak_scale = effective_peak / configured_peak if configured_peak else 1.0  # >= 1.0 (cube only)
+    # For a datasheet-backed (assumed=false) chip, observed > configured cannot be
+    # silently accepted: the selected SKU/precision or the FLOP shape model is
+    # inconsistent.  Keep raw diagnostics, but fail closed on headline MFU/What-if.
+    peak_inconsistent = bool(
+        not calibrated
+        and effective_peak > 0
+        and observed_peak > effective_peak * _PEAK_MEASUREMENT_TOL
+    )
 
     def peak_for(dtype: str, use_cube: bool) -> float:
         # Cube peak gets the observed-ceiling calibration (scale >= 1.0); the
@@ -337,7 +461,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         # (K*N) stay intact. A plain GEMM has output == M*N, so this is a no-op.
         mn_elems = 0
         if types[i] in MATMUL_TYPES:
-            _mnk = _matmul_mnk(shapes_in)
+            _mnk = _matmul_mnk(shapes_in, shapes_out)
             if _mnk:
                 mn_elems = _mnk[0] * _mnk[1] * _mnk[3]   # M * N * batch
         out_numels = {numel(s) for s in shapes_out}
@@ -359,10 +483,19 @@ def compute_efficiency(prof) -> Dict[str, Any]:
 
         is_matmul = types[i] in MATMUL_TYPES
         is_attention = types[i] in ATTENTION_TYPES
+        is_sparse_attention = types[i] in SPARSE_ATTENTION_TYPES
         core_u = str(core[i]).upper()
         is_vector = "VECTOR" in core_u or "AIV" in core_u
         if is_matmul:
-            flops = _estimate_matmul_flops(shapes_in)
+            flops = _estimate_matmul_flops(shapes_in, shapes_out)
+        elif types[i] in SPARSE_ATTENTION_TYPES:
+            flops = _estimate_sparse_flash_attention_flops(
+                shapes_in,
+                shapes_out,
+                types[i] in ATTENTION_GRAD_TYPES,
+                sparse_mode=SETTINGS.sparse_attention_mode,
+                sparse_block_size=(1 if chip.name == "Ascend 950DT" else None),
+            )
         elif is_attention:
             flops = _estimate_attention_flops(
                 shapes_in, shapes_out, types[i] in ATTENTION_GRAD_TYPES)
@@ -374,6 +507,14 @@ def compute_efficiency(prof) -> Dict[str, Any]:
             flops = _estimate_vector_flops(types[i], shapes_in, shapes_out)
         else:
             flops = None
+
+        # Sparse attention's useful FLOP numerator is reconstructible, but the
+        # tensor list is not its physical HBM traffic: selected K/V blocks are
+        # gathered repeatedly and gradient scatter traffic is hidden inside the
+        # fused kernel.  Treating the one-time tensor footprint as bytes moved
+        # would invent an MBU and an unattainable roofline speedup.
+        if is_sparse_attention:
+            b_bytes = 0
 
         # Peak routing: matmul / fused-attention kernels run on the CUBE unit;
         # pure vector-core ops (AI_VECTOR_CORE / MIX_AIV: RMSNorm/SwiGlu/Cast/...)
@@ -388,13 +529,15 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         mfu = (achieved_flops / peak_flops) if achieved_flops else None
         mbu_raw = (achieved_bw / chip.hbm_bandwidth) if achieved_bw else None
         mbu = min(mbu_raw, 1.0) if mbu_raw is not None else None
-        mbu_over_physical = bool(mbu_raw is not None and mbu_raw > 1.02)
+        mbu_over_physical = bool(
+            mbu_raw is not None and mbu_raw > _PEAK_MEASUREMENT_TOL
+        )
 
         # We can only credibly model "ideal time" (and thus wasted time) when we
         # have a FLOP estimate (matmul / fused attention) OR the kernel is a
         # vector-core memory op. Other cube/MIX ops without a FLOP model would
         # look 100% wasted under a memory-only roofline — so we leave them unscored.
-        modeled = (flops is not None) or (is_vector and b_bytes > 0)
+        modeled = ((flops is not None) or (is_vector and b_bytes > 0)) and not is_sparse_attention
         t_compute = (flops / peak_flops) if flops else 0.0
         t_mem = (b_bytes / chip.hbm_bandwidth) if b_bytes else 0.0
         # Ceiling-aware reclaim: matmul / FA / FAG have a realistic MFU ceiling
@@ -403,7 +546,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         # at/above it (running at MFU>=ceiling means dur <= compute_time/ceiling).
         # Non-ceiling modeled ops optimize toward the 100% roofline, so their
         # reclaim == wasted_us.
-        op_class = _op_class(types[i]) if flops is not None else None
+        op_class = _op_class(types[i]) if flops is not None and not is_sparse_attention else None
         ceiling = chip.mfu_ceiling(op_class)
         if modeled:
             ideal_us = max(t_compute, t_mem) * 1e6
@@ -450,6 +593,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
                 "wasted_us": wasted_us,
                 "reclaim_us": reclaim_us,
                 "overhead_bound": overhead_bound,
+                "roofline_eligible": modeled,
                 "op_class": op_class,
                 "ceiling": ceiling,
                 "bound": bound,
@@ -519,7 +663,9 @@ def compute_efficiency(prof) -> Dict[str, Any]:
                 "mfu": round(mfu, 4) if mfu is not None else None,
                 "mbu": round(mbu, 4) if mbu is not None else None,
                 "mbu_raw": round(mbu_raw, 4) if mbu_raw is not None else None,
-                "mbu_over_physical": bool(mbu_raw is not None and mbu_raw > 1.02),
+                "mbu_over_physical": bool(
+                    mbu_raw is not None and mbu_raw > _PEAK_MEASUREMENT_TOL
+                ),
                 "wasted_us": round(t["wasted_us"], 1),
                 "reclaim_us": round(t["reclaim_us"], 1),
             }
@@ -618,7 +764,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     # non-physical >100% on any mixed bf16+fp8 step (which then misfires the
     # peak_underestimated advisory in metrics/core.py).
     mm_peak_time = sum(r["peak_flops"] * r["dur_us"] * 1e-6 for r in mm if r.get("peak_flops"))
-    matmul_mfu = (mm_flops / mm_peak_time) if mm_peak_time else None
+    matmul_mfu_raw = (mm_flops / mm_peak_time) if mm_peak_time else None
     # "assumed" strips the calibration scale (peak_scale) so a genuinely
     # underestimated *assumed* peak still trips >1 (the calibration trigger) —
     # now per-kernel vs each one's un-calibrated peak, not a single bf16 peak.
@@ -631,7 +777,53 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     mc = [r for r in flops_rows if r["type"] in MATMUL_TYPES or r["type"] in ATTENTION_TYPES]
     mc_flops = sum(r["flops"] for r in mc)
     mc_peak_time = sum(r["peak_flops"] * r["dur_us"] * 1e-6 for r in mc if r.get("peak_flops"))
-    model_mfu_compute = (mc_flops / mc_peak_time) if mc_peak_time else None
+    model_mfu_compute_partial = (mc_flops / mc_peak_time) if mc_peak_time else None
+
+    # Duration-weighted coverage over recognized model-compute families.  A known
+    # but unsupported dominant op must make the model MFU unavailable instead of
+    # letting a GEMM-only numerator masquerade as whole-model efficiency.
+    model_rows = [r for r in rows if r["type"] in MATMUL_TYPES or r["type"] in ATTENTION_TYPES]
+    modeled_model_rows = [r for r in model_rows if r.get("flops")]
+    model_total_us = sum(r["dur_us"] for r in model_rows)
+    model_modeled_us = sum(r["dur_us"] for r in modeled_model_rows)
+    flop_coverage = (model_modeled_us / model_total_us) if model_total_us else 0.0
+    flop_model_complete = bool(model_total_us > 0 and flop_coverage >= 0.90)
+    attention_rows = [r for r in rows if r["type"] in ATTENTION_TYPES]
+    attention_total_us = sum(r["dur_us"] for r in attention_rows)
+    attention_modeled_us = sum(r["dur_us"] for r in attention_rows if r.get("flops"))
+    attention_coverage = (attention_modeled_us / attention_total_us) if attention_total_us else None
+    unmodeled_acc: Dict[str, Dict[str, Any]] = {}
+    for r in model_rows:
+        if r.get("flops"):
+            continue
+        a = unmodeled_acc.setdefault(r["type"], {"count": 0, "dur_us": 0.0})
+        a["count"] += 1
+        a["dur_us"] += r["dur_us"]
+    unmodeled_flop_types = {
+        typ: {"count": a["count"], "dur_us": round(a["dur_us"], 1)}
+        for typ, a in sorted(unmodeled_acc.items(), key=lambda kv: kv[1]["dur_us"], reverse=True)
+    }
+    efficiency_reliable = bool(flop_model_complete and not peak_inconsistent)
+    matmul_mfu = matmul_mfu_raw if not peak_inconsistent else None
+    model_mfu_compute = model_mfu_compute_partial if efficiency_reliable else None
+    sparse_present = any(r["type"] in SPARSE_ATTENTION_TYPES for r in model_rows)
+    sparse_flops_modeled = any(
+        r["type"] in SPARSE_ATTENTION_TYPES and r.get("flops") for r in model_rows
+    )
+    flop_model_notes = []
+    if sparse_flops_modeled:
+        flop_model_notes.append(
+            "SparseFlashAttention 按 950DT token-wise（sparse_block_size=1）、"
+            "right-down causal（sparse_mode=3）计算有效稀疏 Cube FLOPs；"
+            "不含 Softmax/Gather/Scatter 与 tiling padding。因 CSV 无法重建离散访存，"
+            "该算子不参与 MBU、roofline 与可回收时延估算。"
+        )
+    elif sparse_present:
+        flop_model_notes.append(
+            "profiler CSV 未记录 SparseFlashAttention 的 sparse_mode；默认不猜测。"
+            "确认本次运行后可显式设置 LLMINSIGHT_SPARSE_MODE=3；仅在 950DT "
+            "token-wise（sparse_block_size=1）语义下启用有效 FLOPs。"
+        )
 
     scatter.sort(key=lambda s: s["dur_us"], reverse=True)
     scatter = scatter[:1500]
@@ -678,6 +870,21 @@ def compute_efficiency(prof) -> Dict[str, Any]:
             "count": a["count"],
         }
 
+    # Do not expose a roofline ranking when the selected denominator is already
+    # contradicted by the data.  Raw aggregate diagnostics stay available via
+    # *_raw / observed_peak, while user-facing MFU and reclaim fields fail closed.
+    public_type_rows = type_rows[:40]
+    public_top_opt = top_opt
+    public_scatter = scatter
+    if peak_inconsistent:
+        public_type_rows = [
+            {**r, "mfu": None, "reclaim_us": 0.0} for r in public_type_rows
+        ]
+        public_top_opt = []
+        public_scatter = []
+        for item in kernel_index.values():
+            item["mfu"] = None
+
     return {
         "available": True,
         "kernel_index": kernel_index,
@@ -695,22 +902,37 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         },
         "roofline_ridge_ai": effective_peak / SETTINGS.chip.hbm_bandwidth,
         "matmul_mfu": round(matmul_mfu, 4) if matmul_mfu else None,
+        "matmul_mfu_raw": round(matmul_mfu_raw, 4) if matmul_mfu_raw else None,
         "matmul_mfu_assumed": round(matmul_mfu_assumed, 4) if matmul_mfu_assumed else None,
         # GEMM + fused-attention combined compute MFU — the "model 算力 MFU" headline.
         "model_mfu_compute": round(model_mfu_compute, 4) if model_mfu_compute else None,
+        "model_mfu_compute_partial": (round(model_mfu_compute_partial, 4)
+                                      if model_mfu_compute_partial else None),
         # Total executed useful FLOPs (matmul + fused attention) in the captured
         # step — numerator for the end-to-end (step) MFU computed in theoretical().
-        "useful_flops_total": sum(r["flops"] for r in flops_rows),
+        "useful_flops_total": mc_flops if efficiency_reliable else None,
+        "useful_flops_modeled_partial": mc_flops,
         "peak_underestimated": calibrated,
-        "by_type": type_rows[:40],
-        "top_optimization": top_opt,
-        "op_ceiling_opt": op_ceiling_opt,
+        "peak_inconsistent": peak_inconsistent,
+        "efficiency_reliable": efficiency_reliable,
+        "flop_model_complete": flop_model_complete,
+        "flop_coverage_pct": round(flop_coverage * 100.0, 1),
+        "attention_flop_coverage_pct": (round(attention_coverage * 100.0, 1)
+                                        if attention_coverage is not None else None),
+        "model_compute_total_us": round(model_total_us, 1),
+        "model_compute_modeled_us": round(model_modeled_us, 1),
+        "attention_total_us": round(attention_total_us, 1),
+        "unmodeled_flop_types": unmodeled_flop_types,
+        "flop_model_notes": flop_model_notes,
+        "by_type": public_type_rows,
+        "top_optimization": public_top_opt,
+        "op_ceiling_opt": {**op_ceiling_opt, "complete": efficiency_reliable},
         # Overhead-bound ops (MFU & MBU both <2%): excluded from top_optimization
         # because the roofline reclaim is physically bogus; listed separately so their
         # time is visible and flagged for kernel-level work (not a roofline target).
         "overhead_bound_ops": overhead_bound_ops,
         "overhead_bound_us": overhead_bound_us,
-        "scatter": scatter,
+        "scatter": public_scatter,
         "kernels_with_flops": len(flops_rows),
         "kernels_total": len(rows),
         "comm_kernels_excluded": skipped_comm,

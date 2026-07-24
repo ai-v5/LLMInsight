@@ -183,7 +183,7 @@ def _sec_header(meta: Dict, overview: Dict, theo: Dict,
     schip = settings.get("chip", {}) or {}
     echip = (eff or {}).get("chip", {}) or {}
 
-    def _glabel(key):                                 # 未知(猜X) label for underivable fields
+    def _glabel(key):                                 # 未知 label for underivable fields
         return (gs.get(key, {}) or {}).get("label", "未知")
 
     def _capval(key):
@@ -191,16 +191,29 @@ def _sec_header(meta: Dict, overview: Dict, theo: Dict,
 
     arch_bits = [b for b in (
         f"hidden {dm['hidden_size']}" if dm.get("hidden_size") else None,
-        f"{dm['num_attention_heads']} heads" if dm.get("num_attention_heads") else None,
+        f"{dm['num_attention_heads']} local heads" if dm.get("num_attention_heads") else None,
     ) if b]
-    arch = "MLA + MoE" + (" · " + " · ".join(arch_bits) if arch_bits else "")
+    arch = (dm.get("architecture") or "架构未识别（仅展示 profiling 可验证特征）")
+    arch += (" · " + " · ".join(arch_bits) if arch_bits else "")
     dtype = dm.get("dtype") or "—"
-    par = f"EP={_glabel('ep_world_size')} · TP/PP/CP 未知（单卡不可得）"
+    par = f"EP={_glabel('ep_world_size')} · TP/PP/CP 未知（当前 profiling 未提供完整 rank 拓扑）"
     moe = (f"experts {_glabel('num_experts')} · top-{dm.get('moe_router_topk', '?')}"
            f" · 每卡 {dm.get('local_experts_per_rank', '?')} 专家 · 专家FFN {dm.get('moe_ffn_hidden_size', '?')}")
     rc = _capval("recompute")
+    sc = _capval("single_card")
+    scope = (meta or {}).get("profile_scope")
+    if sc is True:
+        topology = "单卡训练"
+    elif sc is False:
+        topology = "多卡训练"
+        if scope == "single_rank_or_matrix_missing":
+            topology += "（单 rank 采集）"
+    else:
+        topology = "卡数未知"
+        if scope == "single_rank_or_matrix_missing":
+            topology += "（单 rank / peer matrix 缺失）"
     cap_txt = (f"recompute {rc if rc is not None else '未知'} · "
-               f"{'单卡' if _capval('single_card') else '多卡'} · "
+               f"{topology} · "
                f"blocking {'检出' if _capval('blocking') else '未检出（数据推断）'}")
     chip_name = echip.get("name") or schip.get("name") or "—"
     cube_peak = echip.get("cube_bf16_tflops") or echip.get("peak_bf16_tflops")
@@ -379,7 +392,10 @@ def _sec_theoretical(theo: Dict) -> str:
     cb = theo.get("compute_bound") or {}
     cb_note = ""
     if cb:
-        if cb.get("peak_underestimated"):
+        if cb.get("peak_inconsistent"):
+            cb_note = ('<div class="banner warn">观测吞吐超过所选芯片/精度峰值；'
+                       'MFU 与算子 What-if 已停用，请核对 active chip、dtype 与 shape 语义。</div>')
+        elif cb.get("peak_underestimated"):
             cb_note = ('<div class="banner warn">matmul 实测 MFU <strong>'
                        f'{_e(cb.get("matmul_mfu_pct"))}%</strong> &gt; 100% → '
                        '假设芯片峰值偏低，请在 config.ChipSpec 校正。</div>')
@@ -400,13 +416,16 @@ def _sec_theoretical(theo: Dict) -> str:
     if ub.get("new_mfu") is not None:
         ub_ref = (f' 📐 物理上界（全部 →0，理论不可达）参考：step {_us(ub.get("new_step_us"))} / '
                   f'端到端 MFU {_mfu(ub.get("new_mfu"))} / 省 {_pct(ub.get("save_pct"))}。')
+    has_op = any(w.get("id") == "op_ceiling" for w in levers)
+    op_tip = ('、算子按各自 MFU 天花板（matmul 95% / FA 85% / FAG 70%）收口'
+              if has_op else '；算子 FLOP/峰值口径不完整时不展示算子收益')
     tip = ('<div class="note">💡 此表为<strong>现实可达地板</strong>（非「→0」物理上界）：'
-           '通信重叠至 80–90% 留残留、Free 留 step 2–5%、算子按各自 MFU 天花板'
-           '（matmul 95% / FA 85% / FAG 70%）收口——单项收益小而精，而非冲到 100% 的虚高。'
+           '通信重叠至 80–90% 留残留、Free 留 step 2–5%'
+           + op_tip + '。'
            '优先级：先做计算-通信重叠（--moe-fb-overlap / 异步通信），再压同步空泡。'
            + ub_ref +
            '　⚠️ 「未掩盖通信」与算子页 <strong>HcclLaunchAicpuKernel</strong> '
-           '是同一段集合通信（单卡几乎全是 Wait，非下发延迟），勿重复计入。</div>')
+           '是同一段集合通信（当前 rank 中可能以 Wait 为主，非下发延迟），勿重复计入。</div>')
 
     note = (f'<div class="note">{_e(theo.get("note"))}</div>'
             if theo.get("note") else "")
@@ -498,11 +517,25 @@ def _sec_efficiency(eff: Dict) -> str:
                  rows, align=["l", "c", "r", "r", "r", "r"])
     mm = eff.get("matmul_mfu")
     pu = eff.get("peak_underestimated")
+    incomplete = not eff.get("flop_model_complete", True)
+    inconsistent = bool(eff.get("peak_inconsistent"))
     sub = (f"matmul（cube/GEMM）MFU {_mfu(mm)}"
            + ("（实测超假设峰值 → 已校准）" if pu else "")
+           + ("（峰值/精度/shape 口径冲突，已停用）" if inconsistent else "")
            + f" · roofline ridge AI {eff.get('roofline_ridge_ai','—')}"
            + f" · 建模 kernel {_int(eff.get('kernels_with_flops'))} 个")
-    return _panel("算子效率 · Top 优化候选（vs Roofline 理想）", sub, tbl)
+    warnings = ""
+    if incomplete:
+        missing = "、".join((eff.get("unmodeled_flop_types") or {}).keys()) or "未知算子"
+        warnings += ('<div class="banner warn">主导计算算子 FLOP 模型覆盖不足'
+                     f'（覆盖 {_pct(eff.get("flop_coverage_pct"))}；未建模：{_e(missing)}）。'
+                     '模型 MFU/HFU 与算子 What-if 已保持不可用。</div>')
+    if inconsistent:
+        warnings += ('<div class="banner warn">观测吞吐超过所选芯片/精度峰值；'
+                     '请核对 active chip、dtype 与 shape 语义。当前 MFU 不作为有效结论。</div>')
+    for note in (eff.get("flop_model_notes") or []):
+        warnings += f'<div class="banner info">🧮 {_e(note)}</div>'
+    return _panel("算子效率 · Top 优化候选（vs Roofline 理想）", sub, warnings + tbl)
 
 
 def _sec_communication(comm: Dict) -> str:
@@ -580,7 +613,7 @@ def _sec_attribution(attr: Dict) -> str:
                 f'{_us(moe.get("dispatch_comm_us"))}。</div>')
     return _panel(
         "模型结构归因",
-        "按算子命名启发式归因到 MLA / MoE / Norm / Optimizer 等（基于 device 计算时间）",
+        "按算子命名启发式归因到 Attention / MoE / Norm / Optimizer 等（基于 device 计算时间）",
         f'<div class="two-col"><div>{tbl}</div>'
         f'<div><div class="mini-h">通信（wall-clock，单列不入计算环）</div>{comm_tbl}'
         f'{moe_line}</div></div>')

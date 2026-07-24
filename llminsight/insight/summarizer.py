@@ -29,10 +29,10 @@ SYSTEM_PROMPT = (
     "请基于这些事实，产出一份面向算法/训练工程师的简洁中文诊断报告，包含："
     "(1) 一句话总体结论；(2) 按收益排序的 Top 3-5 优化项，每项给【现象→根因→可执行建议→预计收益→置信度】；"
     "(3) 必要的采集可信度提醒。要求：只用给定数据，不臆造数字；建议要落地到具体开关/参数。"
-    "模型结构与训练/采集配置均由 profiling 反推（model.derived 为反推值，model.unknown_guesses 为"
-    "单卡不可得的\"未知(猜X)\"项——不要当作确定值；capture.state 给出每条采集判定的依据与置信度）。"
+    "模型特征与训练/采集配置均由 profiling 反推（model.derived 为反推值，model.unknown_fields 为"
+    "当前数据不可得的未知项；capture.state 给出每条采集判定的依据与置信度）。"
     "仅当 capture.state.blocking.value 为真时，才把 host 指标标注为 ASCEND_LAUNCH_BLOCKING 采集干扰；"
-    "否则应将 host 同步开销归因为动态 shape 的 D2H 同步（见 capture.state.host_sync_stall）。"
+    "否则只能把动态 shape D2H 作为待 trace 关联验证的候选原因，不能写成已证实因果。"
 )
 
 
@@ -72,8 +72,11 @@ def build_summary(m: Dict[str, Any],
         for k, f in (cfg.get("capture") or {}).items()
     }
     model_block = {
-        "arch": "DeepSeek-V3 风格 MLA + MoE（由 profiling 反推，无启动脚本）",
+        "arch": derived_model.get("architecture") or "架构未识别（仅展示 profiling 可验证特征）",
         "derived": derived_model,
+        "unknown_fields": {k: g.get("label") for k, g in guesses.items()},
+        # Backward-compatible alias for existing consumers; values now remain
+        # unknown rather than carrying model-family numeric guesses.
         "unknown_guesses": {k: g.get("label") for k, g in guesses.items()},
     } if (derived_model or guesses) else None
 
@@ -95,6 +98,11 @@ def build_summary(m: Dict[str, Any],
         "efficiency": {
             "matmul_mfu": eff.get("matmul_mfu"),
             "peak_underestimated": eff.get("peak_underestimated"),
+            "peak_inconsistent": eff.get("peak_inconsistent"),
+            "efficiency_reliable": eff.get("efficiency_reliable"),
+            "flop_model_complete": eff.get("flop_model_complete"),
+            "flop_coverage_pct": eff.get("flop_coverage_pct"),
+            "unmodeled_flop_types": eff.get("unmodeled_flop_types"),
             "roofline_ridge_ai": _round(eff.get("roofline_ridge_ai"), 1),
             "kernels_with_flops": eff.get("kernels_with_flops"),
             "top_optimization": [

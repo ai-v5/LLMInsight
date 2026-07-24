@@ -43,7 +43,7 @@ STREAMS = [
 DEVICE_PROC = "Ascend Hardware"
 COMM_PROC = "Communication"
 
-_GEOM_VERSION = "v5"  # bump when geometry/stream logic changes (cache invalidation)
+_GEOM_VERSION = "v6"  # sparse-attention classification changed; invalidate geometry cache
 
 
 def _is_notify_wait(name: str) -> bool:
@@ -380,16 +380,28 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any], prof=None) -> Dict[st
     modeled_pct = (round(min(geom["modeled_dev_us"] / geom["span_us"] * 100, 100.0), 1)
                    if geom.get("span_us") else None)
 
+    attn_total_us = float((eff or {}).get("attention_total_us") or 0.0)
+    attn_cov = (eff or {}).get("attention_flop_coverage_pct")
+    attn_util_available = bool(attn_total_us > 0 and attn_cov is not None and attn_cov >= 90.0)
+    missing_attn = [t for t in ((eff or {}).get("unmodeled_flop_types") or {})
+                    if t in ATTENTION_TYPES]
+
+    cube_available = not bool((eff or {}).get("peak_inconsistent"))
     utilization = [
-        {"key": "cube", "label": "Cube 利用率(GEMM)", "available": True, "unit": "%",
+        {"key": "cube", "label": "Cube 利用率(GEMM)", "available": cube_available, "unit": "%",
          "color": "#4f9fe0", "series": compute_series,
          "abs": cube_abs, "abs_unit": "TFLOP/s", "peak": peak_tflops,
          "peak_unit": "TFLOP/s", "kind": "rate",
+         "reason": (None if cube_available else
+                    "观测吞吐超过所选芯片/精度峰值，Cube 利用率口径不可信"),
          "note": "matmul/GEMM 的 ΣFLOPs /（桶时长 × Cube 有效峰值）；FlashAttention 见下一条独立泳道"},
-        {"key": "flash_attn", "label": "FlashAttention 利用率", "available": True, "unit": "%",
+        {"key": "flash_attn", "label": "FlashAttention 利用率", "available": attn_util_available, "unit": "%",
          "color": "#a371f7", "series": fa_series,
          "abs": fa_abs, "abs_unit": "TFLOP/s", "peak": peak_tflops,
          "peak_unit": "TFLOP/s", "kind": "rate",
+         "reason": (None if attn_util_available else
+                    ("Attention FLOP 语义未建模：" + "、".join(missing_attn)
+                     if missing_attn else "本次无可计算 FLOP 的 Attention 算子")),
          "note": "FlashAttention(fwd+grad)的 ΣFLOPs /（桶时长 × Cube 有效峰值）；FA 跑在 cube/MIX_AIC 上，单列以看其 MFU 占比"},
         {"key": "vector", "label": "Vector 利用率", "available": True, "unit": "%",
          "color": "#4caf50", "series": vector_series,
