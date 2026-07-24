@@ -102,7 +102,7 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
             cards.append(_card(
                 "comm_not_overlapped", "high", "通信",
                 f"通信掩盖严重不足：未掩盖通信占 step {cno}%，计算-通信重叠率仅 {overlap}%",
-                "EP64 下 MoE alltoall 通信量大，且计算与通信重叠窗口不足；moe-fb-overlap / "
+                "专家并行 alltoall 通信量大，且计算与通信重叠窗口不足；moe-fb-overlap / "
                 "异步通信未能覆盖大部分通信。",
                 "核对 --moe-fb-overlap / --moe-permutation-async-comm 是否生效；增大重叠窗口、"
                 "调整通信切分与下发顺序。",
@@ -112,7 +112,7 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
             ))
 
     # 2. AICPU-driven collective communication (NOT mere launch overhead) ---
-    #    HcclLaunchAicpuKernel is the AI_CPU operator that *executes* the EP64
+    #    HcclLaunchAicpuKernel is the AI_CPU operator that executes collectives
     #    collectives in AICPU-unfold mode; its device duration is the time the
     #    AICPU is occupied inside the collective (here ~100% Wait, Transit≈0),
     #    i.e. communication wait — not kernel-launch latency. It is the same
@@ -126,9 +126,9 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
         cards.append(_card(
             "aicpu_dispatch", "high", "通信",
             f"AICPU 集合通信执行占 device {aicpu['ratio']}%：HcclLaunchAicpuKernel（单次 max {aicpu['max_us']/1000:.0f}ms，主要是通信等待）",
-            "HcclLaunchAicpuKernel 是 AICPU 展开模式下驱动 EP64 alltoall / allGather 等集合通信的 AI_CPU 算子，"
+            "HcclLaunchAicpuKernel 是 AICPU 展开模式下驱动 alltoall / allGather 等集合通信的 AI_CPU 算子，"
             f"其 device 时长是 AICPU 占用在集合通信中的时间，而非内核启动 / 下发延迟（单次达 {aicpu['max_us']/1000:.0f}ms，"
-            "远超任何下发耗时量级）。本次单卡采集中集合通信 Transit≈0、几乎 100% 为 Wait，故这段时间主要是"
+            "远超任何下发耗时量级）。本次单 rank 采集中集合通信 Transit≈0、几乎 100% 为 Wait，故这段时间主要是"
             f"「等待对端 / 同步」。它与 step 的 Communication 实为同一段时间（{share_txt}），切勿与「未掩盖通信」相加。",
             "① 优先把这段通信掩盖到计算下（核对 --moe-fb-overlap / --moe-permutation-async-comm，扩大重叠窗口）；"
             "② 缩短通信本身（HCCL 算法 / HCCL_BUFFSIZE、评估 EP 规模、增大 token 批次以减少 collective 次数）；"
@@ -190,7 +190,34 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
 
     # 5. low-efficiency / optimization room --------------------------------
     if eff.get("available"):
-        top = [r for r in eff.get("top_optimization", []) if r.get("wasted_us", 0) > 0][:5]
+        if not eff.get("flop_model_complete", True):
+            missing = eff.get("unmodeled_flop_types") or {}
+            missing_txt = "、".join(list(missing)[:4]) or "未知主导算子"
+            cards.append(_card(
+                "flop_model_incomplete", "high", "采集体检",
+                f"模型 FLOP 覆盖不足：{missing_txt} 未建模，完整 MFU/HFU 已停用",
+                "已识别到模型计算算子，但其 shape/稀疏语义不足以可靠换算 FLOPs；仅用其余 GEMM 会系统性高估或低估模型效率。",
+                "为对应算子补充经算子语义验证的 FLOP 模型；在此之前只使用原始耗时、模块归因和时间构成。",
+                "避免把局部 GEMM MFU 误当全模型 MFU，也不生成不完整的算子 What-if 收益。",
+                1.0,
+                {"coverage_pct": eff.get("flop_coverage_pct"), "unmodeled_types": missing},
+            ))
+        if eff.get("peak_inconsistent"):
+            chipinfo = eff.get("chip", {})
+            cards.append(_card(
+                "peak_inconsistent", "high", "采集体检",
+                "算力口径不一致：观测吞吐超过所选芯片/精度峰值，MFU 已停用",
+                "可能是 active chip/精度选择错误，或算子 shape→FLOPs 解释不适用于当前算子；真实 kernel 不应超过物理峰值。",
+                "先核对实际芯片 SKU、计算精度与算子布局，再启用 MFU；不要把原始超峰值比例解释为利用率。",
+                "恢复物理一致的 MFU/What-if 口径后再做效率排序。",
+                1.0,
+                {"configured_peak_tflops": chipinfo.get("peak_bf16_tflops"),
+                 "observed_peak_tflops": chipinfo.get("observed_peak_tflops")},
+            ))
+        # Ranking against a roofline is actionable only when the dominant model
+        # operators have FLOP models and the selected chip/precision is physical.
+        top = ([r for r in eff.get("top_optimization", []) if r.get("wasted_us", 0) > 0][:5]
+               if eff.get("efficiency_reliable") else [])
         if top:
             names = "、".join(f"{r['name'][:24]}({r['bound']},省~{r['wasted_us']/1000:.1f}ms)" for r in top[:3])
             total_waste = sum(r["wasted_us"] for r in top)
@@ -278,7 +305,7 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
                        if head.get("new_mfu") else "")
             cards.append(_card(
                 "theoretical_whatif", "info", "理论上界",
-                f"理论上界与 What-if：全部优化项叠加可省约 {head['save_pct']}% step{mfu_txt}",
+                f"理论上界与 What-if：当前可建模项叠加可省约 {head['save_pct']}% step{mfu_txt}",
                 "由 step 时间构成推导优化上界：通信掩盖、消除空泡为最大两块收益来源。",
                 "按 What-if 收益排序优化优先级；先攻通信掩盖（最大单项），再压空泡，可逐项勾选看叠加收益。",
                 f"综合 What-if 上界约 {head['save_pct']}%（{head.get('basis','')}）。",
@@ -288,16 +315,18 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
 
     # 10. parallelism advisor ----------------------------------------------
     #     alltoallv presence proves expert parallelism is on; a single rank
-    #     cannot reveal EP world size, so we advise off a labelled guess.
+    #     cannot reveal EP world size, so advise without inventing a numeric EP.
     ep_g = guesses.get("ep_world_size", {}) or {}
     ep_label = ep_g.get("label", "未知")
     ep_guess = ep_g.get("guess")
-    if ep_guess and ratios.get("comm_not_overlapped_pct", 0) >= 15:
+    comm_types = {str(x.get("type", "")).lower() for x in (comm.get("by_type") or [])}
+    has_alltoall = any(t.startswith("alltoall") for t in comm_types)
+    if has_alltoall and ratios.get("comm_not_overlapped_pct", 0) >= 15:
         cards.append(_card(
             "parallelism_advisor", "medium", "并行策略",
-            f"并行策略提示：EP={ep_label} 下通信（alltoall）占比偏高、未掩盖 {ratios.get('comm_not_overlapped_pct')}%",
-            "存在 alltoallv（专家并行已开启）；大 EP 带来密集 alltoall 与下发开销，未能与计算充分重叠。"
-            "（单卡采集无法确知 EP world size，此处为推测值。）",
+            f"并行策略提示：专家并行 alltoall 占比偏高、未掩盖 {ratios.get('comm_not_overlapped_pct')}%（EP 未知）",
+            "存在 alltoallv（专家并行已开启），但当前单 rank profiling 没有 peer topology，"
+            "不能推出 EP world size；问题是通信暴露，而非某个假定 EP 数字本身。",
             "评估 EP↓ + TP↑ 的再平衡，或加强通信-计算重叠；权衡专家并行的通信代价 vs 负载均衡。",
             "降低 alltoall 占比与下发频次，缓解通信瓶颈（需结合多卡负载数据确认）。",
             0.5,

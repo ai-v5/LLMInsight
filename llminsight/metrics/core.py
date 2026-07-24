@@ -426,12 +426,15 @@ _MODULE_RULES = [
                       "GatherElements"]),
     ("MoE-Router", ["TopKV2", "Sigmoid", "SigmoidGrad", "ArgMaxWithValue", "Sort",
                      "Cumsum", "ReduceSum", "LpNormV2"]),
-    ("Attention-MLA", ["FlashAttentionScore", "FlashAttentionScoreGrad",
+    ("Attention", ["FlashAttentionScore", "FlashAttentionScoreGrad",
+                        "SparseFlashAttention", "SparseFlashAttentionGrad",
+                        "SparseFlashMla", "SparseFlashMlaGrad",
                         "RotaryPositionEmbedding", "RotaryPositionEmbeddingGrad"]),
     ("Norm", ["RmsNorm", "RmsNormGrad"]),
     ("Optimizer", ["ApplyAdamWV2", "ApplyAdamW"]),
     ("Embedding/Loss", ["GatherV2", "EmbeddingDenseGradV2", "Exp", "Log"]),
-    ("GEMM/Projections (shared)", ["MatMulV3", "GemmV3", "MatMul", "BatchMatMul"]),
+    ("GEMM/Projections (shared)", ["MatMulV3", "GemmV3", "MatMul", "BatchMatMul",
+                                    "BatchMatMulV2", "BatchMatMulV3"]),
 ]
 
 
@@ -497,7 +500,7 @@ def attribution(prof) -> Dict[str, Any]:
         "comm_total_us": round(comm_total, 1),
         "moe_focus": moe_focus,
         "note": (
-            "按算子命名启发式归因，基于 device 计算时间；GEMM/Projections 为 MLA 投影 / Router / "
+            "按算子命名启发式归因，基于 device 计算时间；GEMM/Projections 为 Attention 投影 / Router / "
             "LM-Head 共用未细分。通信为 wall-clock（多为等待），单独列出不并入计算环。"
         ),
     }
@@ -524,7 +527,9 @@ REALISTIC_FREE_RESIDUAL_BAND = (0.02, 0.05)
 
 
 def _single_card(prof) -> bool:
-    """No cross-rank traffic → single-card capture. communication_matrix wraps each
+    """Infer training topology without confusing a single-rank shard with one card.
+
+    communication_matrix wraps each
     step as {step: {p2p:{}, collective:{}}}, so emptiness must be tested on the inner
     groups, not the (always-present) outer wrapper."""
     cm = getattr(prof, "communication_matrix", None) or {}
@@ -536,6 +541,10 @@ def _single_card(prof) -> bool:
                 return False
         elif step_v:
             return False
+    # HCCL collectives prove distributed execution even when this export only
+    # contains rank 0 and therefore has an empty peer matrix.
+    if any(c.get("type") != "Total" for c in (getattr(prof, "communication", None) or [])):
+        return False
     return True
 
 
@@ -721,7 +730,7 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
         "levers": levers,
         "combined": combined,
         "blocking": bool(blocking),
-        "single_card": bool(single_card),
+        "single_card": single_card,
         "note": "现实地板 = 业界可达优化上限（重叠 80–90% / Free 残留 2–5% / 算子达 MFU 天花板）"
                 "作用于当前加载 profiling 的实测值；与物理上界（全部 →0，不可达）的差即不可消除部分；"
                 "失真提示按本次采集的 blocking 与单卡状态自动判定。",
@@ -827,7 +836,8 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
     # disjoint from 未掩盖通信 and Free — so this lever stacks with the other two.
     # Kernels already at/above their ceiling are excluded (no further tuning), so the
     # gain is the honest ceiling-relative headroom, not a naive "everything→100%".
-    oco = eff.get("op_ceiling_opt") if eff.get("available") else None
+    oco = (eff.get("op_ceiling_opt")
+           if eff.get("available") and eff.get("efficiency_reliable") else None)
     op_reclaim_full = min(float((oco or {}).get("total_reclaim_us") or 0.0), computing)
     # carve the recomputed kernels' ceiling headroom out of 算子余量 so it is disjoint
     # from the 重计算 lever (which removes those kernels wholesale). op_reclaim_full still
@@ -903,6 +913,11 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
                         if step_mfu else raw_combined_step_us)
     combined_save_us = max(stage - combined_step_us, 0.0)
     combined_capped = combined_step_us > raw_combined_step_us + 1.0
+    combined_parts = ["通信掩盖", "空泡"]
+    if op_reclaim > 0:
+        combined_parts.append("算子极致优化")
+    if recompute_us > 0:
+        combined_parts.append("关闭重计算")
     whatif_combined = {
         "save_us": round(combined_save_us, 1),
         "save_pct": _pct(combined_save_us, stage),
@@ -914,13 +929,23 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         "capped_by_physical_mfu": combined_capped,
         "new_mfu": (round(min(step_mfu * stage / combined_step_us, 1.0), 4)
                     if (step_mfu and combined_step_us > 0) else None),
-        "basis": ("全部优化项叠加（通信掩盖 / 空泡 / 算子极致优化"
-                  + (" / 关闭重计算" if recompute_us > 0 else "")
-                  + " 互不重叠，收益可加）。"),
+        "basis": "当前可建模优化项叠加（" + " / ".join(combined_parts) + "，收益按不重叠口径相加）。",
     }
 
     matmul_mfu = eff.get("matmul_mfu") if eff.get("available") else None
     compute_bound_note = None
+    if eff.get("peak_inconsistent"):
+        chipinfo = eff.get("chip", {})
+        compute_bound_note = {
+            "peak_inconsistent": True,
+            "peak_underestimated": False,
+            "matmul_mfu_pct": None,
+            "ideal_matmul_us": None,
+            "headroom_us": None,
+            "assumed_peak_tflops": chipinfo.get("peak_bf16_tflops"),
+            "observed_peak_tflops": chipinfo.get("observed_peak_tflops"),
+            "hint": "观测吞吐超过所选芯片/精度峰值；MFU 与算子 What-if 已停用，请核对芯片、精度和 shape 语义。",
+        }
     if matmul_mfu:
         if matmul_mfu > 1.0:
             # achieved exceeds the assumed peak -> peak is underestimated, not a
@@ -959,7 +984,8 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
     _cap_state = cap.get("capture", {}) or {}
     blocking = bool((_cap_state.get("blocking", {}) or {}).get("value")) if _cap_state else \
         ((cap.get("env") or {}).get("ASCEND_LAUNCH_BLOCKING") == "1")
-    single_card = _single_card(prof)
+    sc_fact = (_cap_state.get("single_card", {}) or {}).get("value")
+    single_card = sc_fact if isinstance(sc_fact, bool) else _single_card(prof)
     realistic = _whatif_realistic(
         stage, computing, comm_no, free,
         u.get("communication", 0.0) or 0.0, u.get("overlapped", 0.0) or 0.0,
@@ -1004,6 +1030,7 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         "step_mfu": round(step_mfu, 4) if step_mfu else None,
         "step_hfu": round(hfu, 4) if hfu else None,
         "recompute": recompute,
-        "note": "端到端 MFU=模型理论FLOPs/(峰值×step)（不含重计算）；HFU 含重计算重复执行的 FLOPs，"
-                "HFU≥MFU、差值即重计算开销。What-if 为基于 step 时间构成的上界估算，用于优化排序，芯片峰值为假设值。",
+        "note": ("端到端 MFU=模型理论FLOPs/(峰值×step)（不含重计算）；HFU 含重计算重复执行的 FLOPs。"
+                 "当主导算子 FLOP 模型不完整或峰值口径不一致时，MFU/HFU 与算子收益保持 unavailable；"
+                 "通信、空泡和重计算仍按各自证据单独估算。"),
     }

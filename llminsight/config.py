@@ -40,6 +40,22 @@ def _default_script_path() -> str:
     return os.environ.get("LLMINSIGHT_SCRIPT", "")
 
 
+def _sparse_attention_mode() -> Optional[int]:
+    """Explicit sparse-mask semantics for FLOP accounting.
+
+    Profiler CSVs record tensor shapes but not the ``sparse_mode`` operator
+    attribute.  Keep it unknown by default; callers may opt in with
+    ``LLMINSIGHT_SPARSE_MODE=3`` when the launch configuration is verified.
+    """
+    raw = os.environ.get("LLMINSIGHT_SPARSE_MODE", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 DATA_DIR = _default_data_dir()
 SCRIPT_PATH = _default_script_path()
 
@@ -289,6 +305,7 @@ class Settings:
     script_path: str = field(default_factory=_default_script_path)
     chip: ChipSpec = field(default_factory=_load_default_chip)
     chip_key: str = DEFAULT_CHIP
+    sparse_attention_mode: Optional[int] = field(default_factory=_sparse_attention_mode)
     model: ModelConfig = field(default_factory=ModelConfig)
     # Cap how many trace events the timeline endpoint streams to the browser.
     timeline_max_slices: int = 4000
@@ -309,6 +326,8 @@ class Settings:
             # asdict() omits the hbm_capacity_gb @property, so add it explicitly.
             "chip": {**asdict(self.chip), "hbm_capacity_gb": self.chip.hbm_capacity_gb},
             "chip_key": self.chip_key,
+            # Explicit override only: profiler CSV does not carry sparse_mode.
+            "sparse_attention_mode": self.sparse_attention_mode,
             # YAML-backed presets for the UI dropdown (no secrets; peak summary).
             # peak_bf16_tflops is the CUBE bf16 peak (the matmul-MFU denominator).
             "chips": _chip_dropdown(),

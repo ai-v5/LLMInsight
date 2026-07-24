@@ -1,4 +1,4 @@
-"""Derive model architecture + training/capture config from the profiling data
+"""Derive model traits + training/capture config from the profiling data
 ITSELF — never from an external launch script.
 
 Rationale (H4 Zero-Config): a launch script does not necessarily correspond
@@ -19,10 +19,9 @@ Three public entry points:
                                existing consumers keep working, PLUS rich
                                ``model`` / ``capture`` / ``guesses`` blocks.
 
-Fields that single-card / single-step profiling genuinely cannot pin down
-(EP world size, total experts, total layers, global batch) are returned as
-``guesses`` with a "未知(猜X)" label and a best-effort numeric guess — never as a
-fabricated definite value.
+Fields that single-rank / single-step profiling genuinely cannot pin down
+(EP world size, total experts, total layers, global batch) remain ``未知``.  We do
+not inject model-family priors as numeric guesses.
 """
 from __future__ import annotations
 
@@ -69,6 +68,23 @@ def _count_named(kd: pd.DataFrame, sub: str, exclude: Optional[str] = None) -> i
     return int(mask.sum())
 
 
+def _count_types(kd: pd.DataFrame, types: tuple[str, ...], exclude: Optional[str] = None) -> int:
+    """Count profiler op types, falling back to names on older exports."""
+    if kd is None or kd.empty:
+        return 0
+    if "Type" in kd.columns:
+        exact = int(kd["Type"].astype(str).isin(types).sum())
+        if exact:
+            return exact
+    names = _name_series(kd)
+    mask = pd.Series(False, index=names.index)
+    for typ in types:
+        mask |= names.str.contains(typ, case=False, regex=False, na=False)
+    if exclude:
+        mask &= ~names.str.contains(exclude, case=False, regex=False, na=False)
+    return int(mask.sum())
+
+
 def _shape_col(kd: pd.DataFrame, want: str) -> Optional[str]:
     for c in kd.columns:
         cl = c.lower()
@@ -110,13 +126,34 @@ def _api_sum(api: pd.DataFrame, contains: str = None, equals: str = None) -> tup
 # MODEL architecture (from kernel shapes)
 # --------------------------------------------------------------------------- #
 def derive_model(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
-    """Reconstruct DeepSeek-V3 / MLA + MoE architecture from kernel shapes."""
+    """Reconstruct only operator/shape traits supported by the current profile."""
     kd = prof.kernel_details
     facts: Dict[str, Dict[str, Any]] = {}
     if kd is None or kd.empty:
         return facts
     sin = _shape_col(kd, "in")
     sout = _shape_col(kd, "out")
+
+    # Architecture is a generic operator-family description, not a model-name
+    # guess.  SparseFlashAttention is used by more than one model family; neither
+    # its presence nor MoE collectives prove DeepSeek/GLM or a particular EP size.
+    type_values = set(kd["Type"].astype(str)) if "Type" in kd.columns else set(_name_series(kd))
+    has_moe = any(t.startswith("GroupedMatmul") for t in type_values)
+    has_sparse_attn = any(t.startswith("SparseFlashAttention") for t in type_values)
+    has_fused_attn = has_sparse_attn or any("FlashAttention" in t for t in type_values)
+    traits: List[str] = []
+    if has_moe:
+        traits.append("MoE")
+    if has_sparse_attn:
+        traits.append("Sparse Attention")
+    elif has_fused_attn:
+        traits.append("Fused Attention")
+    if traits:
+        facts["architecture"] = _fact(
+            " + ".join(traits),
+            "由当前 profiling 中出现的算子族归纳，不推断具体模型名称",
+            "high",
+        )
 
     # --- hidden_size + MLA low-rank dims, from every RmsNorm gamma -----------
     # RmsNorm input is "[S,1,H];[H]"; the trailing 1-D operand is gamma whose
@@ -291,15 +328,21 @@ def derive_capture(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
         "high" if total_api_t else "unknown",
     )
 
-    # --- recompute granularity, from FlashAttention fwd/grad count ----------
+    # --- recompute granularity, from fused-attention fwd/grad count ----------
     # Forward attention runs once per layer; full recompute reruns it in the
     # backward, so fwd≈2×grad. recompute off → fwd≈grad. The ratio also quantifies
     # HOW MUCH forward is recomputed — ρ=(fwd-grad)/fwd (full→0.5, off→0, selective
     # between) — so we carry the raw counts downstream for the recompute-overhead
     # estimate in metrics (see core._recompute_overhead).
-    fa_grad = _count_named(kd, "FlashAttentionScoreGrad")
-    fa_all = _count_named(kd, "FlashAttentionScore")
-    fa_fwd = fa_all - fa_grad
+    fwd_types = (
+        "FlashAttentionScore", "SparseFlashAttention", "SparseFlashMla",
+        "PromptFlashAttention", "FusedInferAttentionScore",
+    )
+    grad_types = (
+        "FlashAttentionScoreGrad", "SparseFlashAttentionGrad", "SparseFlashMlaGrad",
+    )
+    fa_fwd = _count_types(kd, fwd_types, exclude="Grad")
+    fa_grad = _count_types(kd, grad_types)
     if fa_grad > 0:
         r = fa_fwd / fa_grad
         if r >= 1.5:
@@ -309,14 +352,14 @@ def derive_capture(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
         else:
             val, conf = "selective", "medium"
         fact = _fact(
-            val, f"FlashAttention 前向/反向次数比 = {r:.2f}（fwd {fa_fwd} / grad {fa_grad}）", conf)
+            val, f"融合 Attention 前向/反向次数比 = {r:.2f}（fwd {fa_fwd} / grad {fa_grad}）", conf)
         # raw signals for the recompute-overhead quantifier (ρ = (fwd-grad)/fwd)
         fact["fwd_grad_ratio"] = round(float(r), 4)
         fact["fa_fwd"] = int(fa_fwd)
         fact["fa_grad"] = int(fa_grad)
         out["recompute"] = fact
     else:
-        out["recompute"] = _fact(None, "无 FlashAttentionScoreGrad，无法判定", "unknown")
+        out["recompute"] = _fact(None, "无可配对的融合 Attention 反向算子，无法判定", "unknown")
 
     # --- single card, from communication_matrix ----------------------------
     cm = prof.communication_matrix or {}
@@ -336,8 +379,8 @@ def derive_capture(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
         out["single_card"] = _fact(False, "communication_matrix contains cross-rank collective entries", "high")
     elif has_hcom:
         out["single_card"] = _fact(
-            None,
-            "communication_matrix is empty, but communication.json contains HCCL collectives; this is a single-rank profile shard / missing matrix, not proof of single-card training",
+            False,
+            "communication.json contains HCCL collectives, proving distributed execution; the empty matrix means the capture is a single-rank shard / lacks peer topology",
             "medium",
         )
     else:
@@ -357,36 +400,37 @@ def derive_capture(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------- #
-# Underivable from single-card / single-step → 未知(猜X)
+# Underivable from single-rank / single-step → 未知
 # --------------------------------------------------------------------------- #
 def derive_guesses(prof: ProfileData,
                    model: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Fields the data cannot pin down; show 未知 + a parenthetical best guess."""
+    """Fields the data cannot pin down; keep them unknown without family priors."""
     local = (model.get("local_experts_per_rank", {}) or {}).get("value")
 
-    # EP world size: alltoallv presence proves expert parallelism exists, but a
-    # single rank cannot reveal the world size. DeepSeek-V3 here is typically EP64.
+    # alltoallv proves expert parallelism exists, but a single rank cannot reveal
+    # its world size.  A model-family default (for example EP64) is not evidence.
     has_alltoall = any(
         c.get("type", "").lower().startswith("alltoall")
         for c in (prof.communication or [])
     )
-    ep_guess = 64 if has_alltoall else None
+    ep_guess = None
     guesses: Dict[str, Dict[str, Any]] = {
         "ep_world_size": {
-            "label": f"未知(猜{ep_guess})" if ep_guess else "未知",
+            "label": "未知",
             "guess": ep_guess,
-            "basis": "存在 alltoallv（专家并行确实开启），但单卡无法得知 world size；DeepSeek-V3 此处常见 EP64",
+            "basis": ("存在 alltoallv（专家并行已开启），但单 rank profiling 无 peer topology，"
+                      "无法推出 EP world size" if has_alltoall else "无可靠 EP world-size 信号"),
         },
         "num_experts": {
-            "label": f"未知(猜{local * ep_guess})" if (local and ep_guess) else "未知",
-            "guess": (local * ep_guess) if (local and ep_guess) else None,
-            "basis": f"= local_experts_per_rank({local}) × EP({ep_guess})（依赖 EP 猜测）"
-                     if (local and ep_guess) else "依赖 EP world size（未知）",
+            "label": "未知",
+            "guess": None,
+            "basis": (f"已知 local_experts_per_rank={local}，但 EP world size 未知"
+                      if local else "依赖 local experts 与 EP world size（均无法完整推出）"),
         },
         "num_layers": {
-            "label": "未知(猜10)",
-            "guess": 10,
-            "basis": "FlashAttention 次数被 microbatch / PP 切分混淆，无法反推总层数；样例目录名暗示 1 dense + 9 moe = 10",
+            "label": "未知",
+            "guess": None,
+            "basis": "Attention 次数被 microbatch、重计算与 PP 切分共同影响，无法反推总层数",
         },
         "global_batch_size": {
             "label": "未知",
