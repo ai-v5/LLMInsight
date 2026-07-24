@@ -247,6 +247,13 @@ def _sec_header(meta: Dict, overview: Dict, theo: Dict,
     step_mfu = (theo or {}).get("step_mfu")
     step_hfu = (theo or {}).get("step_hfu")
     rco_hero = (theo or {}).get("recompute") or {}
+    sfa_ratio = rco_hero.get("bwd_fwd_flop_ratio")
+    sfa_ratio_foot = (
+        f" · SFAGrad/Fwd {float(sfa_ratio):.3f}×"
+        if rco_hero.get("flop_ratio_source") ==
+        "component_weighted_matmul_R2_sparse_attention_exact" and sfa_ratio is not None
+        else ""
+    )
     comb = (theo or {}).get("whatif_combined") or {}
     cards = [
         _metric("Step 时长", _us(u.get("stage")),
@@ -263,7 +270,7 @@ def _sec_header(meta: Dict, overview: Dict, theo: Dict,
                 "Overlapped / Communication",
                 "bad" if (r.get("overlap_rate_pct") or 0) < 40 else ""),
         _metric("端到端 MFU", _mfu(step_mfu),
-                (f"HFU {_mfu(step_hfu)}（含重算）" if rco_hero.get("overhead_us")
+                (f"HFU {_mfu(step_hfu)}（含重算）{sfa_ratio_foot}" if rco_hero.get("overhead_us")
                  else (f"全优化上界 {_mfu(comb.get('new_mfu'))}" if comb.get("new_mfu") else "达成算力 / 峰值"))),
     ]
     return (

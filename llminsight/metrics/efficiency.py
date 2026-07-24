@@ -792,6 +792,59 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     attention_total_us = sum(r["dur_us"] for r in attention_rows)
     attention_modeled_us = sum(r["dur_us"] for r in attention_rows if r.get("flops"))
     attention_coverage = (attention_modeled_us / attention_total_us) if attention_total_us else None
+
+    # Exact SparseFlashAttention training FLOP anchor.  The fwd/grad call ratio
+    # identifies repeated activation-recompute forwards; the modeled per-call
+    # FLOPs then gives the actual backward/forward ratio R instead of assuming
+    # textbook R=2.  Restrict this to a uniform, fully modeled SFA-only family so
+    # mixed attention implementations or heterogeneous shapes fail closed.
+    attention_training_flops: Dict[str, Any] = {
+        "available": False,
+        "reason": "requires uniform, fully modeled SparseFlashAttention fwd/grad rows",
+    }
+    sparse_fwd_rows = [r for r in attention_rows if r["type"] == "SparseFlashAttention"]
+    sparse_grad_rows = [r for r in attention_rows if r["type"] == "SparseFlashAttentionGrad"]
+    only_sparse_family = bool(attention_rows) and all(
+        r["type"] in SPARSE_ATTENTION_TYPES for r in attention_rows
+    )
+    all_sparse_modeled = all(r.get("flops") for r in sparse_fwd_rows + sparse_grad_rows)
+    if only_sparse_family and sparse_fwd_rows and sparse_grad_rows and all_sparse_modeled:
+        fwd_values = [float(r["flops"]) for r in sparse_fwd_rows]
+        grad_values = [float(r["flops"]) for r in sparse_grad_rows]
+        fwd_uniform = max(fwd_values) <= min(fwd_values) * (1.0 + 1e-9)
+        grad_uniform = max(grad_values) <= min(grad_values) * (1.0 + 1e-9)
+        fwd_count = len(fwd_values)
+        grad_count = len(grad_values)
+        pass_ratio = fwd_count / grad_count
+        if fwd_uniform and grad_uniform and pass_ratio >= 1.0:
+            fwd_per_call = fwd_values[0]
+            grad_per_call = grad_values[0]
+            recompute_multiplier = pass_ratio - 1.0
+            bwd_fwd_ratio = grad_per_call / fwd_per_call
+            executed_fwd_flops = sum(fwd_values)
+            executed_bwd_flops = sum(grad_values)
+            recompute_fwd_flops = max(fwd_count - grad_count, 0) * fwd_per_call
+            recompute_share = (
+                recompute_multiplier / (1.0 + bwd_fwd_ratio + recompute_multiplier)
+                if recompute_multiplier > 0 else 0.0
+            )
+            attention_training_flops = {
+                "available": True,
+                "scope": "SparseFlashAttention",
+                "source": "modeled_fwd_grad_flops_and_call_counts",
+                "forward_count": fwd_count,
+                "backward_count": grad_count,
+                "forward_pass_ratio": pass_ratio,
+                "recompute_forward_multiplier": recompute_multiplier,
+                "forward_flops_per_call": fwd_per_call,
+                "backward_flops_per_call": grad_per_call,
+                "backward_forward_flop_ratio": bwd_fwd_ratio,
+                "executed_forward_flops": executed_fwd_flops,
+                "executed_backward_flops": executed_bwd_flops,
+                "executed_attention_flops": executed_fwd_flops + executed_bwd_flops,
+                "recompute_forward_flops": recompute_fwd_flops,
+                "attention_recompute_flops_share": recompute_share,
+            }
     unmodeled_acc: Dict[str, Dict[str, Any]] = {}
     for r in model_rows:
         if r.get("flops"):
@@ -912,6 +965,11 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         # step — numerator for the end-to-end (step) MFU computed in theoretical().
         "useful_flops_total": mc_flops if efficiency_reliable else None,
         "useful_flops_modeled_partial": mc_flops,
+        "matmul_flops_total": mm_flops if efficiency_reliable else None,
+        "attention_flops_total": (
+            sum(r["flops"] for r in attention_rows if r.get("flops"))
+            if efficiency_reliable else None
+        ),
         "peak_underestimated": calibrated,
         "peak_inconsistent": peak_inconsistent,
         "efficiency_reliable": efficiency_reliable,
@@ -919,6 +977,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         "flop_coverage_pct": round(flop_coverage * 100.0, 1),
         "attention_flop_coverage_pct": (round(attention_coverage * 100.0, 1)
                                         if attention_coverage is not None else None),
+        "attention_training_flops": attention_training_flops,
         "model_compute_total_us": round(model_total_us, 1),
         "model_compute_modeled_us": round(model_modeled_us, 1),
         "attention_total_us": round(attention_total_us, 1),

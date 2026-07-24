@@ -18,7 +18,12 @@
     const smfu = theo.available ? theo.step_mfu : null;  // model MFU (recompute stripped), 0–1
     const hfu = theo.available ? theo.step_hfu : null;   // hardware FLOPs util (incl. recompute)
     const rco = theo.available ? (theo.recompute || null) : null;  // recompute what-if lever
-    const mfuFoot = (rco && hfu != null) ? `模型MFU · HFU ${fmt.mfu(hfu)}（含重算）` : "有效FLOPs /(峰值×step)";
+    const sfaRatio = rco && rco.flop_ratio_source === "component_weighted_matmul_R2_sparse_attention_exact"
+      ? ` · SFAGrad/Fwd ${Number(rco.bwd_fwd_flop_ratio).toFixed(3)}×`
+      : "";
+    const mfuFoot = (rco && hfu != null)
+      ? `模型MFU · HFU ${fmt.mfu(hfu)}（含重算）${sfaRatio}`
+      : "有效FLOPs /(峰值×step)";
     const cards = [
       metric("有效计算占比", fmt.pct(r.effective_compute_pct), { tone: r.effective_compute_pct >= 60 ? "good" : "warn", foot: "Computing / Stage", barPct: r.effective_compute_pct }),
       metric("未掩盖通信", fmt.pct(r.comm_not_overlapped_pct), { tone: "bad", foot: fmt.us(u.comm_not_overlapped), barPct: r.comm_not_overlapped_pct }),

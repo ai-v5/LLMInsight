@@ -739,52 +739,101 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
 
 # --------------------------------------------------------------------------- #
 # Standard transformer FLOPs split: forward F, backward ≈ 2F (input-grad + weight-
-# grad). Full activation recompute reruns the forward before the backward (+F). The
-# measured FlashAttention fwd/grad ratio gives ρ=(fwd-grad)/fwd — HOW MUCH forward is
-# recomputed (full→0.5, off→0, selective between). Recomputed FLOPs as a fraction of
-# EXECUTED FLOPs: r_re = 2ρ/(1+R+2ρ), R=bwd/fwd. R=2 (textbook) with full ρ=0.5 → 1/4,
-# i.e. the classic 1:2:1 fwd:bwd:recompute split. Band over R∈[2,2.5].
+# grad). Let m=fwd/grad−1 be repeated forward passes per model forward (full→1,
+# off→0).  With R=bwd/fwd, recomputed FLOPs / executed FLOPs is exactly
+# r_re=m/(1+R+m).  A fully modeled SFA fwd/grad pair supplies R; otherwise retain
+# the conservative training fallback band R∈[2,2.5].
 _RECOMPUTE_BWD_FWD = 2.0
 _RECOMPUTE_BWD_FWD_BAND = (2.0, 2.5)
 
 
-def _recompute_overhead(computing: float,
-                        recompute_fact: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _recompute_overhead(
+    computing: float,
+    recompute_fact: Optional[Dict[str, Any]],
+    bwd_fwd_flop_ratio: Optional[float] = None,
+    recompute_forward_multiplier: Optional[float] = None,
+    component_flops: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """Time the backward spends RE-running the forward (activation recompute), in μs,
-    estimated from the measured FA fwd/grad ratio applied to the WHOLE compute slice
-    (every recomputed forward op, not just FA). None when recompute is off/unknown."""
+    estimated from modeled component FLOPs when they fully close to the executed
+    useful-FLOP total. None when recompute is off/unknown."""
     rf = recompute_fact or {}
     gran = rf.get("value")
     if gran not in ("full", "selective") or not computing or computing <= 0:
         return None
-    fa_fwd = rf.get("fa_fwd")
-    fa_grad = rf.get("fa_grad")
     ratio = rf.get("fwd_grad_ratio")
-    if fa_fwd and fa_grad is not None and fa_fwd > 0:
-        rho = max(0.0, (fa_fwd - fa_grad) / fa_fwd)          # measured recompute share
-    elif ratio and ratio > 0:
-        rho = max(0.0, (ratio - 1.0) / ratio)                # (fwd-grad)/fwd from the ratio
-    else:
-        rho = 0.5 if gran == "full" else 0.25                # fallback when raw counts absent
-    if rho <= 0:
+    multiplier = recompute_forward_multiplier
+    if multiplier is None:
+        multiplier = rf.get("recompute_forward_multiplier")
+    if multiplier is None and ratio and ratio > 0:
+        multiplier = max(float(ratio) - 1.0, 0.0)
+    if multiplier is None:
+        multiplier = 1.0 if gran == "full" else 0.5
+    multiplier = max(float(multiplier), 0.0)
+    if multiplier <= 0:
         return None
+    rho = multiplier / (1.0 + multiplier)
 
-    def _share(R: float) -> float:                           # recomputed FLOPs / executed FLOPs
-        return (2.0 * rho) / (1.0 + R + 2.0 * rho)
-    r_re = _share(_RECOMPUTE_BWD_FWD)
-    r_lo = _share(_RECOMPUTE_BWD_FWD_BAND[1])                 # larger R → smaller share (conservative)
-    r_hi = _share(_RECOMPUTE_BWD_FWD_BAND[0])                 # smaller R → larger share (optimistic)
+    def _share(R: float) -> float:
+        return multiplier / (1.0 + R + multiplier)
+
+    exact_ratio = (
+        float(bwd_fwd_flop_ratio)
+        if bwd_fwd_flop_ratio is not None and float(bwd_fwd_flop_ratio) > 0
+        else None
+    )
+    components = component_flops or {}
+    mm_flops = float(components.get("matmul_flops") or 0.0)
+    attn_flops = float(components.get("attention_flops") or 0.0)
+    model_flops = float(components.get("model_flops") or 0.0)
+    attn_recompute_flops = float(components.get("attention_recompute_flops") or 0.0)
+    component_total = mm_flops + attn_flops
+    components_close = bool(
+        model_flops > 0
+        and abs(component_total - model_flops) <= max(model_flops, 1.0) * 1e-9
+    )
+    component_valid = bool(
+        exact_ratio is not None
+        and components_close
+        and 0 <= attn_recompute_flops <= attn_flops
+    )
+    if component_valid:
+        # Linear/GEMM backward is two matmuls per forward (R=2).  Preserve the
+        # established [2,2.5] uncertainty band for non-attention matmuls, while
+        # using the exact modeled SFA recompute FLOPs instead of applying SFA's
+        # larger backward ratio to every compute kernel.
+        mm_recompute = mm_flops * _share(_RECOMPUTE_BWD_FWD)
+        mm_recompute_lo = mm_flops * _share(_RECOMPUTE_BWD_FWD_BAND[1])
+        r_re = (mm_recompute + attn_recompute_flops) / component_total
+        r_lo = (mm_recompute_lo + attn_recompute_flops) / component_total
+        r_hi = r_re
+        R = exact_ratio
+        ratio_source = "component_weighted_matmul_R2_sparse_attention_exact"
+    else:
+        # A SFA-only ratio must never be projected onto unclosed model FLOPs.
+        # Fall back to the standard training band until every modeled component
+        # contributing to the MFU numerator has an explicit phase split.
+        R = _RECOMPUTE_BWD_FWD
+        r_re = _share(R)
+        r_lo = _share(_RECOMPUTE_BWD_FWD_BAND[1])
+        r_hi = _share(_RECOMPUTE_BWD_FWD_BAND[0])
+        ratio_source = ("fallback_training_band_component_mismatch"
+                        if exact_ratio is not None else "fallback_training_band")
     return {
         "us": round(computing * r_re, 1),
         "us_lo": round(computing * r_lo, 1),
         "us_hi": round(computing * r_hi, 1),
         "flops_share": round(r_re, 4),                       # also = (HFU − MFU)/HFU
         "rho": round(rho, 4),
+        "recompute_forward_multiplier": round(multiplier, 4),
+        "bwd_fwd_flop_ratio": round(R, 4),
+        "flop_ratio_source": ratio_source,
         "granularity": gran,
-        "basis": ("重算开销 = computing × r_re；r_re = 2ρ/(1+R+2ρ)，"
-                  "ρ={rho:.2f}（FA 实测前向重算占比），R=反向/前向 FLOPs≈2（band 2–2.5）。"
-                  "full(ρ≈0.5) → r_re≈¼（前向:反向:重算≈1:2:1）；覆盖全部前向计算算子，非仅 FA。"
-                  ).format(rho=rho),
+        "basis": ("重算开销 = computing × r_re；m={m:.2f}（融合 Attention 调用数推导的"
+                  "重复前向倍数）。SFA 使用建模前后向 FLOPs 与精确重复前向 FLOPs；"
+                  "其余 matmul 使用 R=2（band 2–2.5）后按执行 FLOPs 加权。"
+                  "SFA R={R:.4f}，source={source}。"
+                  ).format(m=multiplier, R=R, source=ratio_source),
     }
 
 
@@ -804,7 +853,25 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
     # FLOPs. Used to (a) strip HFU→MFU and (b) add the 重计算 optimization lever, with
     # 算子余量 carved down by (1−r_re) so the two stay disjoint in the combined.
     rc_state = ((capture or {}).get("capture", {}) or {}).get("recompute")
-    rc_ov = _recompute_overhead(computing, rc_state)
+    attn_flops = eff.get("attention_training_flops") or {}
+    exact_attn_flops = bool(attn_flops.get("available") and eff.get("efficiency_reliable"))
+    component_flops = None
+    if exact_attn_flops:
+        component_flops = {
+            "matmul_flops": eff.get("matmul_flops_total"),
+            "attention_flops": eff.get("attention_flops_total"),
+            "model_flops": eff.get("useful_flops_total"),
+            "attention_recompute_flops": attn_flops.get("recompute_forward_flops"),
+        }
+    rc_ov = _recompute_overhead(
+        computing,
+        rc_state,
+        bwd_fwd_flop_ratio=(attn_flops.get("backward_forward_flop_ratio")
+                            if exact_attn_flops else None),
+        recompute_forward_multiplier=(attn_flops.get("recompute_forward_multiplier")
+                                      if exact_attn_flops else None),
+        component_flops=component_flops,
+    )
     r_re = rc_ov["flops_share"] if rc_ov else 0.0
     recompute_us = min(rc_ov["us"], computing) if rc_ov else 0.0
 
@@ -1008,6 +1075,9 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
             "overhead_pct": _pct(rc_ov["us"], stage),
             "rho": rc_ov["rho"],
             "flops_share": rc_ov["flops_share"],
+            "recompute_forward_multiplier": rc_ov["recompute_forward_multiplier"],
+            "bwd_fwd_flop_ratio": rc_ov["bwd_fwd_flop_ratio"],
+            "flop_ratio_source": rc_ov["flop_ratio_source"],
             "save_us": round(rc_save, 1),
             "save_pct": _pct(rc_save, stage),
             "new_step_us": round(_new_step, 1),
@@ -1031,6 +1101,7 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         "step_hfu": round(hfu, 4) if hfu else None,
         "recompute": recompute,
         "note": ("端到端 MFU=模型理论FLOPs/(峰值×step)（不含重计算）；HFU 含重计算重复执行的 FLOPs。"
+                 "SFA 前后向完整建模时，重计算扣除按 SFA 精确 FLOPs 与 matmul R=2 分量加权；"
                  "当主导算子 FLOP 模型不完整或峰值口径不一致时，MFU/HFU 与算子收益保持 unavailable；"
                  "通信、空泡和重计算仍按各自证据单独估算。"),
     }
