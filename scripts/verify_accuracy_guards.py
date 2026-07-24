@@ -9,6 +9,7 @@ from datetime import datetime
 import math
 import os
 import sys
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -24,6 +25,7 @@ from llminsight.metrics.efficiency import (
     _estimate_sparse_flash_attention_flops,
     compute_efficiency,
 )
+from llminsight.metrics.smart_timeline import _apply_chip, compute_msprof_smart_timeline
 from llminsight.parser.shapes import parse_shapes
 from llminsight.parser.derive import derive_capture, derive_config, derive_guesses, derive_model
 from llminsight.parser.profile import ProfileData
@@ -84,6 +86,63 @@ def _sparse_rows() -> pd.DataFrame:
         "Input Data Types": "DT_BF16;DT_BF16",
         "Output Shapes": "32,128",
         "Output Data Types": "DT_BF16",
+    })
+    return pd.DataFrame(rows)
+
+
+def _dsa_indexer_rows() -> pd.DataFrame:
+    """Small, public analogue of the LI + fused KL-loss training schema."""
+    li_in = "1,8,4,8;1,8,1,8;1,8,4;;;"
+    li_out = "1,8,1,4;1,8,1,4"
+    slig_in = (
+        "1,8,8,16;1,8,1,16;1,8,4,8;1,8,1,8;1,8,4;"
+        "1,8,1,4;1,1,8,8;1,1,8,8;1,8,8,4;1,8,1,4;;"
+    )
+    slig_out = "1,8,4,8;1,8,1,8;1,8,4;1"
+    rows = []
+    for typ, count, shapes_in, shapes_out in (
+        ("LightningIndexer", 2, li_in, li_out),
+        ("SparseLightningIndexerGradKLLoss", 1, slig_in, slig_out),
+    ):
+        for _ in range(count):
+            rows.append({
+                "Type": typ,
+                "Name": typ,
+                "Duration(us)": 100.0,
+                "Accelerator Core": "MIX_AIC",
+                "Input Shapes": shapes_in,
+                "Input Data Types": "DT_BF16",
+                "Output Shapes": shapes_out,
+                "Output Data Types": "DT_BF16",
+            })
+    return pd.DataFrame(rows)
+
+
+def _matmul_phase_rows() -> pd.DataFrame:
+    """A terminal projection plus a checkpointed weight-only projection."""
+    rows = []
+    for shapes_in, shapes_out in (
+        ("4,8;16,8", "4,16"),
+        ("4,16;16,8", "4,8"),
+    ):
+        rows.append({
+            "Type": "MatMulV3", "Name": "terminal_projection",
+            "Duration(us)": 100.0, "Accelerator Core": "AI_CORE",
+            "Input Shapes": shapes_in, "Input Data Types": "DT_BF16;DT_BF16",
+            "Output Shapes": shapes_out, "Output Data Types": "DT_BF16",
+        })
+    for _ in range(2):
+        rows.append({
+            "Type": "MatMulV3", "Name": "checkpointed_projection_fwd",
+            "Duration(us)": 100.0, "Accelerator Core": "AI_CORE",
+            "Input Shapes": "4,8;12,8", "Input Data Types": "DT_BF16;DT_BF16",
+            "Output Shapes": "4,12", "Output Data Types": "DT_BF16",
+        })
+    rows.append({
+        "Type": "MatMulV3", "Name": "checkpointed_projection_dw",
+        "Duration(us)": 100.0, "Accelerator Core": "AI_CORE",
+        "Input Shapes": "4,12;12,8", "Input Data Types": "DT_BF16;DT_BF16",
+        "Output Shapes": "4,8", "Output Data Types": "DT_BF16",
     })
     return pd.DataFrame(rows)
 
@@ -172,9 +231,10 @@ def check_sparse_attention_and_capture() -> None:
     expected_hfu = (expected_sparse + expected_grouped) / (432e12 * 1e-6)
     assert theo["step_hfu"] == round(expected_hfu, 4), theo
     assert theo["step_mfu"] == round(expected_hfu * (1 - expected_recompute_share), 4), theo
+    assert theo["step_mfu_lo"] <= theo["step_mfu"] <= theo["step_mfu_hi"], theo
     assert theo["recompute"]["flops_share"] == round(expected_recompute_share, 4), theo
     assert theo["recompute"]["flop_ratio_source"] == \
-        "component_weighted_matmul_R2_sparse_attention_exact", theo
+        "component_weighted_matmul_phase_split_sparse_attention_exact", theo
     unclosed = _recompute_overhead(
         0.7,
         capture["recompute"],
@@ -219,6 +279,153 @@ def check_sparse_attention_and_capture() -> None:
     summary = build_summary(metrics, cards, cfg)
     assert summary["model"]["arch"] == "MoE + Sparse Attention", summary["model"]
     assert summary["model"]["unknown_fields"]["ep_world_size"] == "未知"
+
+
+def check_dsa_indexer_flops_and_phase_split() -> None:
+    rows = pd.concat([_sparse_rows(), _dsa_indexer_rows()], ignore_index=True)
+    prof = _profile(rows)
+    old_sparse_mode = SETTINGS.sparse_attention_mode
+    SETTINGS.sparse_attention_mode = 3
+    try:
+        eff = compute_efficiency(prof)
+    finally:
+        SETTINGS.sparse_attention_mode = old_sparse_mode
+
+    li_per_call = 2.0 * 36 * 4 * 8
+    slig_per_call = 2.0 * 26 * (8 * (16 + 4) + 3 * 4 * 8)
+    sparse_total = 2 * 7488.0 + 19136.0
+    grouped_total = 2.0 * 32 * 64 * 128
+    expected_total = sparse_total + grouped_total + 2 * li_per_call + slig_per_call
+    assert eff["flop_model_complete"] is True, eff
+    assert eff["useful_flops_total"] == expected_total, eff
+    by_type = {row["type"]: row for row in eff["by_type"]}
+    for typ in ("LightningIndexer", "SparseLightningIndexerGradKLLoss"):
+        assert by_type[typ]["mfu"] is not None, by_type[typ]
+        assert by_type[typ]["mbu"] is None, by_type[typ]
+    assert eff["unmodeled_flop_types"] == {}, eff["unmodeled_flop_types"]
+
+    phase = eff["attention_training_flops"]
+    assert phase["available"] is True, phase
+    assert phase["indexer_forward_count"] == 2, phase
+    assert phase["indexer_grad_loss_count"] == 1, phase
+    assert phase["indexer_recompute_forward_flops"] == li_per_call, phase
+    assert phase["recompute_forward_flops"] == 7488.0 + li_per_call, phase
+    # SLIG is real auxiliary-loss/backward work even though checkpoint execution
+    # places it in the grad-enabled recompute forward.
+    assert phase["indexer_model_flops"] == li_per_call + slig_per_call, phase
+
+    ov = {
+        "available": True,
+        "us": {
+            "stage": 1.0, "computing": 0.7,
+            "comm_not_overlapped": 0.2, "free": 0.1,
+            "communication": 0.3, "overlapped": 0.1,
+        },
+        "ratios": {
+            "comm_not_overlapped_pct": 20.0, "free_pct": 10.0,
+            "overlap_rate_pct": 33.3,
+        },
+    }
+    theo = theoretical(prof, ov, eff, derive_config(prof))
+    expected_recompute = 7488.0 + li_per_call + grouped_total / 4.0
+    expected_hfu = expected_total / (432e12 * 1e-6)
+    expected_model_mfu = expected_hfu * (1.0 - expected_recompute / expected_total)
+    assert theo["step_hfu"] == round(expected_hfu, 4), theo
+    assert theo["step_mfu"] == round(expected_model_mfu, 4), theo
+    assert theo["step_mfu_lo"] <= theo["step_mfu"] <= theo["step_mfu_hi"], theo
+    assert theo["recompute"]["flops_share"] == round(
+        expected_recompute / expected_total, 4
+    ), theo
+
+    # A known DSA type with unsupported shapes must enter the coverage denominator
+    # and fail closed instead of leaving a misleading 100% model-FLOP coverage.
+    broken_rows = rows.copy()
+    broken_rows.loc[
+        broken_rows["Type"] == "SparseLightningIndexerGradKLLoss", "Output Shapes"
+    ] = "1,8,4,7;1,8,1,8;1,8,4;1"
+    SETTINGS.sparse_attention_mode = 3
+    try:
+        broken = compute_efficiency(_profile(broken_rows))
+    finally:
+        SETTINGS.sparse_attention_mode = old_sparse_mode
+    assert broken["flop_model_complete"] is False, broken
+    assert broken["useful_flops_total"] is None, broken
+    assert "SparseLightningIndexerGradKLLoss" in broken["unmodeled_flop_types"], broken
+
+
+def check_matmul_phase_split() -> None:
+    eff = compute_efficiency(_profile(_matmul_phase_rows()))
+    phase = eff["matmul_training_flops"]
+    terminal_f = 2.0 * 4 * 16 * 8
+    checkpoint_f = 2.0 * 4 * 12 * 8
+    assert phase["available"] is True, phase
+    assert phase["executed_flops"] == 2 * terminal_f + 3 * checkpoint_f, phase
+    assert phase["recompute_forward_flops"] == checkpoint_f, phase
+    assert phase["exact_group_count"] == 2, phase
+
+
+def check_smart_timeline_cube_breakdown() -> None:
+    geom = {
+        "available": True,
+        "t0_us": 0.0,
+        "span_us": 2_000_000.0,
+        "span_s": 2.0,
+        "bins": 2,
+        "bin_us": 1_000_000.0,
+        "flops_sum": [0.4e12, 0.9e12],
+        "fa_flops_sum": [0.2e12, 0.3e12],
+        "bytes_sum": [0.0, 0.0],
+        "comm_occ": [0.0, 0.0],
+        "vec_occ": [0.0, 0.0],
+        "slices": [],
+        "total_slices": 0,
+        "shown_slices": 0,
+        "modeled_dev_us": 0.0,
+    }
+    eff = {
+        "chip": {"effective_peak_tflops": 1.0, "hbm_tbps": 1.0},
+        "kernel_index": {},
+        "attention_total_us": 1.0,
+        "attention_flop_coverage_pct": 100.0,
+        "unmodeled_flop_types": {},
+        "peak_inconsistent": False,
+    }
+    tl = _apply_chip(geom, eff)
+    util = {row["key"]: row for row in tl["utilization"]}
+    assert util["cube_total"]["series"] == [0.6, 1.0], util
+    assert util["cube_total"]["abs"] == [0.6, 1.2], util
+    assert util["cube_gemm"]["series"] == [0.4, 0.9], util
+    assert util["cube_attention"]["series"] == [0.2, 0.3], util
+
+    incomplete = _apply_chip(
+        geom, {**eff, "attention_flop_coverage_pct": 50.0}
+    )
+    incomplete_util = {row["key"]: row for row in incomplete["utilization"]}
+    assert incomplete_util["cube_total"]["available"] is False, incomplete_util
+    assert incomplete_util["cube_gemm"]["available"] is True, incomplete_util
+    assert incomplete_util["cube_attention"]["available"] is False, incomplete_util
+
+    kd = pd.DataFrame([
+        {"Name": "gemm", "Type": "MatMulV3", "Accelerator Core": "AI_CORE",
+         "Start Time(us)": 0.0, "Duration(us)": 100.0},
+        {"Name": "fag", "Type": "SparseFlashAttentionGrad",
+         "Accelerator Core": "MIX_AIC", "Start Time(us)": 100.0,
+         "Duration(us)": 100.0},
+        {"Name": "other", "Type": "OtherCube", "Accelerator Core": "AI_CORE",
+         "Start Time(us)": 200.0, "Duration(us)": 100.0},
+    ])
+    old_bins = SETTINGS.smart_timeline_bins
+    SETTINGS.smart_timeline_bins = 3
+    try:
+        msprof = compute_msprof_smart_timeline(
+            SimpleNamespace(kernel_details=kd, meta={}), {"kernel_index": {}}
+        )
+    finally:
+        SETTINGS.smart_timeline_bins = old_bins
+    ms_util = {row["key"]: row for row in msprof["utilization"]}
+    assert ms_util["cube_total"]["series"] == [1.0, 1.0, 1.0], ms_util
+    assert ms_util["cube_gemm"]["series"] == [1.0, 0.0, 0.0], ms_util
+    assert ms_util["cube_attention"]["series"] == [0.0, 1.0, 0.0], ms_util
 
 
 def check_peak_inconsistency_fails_closed() -> None:
@@ -317,6 +524,9 @@ def check_report_uses_generic_semantics() -> None:
 
 if __name__ == "__main__":
     check_sparse_attention_and_capture()
+    check_dsa_indexer_flops_and_phase_split()
+    check_matmul_phase_split()
+    check_smart_timeline_cube_breakdown()
     check_peak_inconsistency_fails_closed()
     check_small_peak_noise_is_accepted()
     check_output_aware_gemm_and_sparse_formulas()

@@ -289,13 +289,22 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any], prof=None) -> Dict[st
     vec_occ = geom.get("vec_occ", [0.0] * bins)
 
     if effective_peak > 0 and bin_s > 0:
-        compute_series = [round(_clamp01(flops_sum[b] / (bin_s * effective_peak)), 4)
-                          for b in range(bins)]
-        fa_series = [round(_clamp01(fa_flops_sum[b] / (bin_s * effective_peak)), 4)
-                     for b in range(bins)]
+        total_cube_series = [
+            round(_clamp01((flops_sum[b] + fa_flops_sum[b]) / (bin_s * effective_peak)), 4)
+            for b in range(bins)
+        ]
+        gemm_cube_series = [
+            round(_clamp01(flops_sum[b] / (bin_s * effective_peak)), 4)
+            for b in range(bins)
+        ]
+        attention_cube_series = [
+            round(_clamp01(fa_flops_sum[b] / (bin_s * effective_peak)), 4)
+            for b in range(bins)
+        ]
     else:
-        compute_series = [0.0] * bins
-        fa_series = [0.0] * bins
+        total_cube_series = [0.0] * bins
+        gemm_cube_series = [0.0] * bins
+        attention_cube_series = [0.0] * bins
     if hbm_bw > 0 and bin_s > 0:
         hbm_series = [round(_clamp01(bytes_sum[b] / (bin_s * hbm_bw)), 4)
                       for b in range(bins)]
@@ -344,10 +353,12 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any], prof=None) -> Dict[st
 
     # un-clamped absolute per-bin values for the hover tooltip (reveal >100% overshoot
     # that the clamped utilization % hides — e.g. overlapping streams pushing past peak)
-    cube_abs = ([round(flops_sum[b] / bin_s / 1e12, 2) for b in range(bins)]
-                if bin_s > 0 else [0.0] * bins)        # achieved TFLOP/s
-    fa_abs = ([round(fa_flops_sum[b] / bin_s / 1e12, 2) for b in range(bins)]
-              if bin_s > 0 else [0.0] * bins)          # FA achieved TFLOP/s
+    total_cube_abs = ([round((flops_sum[b] + fa_flops_sum[b]) / bin_s / 1e12, 2)
+                       for b in range(bins)] if bin_s > 0 else [0.0] * bins)
+    gemm_cube_abs = ([round(flops_sum[b] / bin_s / 1e12, 2) for b in range(bins)]
+                     if bin_s > 0 else [0.0] * bins)
+    attention_cube_abs = ([round(fa_flops_sum[b] / bin_s / 1e12, 2)
+                           for b in range(bins)] if bin_s > 0 else [0.0] * bins)
     hbm_abs = ([round(bytes_sum[b] / bin_s / 1e9, 1) for b in range(bins)]
                if bin_s > 0 else [0.0] * bins)         # achieved GB/s
     vec_abs = [round(vec_occ[b], 1) for b in range(bins)]    # busy μs within bin
@@ -387,22 +398,37 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any], prof=None) -> Dict[st
                     if t in ATTENTION_TYPES]
 
     cube_available = not bool((eff or {}).get("peak_inconsistent"))
+    attention_cube_available = bool(cube_available and attn_util_available)
+    total_cube_available = bool(
+        cube_available and (attn_total_us <= 0 or attn_util_available)
+    )
+    peak_reason = "观测吞吐超过所选芯片/精度峰值，Cube 利用率口径不可信"
+    attention_reason = (
+        "Attention/Indexer FLOP 语义未建模：" + "、".join(missing_attn)
+        if missing_attn else "本次无可计算 FLOP 的 Attention/Indexer 算子"
+    )
     utilization = [
-        {"key": "cube", "label": "Cube 利用率(GEMM)", "available": cube_available, "unit": "%",
-         "color": "#4f9fe0", "series": compute_series,
-         "abs": cube_abs, "abs_unit": "TFLOP/s", "peak": peak_tflops,
+        {"key": "cube_total", "label": "总 Cube 利用率", "available": total_cube_available, "unit": "%",
+         "color": "#58d6ff", "series": total_cube_series,
+         "abs": total_cube_abs, "abs_unit": "TFLOP/s", "peak": peak_tflops,
          "peak_unit": "TFLOP/s", "kind": "rate",
-         "reason": (None if cube_available else
-                    "观测吞吐超过所选芯片/精度峰值，Cube 利用率口径不可信"),
-         "note": "matmul/GEMM 的 ΣFLOPs /（桶时长 × Cube 有效峰值）；FlashAttention 见下一条独立泳道"},
-        {"key": "flash_attn", "label": "FlashAttention 利用率", "available": attn_util_available, "unit": "%",
-         "color": "#a371f7", "series": fa_series,
-         "abs": fa_abs, "abs_unit": "TFLOP/s", "peak": peak_tflops,
+         "reason": (None if total_cube_available else
+                    (peak_reason if not cube_available else attention_reason)),
+         "note": "Σ(GEMM + Attention/Indexer)有效 Cube FLOPs /（桶时长 × Cube 有效峰值）"},
+        {"key": "cube_gemm", "label": "GEMM Cube 利用率", "available": cube_available, "unit": "%",
+         "color": "#4f9fe0", "series": gemm_cube_series,
+         "abs": gemm_cube_abs, "abs_unit": "TFLOP/s", "peak": peak_tflops,
          "peak_unit": "TFLOP/s", "kind": "rate",
-         "reason": (None if attn_util_available else
-                    ("Attention FLOP 语义未建模：" + "、".join(missing_attn)
-                     if missing_attn else "本次无可计算 FLOP 的 Attention 算子")),
-         "note": "FlashAttention(fwd+grad)的 ΣFLOPs /（桶时长 × Cube 有效峰值）；FA 跑在 cube/MIX_AIC 上，单列以看其 MFU 占比"},
+         "reason": None if cube_available else peak_reason,
+         "note": "MatMul/GEMM 的 ΣFLOPs /（桶时长 × Cube 有效峰值）"},
+        {"key": "cube_attention", "label": "Attention/Indexer Cube 利用率",
+         "available": attention_cube_available, "unit": "%",
+         "color": "#a371f7", "series": attention_cube_series,
+         "abs": attention_cube_abs, "abs_unit": "TFLOP/s", "peak": peak_tflops,
+         "peak_unit": "TFLOP/s", "kind": "rate",
+         "reason": (None if attention_cube_available else
+                    (peak_reason if not cube_available else attention_reason)),
+         "note": "FA/FAG/LightningIndexer/GradKLLoss 的 ΣFLOPs /（桶时长 × Cube 有效峰值）"},
         {"key": "vector", "label": "Vector 利用率", "available": True, "unit": "%",
          "color": "#4caf50", "series": vector_series,
          "abs": vec_abs, "abs_unit": "μs", "peak": bin_us_r,
@@ -457,10 +483,12 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any], prof=None) -> Dict[st
         "total_slices": geom["total_slices"],
         "shown_slices": geom["shown_slices"],
         "note": (
-            "单张大图、统一时间轴：上方 Cube / Vector / HBM / 通信 四条利用率泳道，"
+            "单张大图、统一时间轴：上方总 Cube / GEMM Cube / Attention-Indexer Cube / "
+            "Vector / HBM / 通信利用率泳道，"
             "下方算子按 stream 泳道铺成 Gantt。悬停算子显示 名称/类型/Core/start/dur，"
             "命中按名 join 的 kernel_index 时追加 MFU/MBU/dtype（按名平均，参考值）。"
-            "利用率口径：Cube = Σ建模FLOPs /（桶 × Cube 有效峰值），"
+            "利用率口径：总 Cube = GEMM + Attention/Indexer 建模FLOPs；"
+            "两条分项使用同一桶时长与 Cube 有效峰值，"
             "Vector = 向量泳道每桶时间占用率（无 FLOP 模型），"
             "HBM = Σ字节 /（桶 × HBM 带宽），通信 = Communication 泳道每桶时间占用率。"
             "Notify_Wait 同步等待已全程剔除，不进入任何泳道。"
@@ -590,6 +618,8 @@ def compute_msprof_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
     bin_us = span / bins
 
     cube_occ = [0.0] * bins
+    gemm_cube_occ = [0.0] * bins
+    attention_cube_occ = [0.0] * bins
     vec_occ = [0.0] * bins
     comm_occ = [0.0] * bins
     p2p_occ = [0.0] * bins   # point-to-point (PP send/recv) AICPU blocking — a
@@ -625,6 +655,10 @@ def compute_msprof_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
             spread(comm_occ, s, e)
         else:
             spread(cube_occ, s, e)
+            if ty in MATMUL_TYPES:
+                spread(gemm_cube_occ, s, e)
+            if ty in ATTENTION_TYPES:
+                spread(attention_cube_occ, s, e)
         slices.append({"name": nm, "stream": stream, "type": ty, "core": co,
                        "dtype": None, "start_ms": (s - t0) / 1e3, "dur_ms": float(d) / 1e3})
     if not slices:
@@ -714,11 +748,25 @@ def compute_msprof_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
                  for b in range(bins)]
 
     utilization = [
-        {"key": "cube", "label": "Cube 占用率", "available": True, "unit": "%",
-         "color": "#4f9fe0", "series": occ_series(cube_occ),
+        {"key": "cube_total", "label": "总 Cube 占用率", "available": True, "unit": "%",
+         "color": "#58d6ff", "series": occ_series(cube_occ),
          "abs": [round(v, 1) for v in cube_occ], "abs_unit": "μs", "peak": bin_us_r,
          "peak_unit": "μs", "kind": "occupancy",
-         "note": "AI_CORE 泳道每桶时间占用率（无 shape 采集 → 按占用计，非 FLOP MFU）"},
+         "note": "全部 AI_CORE/MIX_AIC 每桶时间占用率（无 shape 采集 → 按占用计，非 FLOP MFU）"},
+        {"key": "cube_gemm", "label": "GEMM Cube 占用率",
+         "available": bool(any(gemm_cube_occ)), "unit": "%",
+         "color": "#4f9fe0", "series": occ_series(gemm_cube_occ),
+         "abs": [round(v, 1) for v in gemm_cube_occ], "abs_unit": "μs", "peak": bin_us_r,
+         "peak_unit": "μs", "kind": "occupancy",
+         "reason": None if any(gemm_cube_occ) else "本次无 MatMul/GEMM 算子",
+         "note": "MatMul/GEMM 每桶时间占用率（非 FLOP MFU）"},
+        {"key": "cube_attention", "label": "Attention/Indexer Cube 占用率",
+         "available": bool(any(attention_cube_occ)), "unit": "%",
+         "color": "#a371f7", "series": occ_series(attention_cube_occ),
+         "abs": [round(v, 1) for v in attention_cube_occ], "abs_unit": "μs", "peak": bin_us_r,
+         "peak_unit": "μs", "kind": "occupancy",
+         "reason": None if any(attention_cube_occ) else "本次无 Attention/Indexer 算子",
+         "note": "FA/FAG/LightningIndexer/GradKLLoss 每桶时间占用率（非 FLOP MFU）"},
         {"key": "vector", "label": "Vector 占用率", "available": True, "unit": "%",
          "color": "#4caf50", "series": occ_series(vec_occ),
          "abs": [round(v, 1) for v in vec_occ], "abs_unit": "μs", "peak": bin_us_r,

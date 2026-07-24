@@ -16,13 +16,18 @@
     if (!ov.available) { root.innerHTML = `<div class="empty">无 step_trace 数据</div>`; return; }
     const r = ov.ratios, u = ov.us;
     const smfu = theo.available ? theo.step_mfu : null;  // model MFU (recompute stripped), 0–1
+    const smfuLo = theo.available ? theo.step_mfu_lo : null;
+    const smfuHi = theo.available ? theo.step_mfu_hi : null;
     const hfu = theo.available ? theo.step_hfu : null;   // hardware FLOPs util (incl. recompute)
     const rco = theo.available ? (theo.recompute || null) : null;  // recompute what-if lever
-    const sfaRatio = rco && rco.flop_ratio_source === "component_weighted_matmul_R2_sparse_attention_exact"
+    const sfaRatio = rco && String(rco.flop_ratio_source || "").endsWith("_sparse_attention_exact")
       ? ` · SFAGrad/Fwd ${Number(rco.bwd_fwd_flop_ratio).toFixed(3)}×`
       : "";
+    const mfuBand = smfuLo != null && smfuHi != null && smfuHi - smfuLo >= 0.00005
+      ? ` · 估计区间 ${fmt.mfu(smfuLo)}–${fmt.mfu(smfuHi)}`
+      : "";
     const mfuFoot = (rco && hfu != null)
-      ? `模型MFU · HFU ${fmt.mfu(hfu)}（含重算）${sfaRatio}`
+      ? `模型MFU · HFU ${fmt.mfu(hfu)}（含重算）${mfuBand}${sfaRatio}`
       : "有效FLOPs /(峰值×step)";
     const cards = [
       metric("有效计算占比", fmt.pct(r.effective_compute_pct), { tone: r.effective_compute_pct >= 60 ? "good" : "warn", foot: "Computing / Stage", barPct: r.effective_compute_pct }),
@@ -727,14 +732,14 @@
     root.innerHTML = `
       <div class="grid cols-4">
         ${metric("时间跨度", tl.span_s + " s", { foot: fmt.int(tl.bins) + " 桶 · " + fmt.us(tl.bin_us) + "/桶" })}
-        ${metric("利用率泳道", fmt.int(utilN), { foot: "Cube / Vector / HBM / 通信" })}
+        ${metric("利用率泳道", fmt.int(utilN), { foot: "总Cube / GEMM / Attention-Indexer / Vector / HBM / 通信" })}
         ${metric("算子切片", fmt.int(tl.shown_slices), { foot: "共 " + fmt.int(tl.total_slices) + "（按时长下采样）" })}
         ${metric("已建模占比", fmt.pct(tl.modeled_pct), { tone: (tl.modeled_pct || 0) >= 40 ? "good" : "warn", foot: "matmul/attention 计算覆盖墙钟时间", barPct: tl.modeled_pct })}
       </div>
       <div class="tl-legend"><span style="color:var(--text-mut)">利用率</span>${utilLeg}</div>
       <div class="tl-legend"><span style="color:var(--text-mut)">算子泳道</span>${opLeg}</div>
       ${panel("算子泳道 Gantt × 利用率泳道（统一时间轴）",
-        "上方 Cube/Vector/HBM/通信 利用率（0–100%）· 下方算子按 stream 泳道铺条 · 悬停算子看 类型/Core/MFU/MBU/耗时 · 滚轮或拖滑块缩放 · 已剔除 Notify_Wait",
+        "上方总Cube/GEMM/Attention-Indexer/Vector/HBM/通信 利用率（0–100%）· 下方算子按 stream 泳道铺条 · 悬停算子看 类型/Core/MFU/MBU/耗时 · 滚轮或拖滑块缩放 · 已剔除 Notify_Wait",
         `<div id="stl-all" style="width:100%;height:${lay.height}px"></div>`, "span-2")}
       ${placeholders}
       <div class="note">${esc(tl.note || "")}</div>`;
