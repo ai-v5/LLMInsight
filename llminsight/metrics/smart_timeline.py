@@ -24,6 +24,8 @@ slice has no model (communication, AI_CPU dispatch).
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Dict, List, Optional
 
 from ..cache import cached_json, file_signature
@@ -43,7 +45,28 @@ STREAMS = [
 DEVICE_PROC = "Ascend Hardware"
 COMM_PROC = "Communication"
 
-_GEOM_VERSION = "v6"  # sparse-attention classification changed; invalidate geometry cache
+_GEOM_VERSION = "v7"  # geometry cache also tracks the active per-name FLOP model
+
+
+def _kernel_index_signature(kindex: Dict[str, Any]) -> str:
+    """Hash only the kernel-index fields consumed by the cached geometry."""
+    digest = hashlib.sha1()
+    for name in sorted(kindex):
+        item = kindex.get(name) or {}
+        payload = [
+            name,
+            item.get("type"),
+            item.get("core"),
+            item.get("dtype"),
+            item.get("flops_per_us"),
+            item.get("bytes_per_us"),
+        ]
+        encoded = json.dumps(
+            payload, ensure_ascii=True, separators=(",", ":")
+        ).encode("utf-8")
+        digest.update(encoded)
+        digest.update(b"\n")
+    return digest.hexdigest()[:16]
 
 
 def _is_notify_wait(name: str) -> bool:
@@ -520,8 +543,10 @@ def compute_smart_timeline(prof, eff: Dict[str, Any]) -> Dict[str, Any]:
                 "reason": "kernel_details.csv missing（无法按名 join 算子）"}
     kindex = eff.get("kernel_index", {}) or {}
     sig = file_signature(prof.trace_path)
+    kindex_sig = _kernel_index_signature(kindex)
     key = (f"smarttl:{_GEOM_VERSION}:{sig}:"
-           f"{SETTINGS.smart_timeline_bins}:{SETTINGS.timeline_max_slices}")
+           f"{kindex_sig}:{SETTINGS.smart_timeline_bins}:"
+           f"{SETTINGS.timeline_max_slices}")
     geom = cached_json(key, lambda: _build_geometry(prof, kindex))
     return _apply_chip(geom, eff, prof)
 
