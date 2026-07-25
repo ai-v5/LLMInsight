@@ -26,6 +26,7 @@ from llminsight.metrics.efficiency import (
     compute_efficiency,
 )
 from llminsight.metrics.smart_timeline import _apply_chip, compute_msprof_smart_timeline
+from llminsight.metrics import smart_timeline as smart_timeline_module
 from llminsight.parser.shapes import parse_shapes
 from llminsight.parser.derive import derive_capture, derive_config, derive_guesses, derive_model
 from llminsight.parser.profile import ProfileData
@@ -428,6 +429,50 @@ def check_smart_timeline_cube_breakdown() -> None:
     assert ms_util["cube_attention"]["series"] == [0.0, 1.0, 0.0], ms_util
 
 
+def check_smart_timeline_cache_tracks_flop_model() -> None:
+    prof = SimpleNamespace(
+        kernel_details=pd.DataFrame([{"Input Shapes": "1"}]),
+        trace_path=__file__,
+    )
+    unmodeled = {
+        "available": True,
+        "kernel_index": {
+            "fag": {
+                "type": "SparseFlashAttentionGrad",
+                "core": "MIX_AIC",
+                "dtype": "DT_BF16",
+                "flops_per_us": None,
+                "bytes_per_us": None,
+            },
+        },
+    }
+    modeled = {
+        **unmodeled,
+        "kernel_index": {
+            "fag": {
+                **unmodeled["kernel_index"]["fag"],
+                "flops_per_us": 31_040_109.949,
+            },
+        },
+    }
+
+    cache_keys = []
+    old_cached_json = smart_timeline_module.cached_json
+
+    def capture_key(key, builder):
+        cache_keys.append(key)
+        return {"available": False, "reason": "synthetic cache-key guard"}
+
+    smart_timeline_module.cached_json = capture_key
+    try:
+        smart_timeline_module.compute_smart_timeline(prof, unmodeled)
+        smart_timeline_module.compute_smart_timeline(prof, modeled)
+    finally:
+        smart_timeline_module.cached_json = old_cached_json
+
+    assert cache_keys[0] != cache_keys[1], cache_keys
+
+
 def check_peak_inconsistency_fails_closed() -> None:
     kd = pd.DataFrame([{
         "Type": "BatchMatMulV3",
@@ -527,6 +572,7 @@ if __name__ == "__main__":
     check_dsa_indexer_flops_and_phase_split()
     check_matmul_phase_split()
     check_smart_timeline_cube_breakdown()
+    check_smart_timeline_cache_tracks_flop_model()
     check_peak_inconsistency_fails_closed()
     check_small_peak_noise_is_accepted()
     check_output_aware_gemm_and_sparse_formulas()
