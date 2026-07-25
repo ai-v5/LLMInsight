@@ -540,7 +540,9 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     def colf(name):
         return num(kd[name]).fillna(0.0).to_numpy() if name in cols else [0.0] * len(kd)
 
-    mac_r = colf("aic_mac_ratio")
+    mac_series = num(kd["aic_mac_ratio"]) if "aic_mac_ratio" in cols else None
+    mac_r = mac_series.fillna(0.0).to_numpy() if mac_series is not None else [0.0] * len(kd)
+    mac_valid = mac_series.notna().to_numpy() if mac_series is not None else [False] * len(kd)
     mte2_r = colf("aic_mte2_ratio")
     mte3_r = colf("aic_mte3_ratio")
     vec_r = colf("aiv_vec_ratio")
@@ -785,6 +787,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
                 "ai": (flops / b_bytes) if (flops and b_bytes) else None,
                 "achieved_tflops": (achieved_flops / 1e12) if achieved_flops else None,
                 "mac_ratio": float(mac_r[i]),
+                "mac_ratio_available": bool(mac_valid[i]),
                 "mte2_ratio": float(mte2_r[i]),
                 "cube_util": float(cube_u[i]),
             }
@@ -816,7 +819,8 @@ def compute_efficiency(prof) -> Dict[str, Any]:
             r["type"],
             {"type": r["type"], "count": 0, "dur_us": 0.0, "flops": 0.0,
              "bytes": 0.0, "wasted_us": 0.0, "reclaim_us": 0.0,
-             "peak_time": 0.0, "dt_dur": {}},
+             "peak_time": 0.0, "mac_ratio_time": 0.0,
+             "mac_ratio_dur_us": 0.0, "dt_dur": {}},
         )
         t["count"] += 1
         t["dur_us"] += r["dur_us"]
@@ -830,6 +834,9 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         # vector-heavy types). dt_dur tracks the duration-dominant dtype.
         if r["flops"]:
             t["peak_time"] += r["peak_flops"] * (r["dur_us"] * 1e-6)
+        if r["mac_ratio_available"]:
+            t["mac_ratio_time"] += r["mac_ratio"] * r["dur_us"]
+            t["mac_ratio_dur_us"] += r["dur_us"]
         t["dt_dur"][r["dtype"]] = t["dt_dur"].get(r["dtype"], 0.0) + r["dur_us"]
 
     type_rows = []
@@ -838,6 +845,14 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         mfu = (t["flops"] / t["peak_time"]) if t["peak_time"] else None
         mbu_raw = (t["bytes"] / d_s / SETTINGS.chip.hbm_bandwidth) if (d_s and t["bytes"]) else None
         mbu = min(mbu_raw, 1.0) if mbu_raw is not None else None
+        mac_ratio_weighted = (
+            t["mac_ratio_time"] / t["mac_ratio_dur_us"]
+            if t["mac_ratio_dur_us"] > 0 else None
+        )
+        mac_ratio_coverage_pct = (
+            100.0 * t["mac_ratio_dur_us"] / t["dur_us"]
+            if t["dur_us"] > 0 else 0.0
+        )
         dom_dtype = max(t["dt_dur"].items(), key=lambda kv: kv[1])[0] if t["dt_dur"] else None
         type_rows.append(
             {
@@ -846,6 +861,11 @@ def compute_efficiency(prof) -> Dict[str, Any]:
                 "dur_us": round(t["dur_us"], 1),
                 "dtype": dom_dtype,
                 "mfu": round(mfu, 4) if mfu is not None else None,
+                "mac_ratio_weighted": (
+                    round(mac_ratio_weighted, 4)
+                    if mac_ratio_weighted is not None else None
+                ),
+                "mac_ratio_coverage_pct": round(mac_ratio_coverage_pct, 1),
                 "mbu": round(mbu, 4) if mbu is not None else None,
                 "mbu_raw": round(mbu_raw, 4) if mbu_raw is not None else None,
                 "mbu_over_physical": bool(
@@ -972,6 +992,19 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     modeled_model_rows = [r for r in model_rows if r.get("flops")]
     model_total_us = sum(r["dur_us"] for r in model_rows)
     model_modeled_us = sum(r["dur_us"] for r in modeled_model_rows)
+    model_mac_rows = [r for r in model_rows if r["mac_ratio_available"]]
+    model_mac_dur_us = sum(r["dur_us"] for r in model_mac_rows)
+    model_mac_active_us = sum(
+        r["mac_ratio"] * r["dur_us"] for r in model_mac_rows
+    ) if model_mac_dur_us > 0 else None
+    model_compute_mac_ratio_weighted = (
+        model_mac_active_us / model_mac_dur_us
+        if model_mac_dur_us > 0 else None
+    )
+    model_mac_coverage_pct = (
+        100.0 * model_mac_dur_us / model_total_us
+        if model_total_us > 0 else 0.0
+    )
     flop_coverage = (model_modeled_us / model_total_us) if model_total_us else 0.0
     flop_model_complete = bool(model_total_us > 0 and flop_coverage >= 0.90)
     attention_rows = [r for r in rows if r["type"] in ATTENTION_TYPES]
@@ -1207,6 +1240,18 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         "model_mfu_compute": round(model_mfu_compute, 4) if model_mfu_compute else None,
         "model_mfu_compute_partial": (round(model_mfu_compute_partial, 4)
                                       if model_mfu_compute_partial else None),
+        # Duration-weighted hardware MAC counter over the same GEMM + attention
+        # families as model_mfu_compute. Missing counters are excluded, with their
+        # duration reflected separately in the coverage percentage.
+        "model_compute_mac_ratio_weighted": (
+            round(model_compute_mac_ratio_weighted, 4)
+            if model_compute_mac_ratio_weighted is not None else None
+        ),
+        "model_mac_active_us": (
+            round(model_mac_active_us, 1)
+            if model_mac_active_us is not None else None
+        ),
+        "model_mac_counter_coverage_pct": round(model_mac_coverage_pct, 1),
         # Total executed useful FLOPs (matmul + fused attention) in the captured
         # step — numerator for the end-to-end (step) MFU computed in theoretical().
         "useful_flops_total": mc_flops if efficiency_reliable else None,
