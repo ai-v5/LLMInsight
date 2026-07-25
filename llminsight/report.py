@@ -249,12 +249,12 @@ def _sec_header(meta: Dict, overview: Dict, theo: Dict,
     step_mfu_hi = (theo or {}).get("step_mfu_hi")
     step_hfu = (theo or {}).get("step_hfu")
     rco_hero = (theo or {}).get("recompute") or {}
-    sfa_ratio = rco_hero.get("bwd_fwd_flop_ratio")
-    sfa_ratio_foot = (
-        f" · SFAGrad/Fwd {float(sfa_ratio):.3f}×"
-        if str(rco_hero.get("flop_ratio_source") or "").endswith(
-            "_sparse_attention_exact"
-        ) and sfa_ratio is not None
+    model_mac = (theo or {}).get("model_mac_ratio")
+    model_mac_coverage = (theo or {}).get("model_mac_counter_coverage_pct")
+    model_mac_foot = (
+        f" · 模型MAC(GEMM+Attn)/Step {_mfu(model_mac)}"
+        f"（含通信/空泡，计数器覆盖{_pct(model_mac_coverage)}）"
+        if model_mac is not None
         else ""
     )
     mfu_band_foot = (
@@ -279,7 +279,7 @@ def _sec_header(meta: Dict, overview: Dict, theo: Dict,
                 "Overlapped / Communication",
                 "bad" if (r.get("overlap_rate_pct") or 0) < 40 else ""),
         _metric("端到端 MFU", _mfu(step_mfu),
-                (f"HFU {_mfu(step_hfu)}（含重算）{mfu_band_foot}{sfa_ratio_foot}" if rco_hero.get("overhead_us")
+                (f"HFU {_mfu(step_hfu)}（含重算）{mfu_band_foot}{model_mac_foot}" if rco_hero.get("overhead_us")
                  else (f"全优化上界 {_mfu(comb.get('new_mfu'))}" if comb.get("new_mfu") else "达成算力 / 峰值"))),
     ]
     return (

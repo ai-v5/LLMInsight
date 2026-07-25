@@ -992,6 +992,29 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
     step_mfu = (hfu * (1.0 - r_re)) if hfu is not None else None
     step_mfu_lo = (hfu * (1.0 - r_re_hi)) if hfu is not None else None
     step_mfu_hi = (hfu * (1.0 - r_re_lo)) if hfu is not None else None
+    # Step-normalized model MAC: the numerator is accumulated MAC-active time over
+    # GEMM + attention kernels; the denominator is the full training Stage, so
+    # exposed communication and Free/bubbles lower it just as they lower MFU/HFU.
+    model_mac_active_us = (
+        eff.get("model_mac_active_us") if eff.get("available") else None
+    )
+    model_mac_counter_coverage_pct = eff.get("model_mac_counter_coverage_pct")
+    model_mac_insufficient_coverage = bool(
+        model_mac_counter_coverage_pct is None
+        or float(model_mac_counter_coverage_pct) < 90.0
+    )
+    model_mac_ratio_raw = (
+        float(model_mac_active_us) / stage
+        if model_mac_active_us is not None and stage > 0 else None
+    )
+    model_mac_inconsistent = bool(
+        model_mac_ratio_raw is not None and model_mac_ratio_raw > 1.05
+    )
+    model_mac_ratio = (
+        None
+        if model_mac_inconsistent or model_mac_insufficient_coverage
+        else model_mac_ratio_raw
+    )
     # Time-only levers (comm/free/op) keep useful FLOPs fixed, so post-opt MFU scales
     # as mfu × stage/new_step — the same factor for MFU or HFU.
     physical_floor_us = (step_mfu * stage) if step_mfu else 0.0
@@ -1141,6 +1164,14 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         "step_mfu_lo": round(step_mfu_lo, 4) if step_mfu_lo else None,
         "step_mfu_hi": round(step_mfu_hi, 4) if step_mfu_hi else None,
         "step_hfu": round(hfu, 4) if hfu else None,
+        "model_mac_ratio": (
+            round(model_mac_ratio, 4) if model_mac_ratio is not None else None
+        ),
+        "model_mac_active_us": model_mac_active_us,
+        "model_mac_denominator_us": round(stage, 1),
+        "model_mac_counter_coverage_pct": model_mac_counter_coverage_pct,
+        "model_mac_insufficient_coverage": model_mac_insufficient_coverage,
+        "model_mac_inconsistent": model_mac_inconsistent,
         "recompute": recompute,
         "note": ("端到端 MFU=模型理论FLOPs/(峰值×step)（不含重计算）；HFU 含重计算重复执行的 FLOPs。"
                  "稀疏 Attention/Indexer 按前后向调用计数拆分；matmul 优先按线性层方向/次数拆分，"

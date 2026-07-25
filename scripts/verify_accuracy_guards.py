@@ -149,8 +149,18 @@ def _matmul_phase_rows() -> pd.DataFrame:
 
 
 def check_sparse_attention_and_capture() -> None:
+    sparse_rows = _sparse_rows()
+    sparse_rows.loc[
+        sparse_rows["Type"].eq("SparseFlashAttention"), "Duration(us)"
+    ] = [100.0, 300.0]
+    sparse_rows.loc[
+        sparse_rows["Type"].eq("SparseFlashAttention"), "aic_mac_ratio"
+    ] = [0.1, 0.3]
+    sparse_rows.loc[
+        sparse_rows["Type"].eq("SparseFlashAttentionGrad"), "aic_mac_ratio"
+    ] = 0.5
     prof = _profile(
-        _sparse_rows(),
+        sparse_rows,
         communication=[{
             "type": "alltoallv", "elapse_ms": 1.0, "wait_ms": 0.5,
             "transit_ms": 0.5, "links": {},
@@ -203,6 +213,28 @@ def check_sparse_attention_and_capture() -> None:
         if row["type"] in {"SparseFlashAttention", "SparseFlashAttentionGrad"}
     }
     assert sparse_types and all(row["mbu"] is None for row in sparse_types.values()), eff
+    assert math.isclose(
+        sparse_types["SparseFlashAttention"]["mac_ratio_weighted"], 0.25,
+        rel_tol=0, abs_tol=1e-12,
+    ), sparse_types
+    assert math.isclose(
+        sparse_types["SparseFlashAttentionGrad"]["mac_ratio_weighted"], 0.5,
+        rel_tol=0, abs_tol=1e-12,
+    ), sparse_types
+    assert all(
+        row["mac_ratio_coverage_pct"] == 100.0 for row in sparse_types.values()
+    ), sparse_types
+    grouped_type = next(
+        row for row in eff["by_type"] if row["type"] == "GroupedMatmul"
+    )
+    assert grouped_type["mac_ratio_weighted"] is None, grouped_type
+    assert grouped_type["mac_ratio_coverage_pct"] == 0.0, grouped_type
+    assert math.isclose(
+        eff["model_compute_mac_ratio_weighted"], 0.3,
+        rel_tol=0, abs_tol=1e-12,
+    ), eff
+    assert eff["model_mac_active_us"] == 150.0, eff
+    assert eff["model_mac_counter_coverage_pct"] == 96.2, eff
     assert not any(
         row["type"] in sparse_types for row in eff["top_optimization"]
     ), eff["top_optimization"]
@@ -212,9 +244,9 @@ def check_sparse_attention_and_capture() -> None:
     ov = {
         "available": True,
         "us": {
-            "stage": 1.0, "computing": 0.7,
-            "comm_not_overlapped": 0.2, "free": 0.1,
-            "communication": 0.3, "overlapped": 0.1,
+            "stage": 1000.0, "computing": 700.0,
+            "comm_not_overlapped": 200.0, "free": 100.0,
+            "communication": 300.0, "overlapped": 100.0,
         },
         "ratios": {
             "comm_not_overlapped_pct": 20.0, "free_pct": 10.0,
@@ -224,12 +256,24 @@ def check_sparse_attention_and_capture() -> None:
     cfg = derive_config(prof)
     theo = theoretical(prof, ov, eff, cfg)
     assert theo["step_mfu"] is not None and theo["step_hfu"] is not None, theo
+    assert theo["model_mac_ratio"] == 0.15, theo
+    assert theo["model_mac_active_us"] == 150.0, theo
+    assert theo["model_mac_denominator_us"] == 1000.0, theo
+    assert theo["model_mac_counter_coverage_pct"] == 96.2, theo
+    low_mac_coverage = theoretical(
+        prof,
+        ov,
+        {**eff, "model_mac_counter_coverage_pct": 50.0},
+        cfg,
+    )
+    assert low_mac_coverage["model_mac_ratio"] is None, low_mac_coverage
+    assert low_mac_coverage["model_mac_insufficient_coverage"] is True, low_mac_coverage
     expected_attention_recompute = 7488.0
     expected_matmul_recompute = expected_grouped / 4.0
     expected_recompute_share = (
         expected_attention_recompute + expected_matmul_recompute
     ) / (expected_sparse + expected_grouped)
-    expected_hfu = (expected_sparse + expected_grouped) / (432e12 * 1e-6)
+    expected_hfu = (expected_sparse + expected_grouped) / (432e12 * 1000e-6)
     assert theo["step_hfu"] == round(expected_hfu, 4), theo
     assert theo["step_mfu"] == round(expected_hfu * (1 - expected_recompute_share), 4), theo
     assert theo["step_mfu_lo"] <= theo["step_mfu"] <= theo["step_mfu_hi"], theo
