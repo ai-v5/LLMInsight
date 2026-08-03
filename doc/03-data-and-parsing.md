@@ -56,8 +56,9 @@ class ProfileData:
 
 ## 3.4 rank × step 维度预留
 
-数据模型、`meta`、视图均按 `rank × step` 设计。当前单卡 / 单 step：
+数据模型、`meta`、视图均按 `rank × step` 设计：
 - `meta.rank = 0`（预留），`communication_matrix` 为空 `{}` 时**空跑不报错**。
+- 同一设备包含多个完整 step 时，overview 汇总整个 step 窗口，并同时返回 `steps`、`step_count`、窗口总量 `us` 与单步平均 `avg_us`；MFU/HFU 分子和分母必须使用同一窗口。
 - 多卡数据接入后，rank 维度填充即解锁 M1–M5（见 [07](07-roadmap-and-verification.md)）。
 
 ## 3.5 校验基线（来自本数据，可作单测断言）

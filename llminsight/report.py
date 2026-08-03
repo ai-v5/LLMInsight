@@ -234,7 +234,9 @@ def _sec_header(meta: Dict, overview: Dict, theo: Dict,
         ("序列 / 批", f"seq {_int(dm.get('seq_length'))} · global-batch {_e(_glabel('global_batch_size'))}"),
         ("训练 / 采集", _e(cap_txt)),
         ("参考芯片", f"{_e(chip_name)} · {peak_txt}"),
-        ("采集", f"step {overview.get('step','—')} · device {overview.get('device_id','—')} · "
+        ("采集", f"step {overview.get('step','—')}"
+                 + (f"（{overview.get('step_count')}-step 窗口）" if (overview.get('step_count') or 1) > 1 else "")
+                 + f" · device {overview.get('device_id','—')} · "
                  f"{_e(_mask_path(settings.get('data_dir')))}"),
         ("生成时间", _e(generated_at.strftime("%Y-%m-%d %H:%M"))),
     ]
@@ -244,10 +246,13 @@ def _sec_header(meta: Dict, overview: Dict, theo: Dict,
     # hero metrics
     r = (overview or {}).get("ratios", {}) or {}
     u = (overview or {}).get("us", {}) or {}
+    avg_u = (overview or {}).get("avg_us", {}) or u
+    step_count = int((overview or {}).get("step_count") or 1)
     step_mfu = (theo or {}).get("step_mfu")
     step_mfu_lo = (theo or {}).get("step_mfu_lo")
     step_mfu_hi = (theo or {}).get("step_mfu_hi")
     step_hfu = (theo or {}).get("step_hfu")
+    mfu_estimated = bool((theo or {}).get("mfu_estimated"))
     rco_hero = (theo or {}).get("recompute") or {}
     model_mac = (theo or {}).get("model_mac_ratio")
     model_mac_coverage = (theo or {}).get("model_mac_counter_coverage_pct")
@@ -265,8 +270,10 @@ def _sec_header(meta: Dict, overview: Dict, theo: Dict,
     )
     comb = (theo or {}).get("whatif_combined") or {}
     cards = [
-        _metric("Step 时长", _us(u.get("stage")),
-                f"≈ {r.get('step_time_s','—')} s"),
+        _metric("平均 Step 时长" if step_count > 1 else "Step 时长",
+                _us(avg_u.get("stage")),
+                (f"{step_count}-step 窗口 {_us(u.get('stage'))}" if step_count > 1
+                 else f"≈ {r.get('step_time_s','—')} s")),
         _metric("有效计算占比", _pct(r.get("effective_compute_pct")),
                 "Computing / Stage",
                 "good" if (r.get("effective_compute_pct") or 0) >= 60 else "warn"),
@@ -278,8 +285,8 @@ def _sec_header(meta: Dict, overview: Dict, theo: Dict,
         _metric("通信掩盖率", _pct(r.get("overlap_rate_pct")),
                 "Overlapped / Communication",
                 "bad" if (r.get("overlap_rate_pct") or 0) < 40 else ""),
-        _metric("端到端 MFU", _mfu(step_mfu),
-                (f"HFU {_mfu(step_hfu)}（含重算）{mfu_band_foot}{model_mac_foot}" if rco_hero.get("overhead_us")
+        _metric("端到端 MFU(est)" if mfu_estimated else "端到端 MFU", _mfu(step_mfu),
+                (f"{'计数器校准估算 · ' if mfu_estimated else ''}HFU {_mfu(step_hfu)}（含重算）{mfu_band_foot}{model_mac_foot}" if rco_hero.get("overhead_us")
                  else (f"全优化上界 {_mfu(comb.get('new_mfu'))}" if comb.get("new_mfu") else "达成算力 / 峰值"))),
     ]
     return (
@@ -345,7 +352,9 @@ def _sec_overview(overview: Dict) -> str:
                       f'{_e(nm)} · {_pct(pct)} · {_us(c.get("us"))}</span>')
     bar = (f'<div class="stack">{"".join(segs)}</div>'
            f'<div class="legend">{"".join(legend)}</div>')
-    return _panel("Step 时间构成", "Stage = Computing + 未掩盖通信 + Free（三者合计 100%）", bar)
+    step_count = int(overview.get("step_count") or 1)
+    title = f"{step_count}-step 窗口时间构成" if step_count > 1 else "Step 时间构成"
+    return _panel(title, "Stage = Computing + 未掩盖通信 + Free（三者合计 100%）", bar)
 
 
 def _sec_theoretical(theo: Dict) -> str:
@@ -358,13 +367,14 @@ def _sec_theoretical(theo: Dict) -> str:
     if not theo or not theo.get("available"):
         return ""
     smfu = theo.get("step_mfu")  # base end-to-end MFU, 0–1
+    step_count = max(int(theo.get("window_step_count") or 1), 1)
 
     def saved_s(us):
         try:
             us = float(us)
         except (TypeError, ValueError):
             return "—"
-        return f"-{us / 1e6:.2f} s" if us > 0 else "—"
+        return f"-{us / step_count / 1e6:.2f} s" if us > 0 else "—"
 
     def saved_pct(p):
         try:
@@ -401,7 +411,8 @@ def _sec_theoretical(theo: Dict) -> str:
             f'<span class="gain">{mfu_cell}</span>',
         ])
         row_cls.append("sum-row")
-    tbl = _table(["优化项", "单独节省(s)", "单独节省(%)", "端到端 MFU"],
+    time_head = "单步平均节省(s)" if step_count > 1 else "单独节省(s)"
+    tbl = _table(["优化项", time_head, "单独节省(%)", "端到端 MFU"],
                  rows, row_classes=row_cls)
 
     # compute-bound footnote — same wording/branching as the live page.
@@ -430,7 +441,8 @@ def _sec_theoretical(theo: Dict) -> str:
     ub = theo.get("whatif_combined") or {}   # physical →0 upper bound, reference only
     ub_ref = ""
     if ub.get("new_mfu") is not None:
-        ub_ref = (f' 📐 物理上界（全部 →0，理论不可达）参考：step {_us(ub.get("new_step_us"))} / '
+        _ub_step = ((ub.get("new_step_us") or 0) / step_count)
+        ub_ref = (f' 📐 物理上界（全部 →0，理论不可达）参考：step {_us(_ub_step)} / '
                   f'端到端 MFU {_mfu(ub.get("new_mfu"))} / 省 {_pct(ub.get("save_pct"))}。')
     has_op = any(w.get("id") == "op_ceiling" for w in levers)
     op_tip = ('、算子按各自 MFU 天花板（matmul 95% / FA 85% / FAG 70%）收口'
@@ -459,6 +471,12 @@ def _sec_whatif_floor(theo: Dict) -> str:
     levers = r.get("levers") or []
     if not levers:
         return ""
+    step_count = max(int(theo.get("window_step_count") or 1), 1)
+    step_word = "平均 step" if step_count > 1 else "step"
+
+    def shown_us(value):
+        return _us((value or 0) / step_count)
+
     items = []
     for lv in levers:
         zero = "可减到 0" if lv.get("can_reach_zero") else "不能减到 0（有不可消除下限）"
@@ -467,13 +485,13 @@ def _sec_whatif_floor(theo: Dict) -> str:
         caveats = "".join(
             f'<div class="banner" style="margin-top:8px">⚠️ {_e(c)}</div>'
             for c in lv.get("caveats") or [])
-        line = (f'实测 <strong>{_us(lv.get("measured_us"))}</strong>'
-                f'（step {_pct(lv.get("measured_pct"))}）'
-                f' → 现实地板 ≈ <strong>{_us(lv.get("floor_us"))}</strong>'
-                f'（step {_pct(lv.get("floor_pct"))}）'
-                f' · 可回收 ≈ <strong>{_us(lv.get("recoverable_us"))}</strong>'
-                f'（区间 {_us(lv.get("recoverable_lo_us"))}–{_us(lv.get("recoverable_hi_us"))}）'
-                f' · 优化后 step {_us(lv.get("new_step_us"))} / 端到端 MFU {_mfu(lv.get("new_mfu"))}')
+        line = (f'实测 <strong>{shown_us(lv.get("measured_us"))}</strong>'
+                f'（{step_word} {_pct(lv.get("measured_pct"))}）'
+                f' → 现实地板 ≈ <strong>{shown_us(lv.get("floor_us"))}</strong>'
+                f'（{step_word} {_pct(lv.get("floor_pct"))}）'
+                f' · 可回收 ≈ <strong>{shown_us(lv.get("recoverable_us"))}</strong>'
+                f'（区间 {shown_us(lv.get("recoverable_lo_us"))}–{shown_us(lv.get("recoverable_hi_us"))}）'
+                f' · 优化后{step_word} {shown_us(lv.get("new_step_us"))} / 端到端 MFU {_mfu(lv.get("new_mfu"))}')
         items.append(
             '<div style="margin:13px 0;padding-top:11px;border-top:1px solid var(--line)">'
             f'<div class="mini-h">{_e(lv.get("title"))} · 能减到 0？{zero}</div>'
@@ -488,14 +506,34 @@ def _sec_whatif_floor(theo: Dict) -> str:
     if comb:
         comb_html = (
             '<div class="banner" style="margin-top:12px"><strong>综合现实地板</strong>：'
-            f'优化后 step ≈ <strong>{_us(comb.get("new_step_us"))}</strong>'
-            f'（区间 {_us(comb.get("new_step_hi_us"))}–{_us(comb.get("new_step_lo_us"))}），'
+            f'优化后{step_word} ≈ <strong>{shown_us(comb.get("new_step_us"))}</strong>'
+            f'（区间 {shown_us(comb.get("new_step_hi_us"))}–{shown_us(comb.get("new_step_lo_us"))}），'
             f'端到端 MFU ≈ <strong>{_mfu(comb.get("new_mfu"))}</strong>'
             f'（{_mfu(comb.get("new_mfu_lo"))}–{_mfu(comb.get("new_mfu_hi"))}），'
             f'省 ≈ <strong>{_pct(comb.get("recoverable_pct"))}</strong>。'
             f'{_e(comb.get("basis"))}</div>')
+    recompute = theo.get("recompute") or {}
+    evidence_html = ""
+    if recompute:
+        candidate_rows = [[
+            _e(c.get("type")),
+            _e(c.get("method")),
+            _e(c.get("evidence")),
+            shown_us(c.get("duration_us")),
+            _e(c.get("confidence")),
+        ] for c in (recompute.get("candidates") or [])]
+        candidate_tbl = _table(
+            ["重计算候选算子", "识别方法", "证据", "平均 step 耗时", "置信度"],
+            candidate_rows,
+        ) if candidate_rows else ""
+        evidence_html = (
+            '<div class="banner warn"><strong>重计算观点：已开启，粒度更接近 '
+            f'{_e(recompute.get("granularity"))}</strong>；占执行 FLOPs '
+            f'{_pct((recompute.get("flops_share") or 0) * 100)}，平均每 step 约 '
+            f'{shown_us(recompute.get("overhead_us"))}。{candidate_tbl}</div>'
+        )
     return _panel("What-if 严谨性分析 · 能否减到 0 / 现实地板",
-                  _e(r.get("note", "")), "".join(items) + comb_html)
+                  _e(r.get("note", "")), evidence_html + "".join(items) + comb_html)
 
 
 def _sec_hotspots(hot: Dict) -> str:
@@ -540,12 +578,17 @@ def _sec_efficiency(eff: Dict) -> str:
            + ("（峰值/精度/shape 口径冲突，已停用）" if inconsistent else "")
            + f" · roofline ridge AI {eff.get('roofline_ridge_ai','—')}"
            + f" · 建模 kernel {_int(eff.get('kernels_with_flops'))} 个")
+    if incomplete and eff.get("model_mfu_compute_estimated") is not None:
+        sub += (f" · 模型算力 MFU(est) {_mfu(eff.get('model_mfu_compute_estimated'))}"
+                f"（{_mfu(eff.get('model_mfu_compute_estimated_lo'))}–"
+                f"{_mfu(eff.get('model_mfu_compute_estimated_hi'))}）")
     warnings = ""
     if incomplete:
         missing = "、".join((eff.get("unmodeled_flop_types") or {}).keys()) or "未知算子"
         warnings += ('<div class="banner warn">主导计算算子 FLOP 模型覆盖不足'
                      f'（覆盖 {_pct(eff.get("flop_coverage_pct"))}；未建模：{_e(missing)}）。'
-                     '模型 MFU/HFU 与算子 What-if 已保持不可用。</div>')
+                     '完整模型 MFU 使用同次采集 MAC/Vector 周期校准估算；'
+                     '未知算子不生成 Roofline 收益。</div>')
     if inconsistent:
         warnings += ('<div class="banner warn">观测吞吐超过所选芯片/精度峰值；'
                      '请核对 active chip、dtype 与 shape 语义。当前 MFU 不作为有效结论。</div>')
@@ -971,23 +1014,26 @@ def _sec_timeline(tl: Dict) -> str:
 def _sec_replay(overview: Dict) -> str:
     r = (overview or {}).get("ratios", {}) or {}
     step = (overview or {}).get("step", "—")
+    step_count = int((overview or {}).get("step_count") or 1)
     snap = [
         _metric("有效计算", _pct(r.get("effective_compute_pct")), "", "good"),
         _metric("未掩盖通信", _pct(r.get("comm_not_overlapped_pct")), "", "bad"),
         _metric("空闲 Free", _pct(r.get("free_pct")), "", "warn"),
-        _metric("Step 时间", f'{r.get("step_time_s", "—")} s'),
+        _metric("平均 Step 时间" if step_count > 1 else "Step 时间",
+                f'{r.get("step_time_s", "—")} s'),
     ]
+    scope = (f'{step_count}-step 聚合窗口（step {_e(step)}），尚未拆成逐帧指标'
+             if step_count > 1 else f'单 step（step {_e(step)}）单帧')
     bn = ('<div class="banner info"><strong>全训练回放（骨架）</strong> —— '
-          f'当前数据为单 step（step {_e(step)}）单帧；回放轴与联动机制已搭好，'
-          '多 step 全程指标（loss / 吞吐 / 显存 / 通信抖动）随后续多 step + '
-          '训练日志采集接入。</div>')
+          f'当前数据为{scope}；回放轴与联动机制已搭好，逐 step 的 loss / 吞吐 / '
+          '显存 / 通信抖动需后续接入。</div>')
     plan = ('<div class="note">回放将支持：全程趋势叠加（耗时构成 / 未掩盖通信占比 / '
             '显存峰值 / loss·吞吐·grad-norm 趋势线，定位「第几步开始变慢」）；'
             '任意两 step 对比（Δ 自动定位回归来源算子，轴上打标变慢 / 显存爬升 / '
             '通信抖动 / loss 突刺）。</div>')
     body = (bn + '<div class="mini-h">当前帧快照（联动总览）</div>'
             f'<div class="grid g4">{"".join(snap)}</div>' + plan)
-    return _panel("全训练回放", "单 step 单帧 · 多 step 趋势与对比为设计预留", body)
+    return _panel("全训练回放", "聚合窗口 · 逐 step 趋势与对比为设计预留", body)
 
 
 # --------------------------------------------------------------------------- #

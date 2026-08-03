@@ -143,8 +143,9 @@
     // never a launch script. Underivable fields (EP world size, TP/PP/CP) surface as
     // labeled guesses / 未知 instead of fabricated values.
     const cfg = m.config || {}, dm = cfg.model || {}, gs = cfg.guesses || {};
-    const arch = dm.hidden_size
-      ? "MLA+MoE · hidden " + dm.hidden_size
+    const arch = dm.architecture
+      ? dm.architecture
+        + (dm.hidden_size ? " · hidden " + dm.hidden_size : "")
         + (dm.num_attention_heads ? " · " + dm.num_attention_heads + " heads" : "")
         + (dm.dtype ? " · " + dm.dtype : "")
       : "—";

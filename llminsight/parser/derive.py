@@ -25,6 +25,7 @@ not inject model-family priors as numeric guesses.
 """
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -41,6 +42,23 @@ def _fact(value: Any, evidence: str, confidence: str = "high") -> Dict[str, Any]
 
 
 _UNKNOWN = _fact(None, "数据中无可靠信号", "unknown")
+
+# Model-compute families whose FLOP/phase semantics are not implemented yet.
+# Their presence is still important: attention-only phase counts must not be
+# promoted to a whole-model recompute conclusion on a hybrid KDA model.
+_CUSTOM_MODEL_MARKERS = (
+    "chunk_kda", "kda_", "gated_delta", "chunk_gla", "causal_conv1d",
+)
+
+
+def _custom_model_types(kd: pd.DataFrame) -> List[str]:
+    if kd is None or kd.empty:
+        return []
+    values = (kd["Type"].astype(str) if "Type" in kd.columns else _name_series(kd))
+    return sorted({
+        value for value in values
+        if any(marker in value.lower() for marker in _CUSTOM_MODEL_MARKERS)
+    })
 
 
 def _name_series(kd: pd.DataFrame) -> pd.Series:
@@ -141,6 +159,15 @@ def derive_model(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
     has_moe = any(t.startswith("GroupedMatmul") for t in type_values)
     has_sparse_attn = any(t.startswith("SparseFlashAttention") for t in type_values)
     has_fused_attn = has_sparse_attn or any("FlashAttention" in t for t in type_values)
+    # causal_conv1d is also treated as an unsupported model-compute family for
+    # FLOP coverage, but its presence alone does not prove a KDA architecture.
+    has_kda = any(
+        any(
+            marker in t.lower()
+            for marker in ("chunk_kda", "kda_", "gated_delta", "chunk_gla")
+        )
+        for t in type_values
+    )
     traits: List[str] = []
     if has_moe:
         traits.append("MoE")
@@ -148,6 +175,8 @@ def derive_model(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
         traits.append("Sparse Attention")
     elif has_fused_attn:
         traits.append("Fused Attention")
+    if has_kda:
+        traits.append("KDA")
     if traits:
         facts["architecture"] = _fact(
             " + ".join(traits),
@@ -160,7 +189,7 @@ def derive_model(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
     # length == the normalized width. The widths seen are exactly
     # {hidden, q_lora_rank, kv_lora_rank}.
     gammas: List[int] = []
-    seq_from_rms: Optional[int] = None
+    seq_candidates: List[int] = []
     rms = _rows_named(kd, "RmsNorm", exclude="Grad")
     if rms is not None and not rms.empty and sin:
         for cell in rms[sin]:
@@ -172,12 +201,15 @@ def derive_model(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
     if hidden:
         facts["hidden_size"] = _fact(
             hidden, f"RmsNorm gamma 宽度集合 {gammas} 取最大", "high")
-        # seq from the hidden-width RmsNorm's activation operand [S,1,H]
+        # Seq can be [S,1,H], [1,S,H], or [S,H].  The old first-axis rule
+        # silently returned batch=1 for [1,S,H].  Use the dominant non-unit
+        # dimension before H across every hidden-width RmsNorm instead.
         for cell in rms[sin]:
             ops = parse_shapes(cell)
             if ops and ops[-1] == [hidden] and len(ops[0]) >= 1:
-                seq_from_rms = ops[0][0]
-                break
+                prefix = [int(x) for x in ops[0][:-1] if int(x) > 1]
+                if prefix:
+                    seq_candidates.append(max(prefix))
         lora = [g for g in gammas if g != hidden]
         if len(lora) >= 2:
             facts["q_lora_rank"] = _fact(
@@ -186,9 +218,24 @@ def derive_model(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
                 lora[1], f"RmsNorm 非 hidden 的低秩宽度，取较小 {lora[1]}", "high")
 
     # --- seq_length ----------------------------------------------------------
-    seq = seq_from_rms
-    if seq:
-        facts["seq_length"] = _fact(seq, "hidden-width RmsNorm 激活首维 [S,1,H]", "high")
+    seq: Optional[int] = None
+    if seq_candidates:
+        counts = Counter(seq_candidates)
+        seq, count = counts.most_common(1)[0]
+        share = count / len(seq_candidates)
+        if share >= 0.8:
+            facts["seq_length"] = _fact(
+                seq,
+                f"hidden-width RmsNorm 激活非 hidden 维众数 {seq}（{count}/{len(seq_candidates)}）",
+                "high",
+            )
+        else:
+            facts["seq_length"] = _fact(
+                None,
+                f"hidden-width RmsNorm 序列维候选冲突：{dict(counts.most_common(5))}",
+                "unknown",
+            )
+            seq = None
 
     # --- attention heads + per-head dims, from FlashAttentionScore -----------
     fa = _rows_named(kd, "FlashAttentionScore", exclude="Grad")
@@ -347,13 +394,73 @@ def derive_capture(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
     if fa_grad > 0:
         r = fa_fwd / fa_grad
         if r >= 1.5:
-            val, conf = "full", "high"
+            attention_val, conf = "full", "high"
         elif r <= 1.2:
-            val, conf = "off", "high"
+            attention_val, conf = "off", "high"
         else:
-            val, conf = "selective", "medium"
-        fact = _fact(
-            val, f"融合 Attention 前向/反向次数比 = {r:.2f}（fwd {fa_fwd} / grad {fa_grad}）", conf)
+            attention_val, conf = "selective", "medium"
+        custom_types = _custom_model_types(kd)
+        if custom_types:
+            type_counts = Counter(kd["Type"].astype(str)) if "Type" in kd.columns else Counter()
+            operator_candidates: List[Dict[str, Any]] = []
+            explicit_types = [t for t in custom_types if "recompute" in t.lower()]
+            for typ in explicit_types:
+                operator_candidates.append({
+                    "type": typ,
+                    "method": "explicit_kernel_name",
+                    "count": int(type_counts.get(typ, 0)),
+                    "confidence": "high",
+                })
+            pair_specs = (
+                ("causal_conv1d_fwd_kernel", "causal_conv1d_bwd_kernel"),
+                ("chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+                 "chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64"),
+            )
+            for fwd_type, bwd_type in pair_specs:
+                nf, nb = int(type_counts.get(fwd_type, 0)), int(type_counts.get(bwd_type, 0))
+                if nb > 0 and nf > nb:
+                    operator_candidates.append({
+                        "type": fwd_type,
+                        "paired_backward_type": bwd_type,
+                        "method": "forward_backward_excess",
+                        "forward_count": nf,
+                        "backward_count": nb,
+                        "excess_forward_count": nf - nb,
+                        "confidence": "medium",
+                    })
+            if fa_fwd > fa_grad:
+                operator_candidates.append({
+                    "type": "Fused Attention forward",
+                    "method": "forward_backward_excess",
+                    "forward_count": int(fa_fwd),
+                    "backward_count": int(fa_grad),
+                    "excess_forward_count": int(fa_fwd - fa_grad),
+                    "confidence": "medium",
+                })
+            # Multiple independent signals prove recompute is enabled even though
+            # not every custom family has a semantic FLOP model.  Report a useful
+            # model-wide opinion: selective is the defensible observed state;
+            # ratios near 2 plus explicit KDA replay make full the likely launch
+            # granularity, surfaced separately as an estimate.
+            val = "selective" if operator_candidates else attention_val
+            conf = "medium"
+            evidence = (
+                f"融合 Attention 子集前向/反向次数比 = {r:.2f}（fwd {fa_fwd} / grad {fa_grad}），"
+                f"并检出 {len(operator_candidates)} 组显式/超额 forward 重计算证据；"
+                "判定重计算已开启，观测范围为选择性，启动配置更可能接近 full"
+            )
+        else:
+            val = attention_val
+            evidence = f"融合 Attention 前向/反向次数比 = {r:.2f}（fwd {fa_fwd} / grad {fa_grad}）"
+        fact = _fact(val, evidence, conf)
+        fact["attention_value"] = attention_val
+        fact["scope"] = "model_wide_estimated" if custom_types else "whole_model_supported_families"
+        if custom_types:
+            fact["unmodeled_model_types"] = custom_types
+            fact["likely_granularity"] = (
+                "full" if attention_val == "full" and bool(explicit_types) else "selective"
+            )
+            fact["operator_candidates"] = operator_candidates
         # Raw signals for the recompute-overhead quantifier (m=fwd/grad−1).
         fact["fwd_grad_ratio"] = round(float(r), 4)
         fact["recompute_forward_multiplier"] = round(max(float(r) - 1.0, 0.0), 4)
@@ -462,8 +569,9 @@ def derive_config(prof: ProfileData) -> Dict[str, Any]:
     guesses = derive_guesses(prof, model)
 
     flags: Dict[str, Any] = {}
-    if (capture.get("recompute", {}) or {}).get("value") == "full":
-        flags["recompute-granularity"] = "full"
+    recompute_value = (capture.get("recompute", {}) or {}).get("value")
+    if recompute_value in ("full", "selective"):
+        flags["recompute-granularity"] = recompute_value
     flags["swap-optimizer"] = bool((capture.get("swap_optimizer", {}) or {}).get("value"))
     # Derived training dims that map onto the old flag names (display only):
     if (model.get("seq_length", {}) or {}).get("value"):

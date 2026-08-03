@@ -193,14 +193,20 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
         if not eff.get("flop_model_complete", True):
             missing = eff.get("unmodeled_flop_types") or {}
             missing_txt = "、".join(list(missing)[:4]) or "未知主导算子"
+            estimate = eff.get("mfu_estimate") or {}
             cards.append(_card(
                 "flop_model_incomplete", "high", "采集体检",
-                f"模型 FLOP 覆盖不足：{missing_txt} 未建模，完整 MFU/HFU 已停用",
-                "已识别到模型计算算子，但其 shape/稀疏语义不足以可靠换算 FLOPs；仅用其余 GEMM 会系统性高估或低估模型效率。",
-                "为对应算子补充经算子语义验证的 FLOP 模型；在此之前只使用原始耗时、模块归因和时间构成。",
-                "避免把局部 GEMM MFU 误当全模型 MFU，也不生成不完整的算子 What-if 收益。",
-                1.0,
-                {"coverage_pct": eff.get("flop_coverage_pct"), "unmodeled_types": missing},
+                f"模型 FLOP 公式覆盖不足：{missing_txt} 改用周期计数校准，MFU 输出为估算值",
+                "未建模 KDA/causal-conv 不能只用其余 GEMM 代替；当前用同一采集内 GEMM/Attention "
+                "的公式 FLOPs 校准 MAC/Vector 活跃周期，再补齐端到端工作量。",
+                "保留 MFU(est) 作为调优主判断，同时优先补充对应算子的语义 FLOP 模型；"
+                "未知算子不进入 Roofline 收益排行。",
+                ("给出可行动的 MFU 点估计与区间；当前公式覆盖 "
+                 f"{eff.get('flop_coverage_pct')}%，自定义算子计数器覆盖 "
+                 f"{estimate.get('custom_counter_coverage_pct')}%。"),
+                0.75,
+                {"coverage_pct": eff.get("flop_coverage_pct"), "unmodeled_types": missing,
+                 "mfu_estimate": estimate},
             ))
         if eff.get("peak_inconsistent"):
             chipinfo = eff.get("chip", {})
@@ -271,11 +277,15 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
         _mp = lambda x: (f"{x * 100:.1f}%" if isinstance(x, (int, float)) else "—")
         _rk = "全量" if rc == "full" else "选择性"
         if rco.get("overhead_us"):
+            candidate_names = "、".join(
+                str(c.get("type")) for c in (rco.get("candidates") or [])[:5]
+            )
             root = ("为省激活显存，反向重跑前向，额外计算 ≈ {us:,.0f}us（step 的 {pct}%，"
-                    "band {lo:,.0f}–{hi:,.0f}us，覆盖全部前向算子）。这是硬件多做的功，"
+                    "band {lo:,.0f}–{hi:,.0f}us）。识别候选：{ops}。这是硬件多做的功，"
                     "拉低 MFU：HFU {hfu} vs MFU {mfu}。").format(
                         us=rco["overhead_us"], pct=rco.get("overhead_pct"),
                         lo=rco.get("overhead_us_lo"), hi=rco.get("overhead_us_hi"),
+                        ops=candidate_names or "前向/反向相位组",
                         hfu=_mp(rco.get("hfu")), mfu=_mp(rco.get("mfu")))
             gain = "关闭重计算可省 ≈ {us:,.0f}us → 端到端 MFU {m0}→{m1}（需显存余量）。".format(
                         us=rco["save_us"], m0=_mp(rco.get("mfu")), m1=_mp(rco.get("new_mfu")))
