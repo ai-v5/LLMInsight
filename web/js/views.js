@@ -15,10 +15,13 @@
     const [ov, theo] = await Promise.all([api("/api/overview"), api("/api/theoretical")]);
     if (!ov.available) { root.innerHTML = `<div class="empty">无 step_trace 数据</div>`; return; }
     const r = ov.ratios, u = ov.us;
+    const stepCount = Number(ov.step_count || 1);
+    const multiStep = stepCount > 1;
     const smfu = theo.available ? theo.step_mfu : null;  // model MFU (recompute stripped), 0–1
     const smfuLo = theo.available ? theo.step_mfu_lo : null;
     const smfuHi = theo.available ? theo.step_mfu_hi : null;
     const hfu = theo.available ? theo.step_hfu : null;   // hardware FLOPs util (incl. recompute)
+    const mfuEstimated = Boolean(theo.available && theo.mfu_estimated);
     const rco = theo.available ? (theo.recompute || null) : null;  // recompute what-if lever
     const modelMac = theo.available && theo.model_mac_ratio != null
       ? ` · 模型MAC(GEMM+Attn)/Step ${fmt.mfu(theo.model_mac_ratio)}（含通信/空泡，计数器覆盖${Number(theo.model_mac_counter_coverage_pct || 0).toFixed(1)}%）`
@@ -27,15 +30,17 @@
       ? ` · 估计区间 ${fmt.mfu(smfuLo)}–${fmt.mfu(smfuHi)}`
       : "";
     const mfuFoot = (rco && hfu != null)
-      ? `模型MFU · HFU ${fmt.mfu(hfu)}（含重算）${mfuBand}${modelMac}`
+      ? `${mfuEstimated ? "计数器校准估算 · " : ""}HFU ${fmt.mfu(hfu)}（含重算）${mfuBand}${modelMac}`
       : "有效FLOPs /(峰值×step)";
     const cards = [
       metric("有效计算占比", fmt.pct(r.effective_compute_pct), { tone: r.effective_compute_pct >= 60 ? "good" : "warn", foot: "Computing / Stage", barPct: r.effective_compute_pct }),
       metric("未掩盖通信", fmt.pct(r.comm_not_overlapped_pct), { tone: "bad", foot: fmt.us(u.comm_not_overlapped), barPct: r.comm_not_overlapped_pct }),
       metric("空闲 Free", fmt.pct(r.free_pct), { tone: "warn", foot: fmt.us(u.free), barPct: r.free_pct }),
       metric("通信掩盖率", fmt.pct(r.overlap_rate_pct), { tone: r.overlap_rate_pct < 40 ? "bad" : "good", foot: "Overlapped / Communication", barPct: r.overlap_rate_pct }),
-      metric("端到端 MFU", fmt.mfu(smfu), { tone: smfu == null ? undefined : (smfu >= 0.5 ? "good" : smfu >= 0.3 ? "warn" : "bad"), foot: mfuFoot, barPct: smfu != null ? smfu * 100 : undefined }),
-      metric("Step 时间", r.step_time_s + " s", { foot: "Stage = " + fmt.us(u.stage) }),
+      metric(mfuEstimated ? "端到端 MFU(est)" : "端到端 MFU", fmt.mfu(smfu), { tone: smfu == null ? undefined : (smfu >= 0.5 ? "good" : smfu >= 0.3 ? "warn" : "bad"), foot: mfuFoot, barPct: smfu != null ? smfu * 100 : undefined }),
+      metric(multiStep ? "平均 Step 时间" : "Step 时间", r.step_time_s + " s", {
+        foot: multiStep ? `${stepCount}-step 窗口 ${fmt.us(u.stage)}` : "Stage = " + fmt.us(u.stage)
+      }),
     ];
     // Upper table renders the REALISTIC floor (业界可达上限), not the physical →0 bound:
     // labels read 实测%→地板% and savings/MFU/combined all follow the floor. The →0 bound
@@ -47,7 +52,7 @@
     // MFU column shows the gain vs base (step_mfu); the base row stays the absolute anchor.
     const dmfu = (nv) => (smfu == null || nv == null) ? "—" : (nv - smfu >= 0 ? "+" : "-") + fmt.mfu(Math.abs(nv - smfu));
     // step column shows time saved vs base, in seconds (— at base, which saves nothing).
-    const saved = (us) => us > 0 ? "-" + (us / 1e6).toFixed(2) + " s" : "—";
+    const saved = (us) => us > 0 ? "-" + (us / stepCount / 1e6).toFixed(2) + " s" : "—";
     // combined row is the summary line, so its MFU shows the absolute reached value
     // plus the gain in parens — e.g. 76.7%（+35.8%）— unlike the delta-only lever rows.
     const mfuAbsDelta = (nv) => nv == null ? "—" : `${fmt.mfu(nv)}（${dmfu(nv)}）`;
@@ -80,12 +85,20 @@
         + `<td style="color:var(--accent-2)">${saveUs > 0 ? "-" + fmt.pct(savePct) : "—"}</td>`
         + `<td style="color:var(--accent)"><strong>${mfuAbsDelta(newMfu)}</strong></td>`;
     };
+    const opinion = mfuEstimated && smfu != null
+      ? banner("warn", "🧮", `<strong>观点：${esc(theo.mfu_opinion || "MFU 为计数器校准估算")}</strong>。端到端 MFU(est) <strong>${fmt.mfu(smfu)}</strong>（${fmt.mfu(smfuLo)}–${fmt.mfu(smfuHi)}），HFU <strong>${fmt.mfu(hfu)}</strong>；公式 FLOPs 覆盖不足部分由同次采集的 MAC/Vector 周期校准补齐。`)
+      : "";
+    const rcCandidates = (rco && rco.candidates) || [];
+    const rcEvidence = rco
+      ? banner("warn", "♻️", `<strong>重计算观点：已开启，粒度更接近 ${esc(rco.granularity || "selective")}</strong>；估计占执行 FLOPs <strong>${fmt.pct((rco.flops_share || 0) * 100)}</strong>，平均每 step 约 <strong>${fmt.us((rco.overhead_us || 0) / stepCount)}</strong>。候选算子：${rcCandidates.slice(0, 5).map(x => `<strong>${esc(x.type)}</strong>（${esc(x.evidence || x.method)}）`).join("、") || "前向/反向相位组"}。`)
+      : "";
     root.innerHTML = `
+      ${opinion}${rcEvidence}
       <div class="grid cols-6">${cards.join("")}</div>
       <div class="grid cols-2" style="margin-top:16px">
-        ${panel("Step 时间构成", "Computing / 未掩盖通信 / Free（单位 us）", `<div id="ov-donut" class="chart"></div>`)}
+        ${panel(multiStep ? `${stepCount}-step 窗口时间构成` : "Step 时间构成", "Computing / 未掩盖通信 / Free（单位 us）", `<div id="ov-donut" class="chart"></div>`)}
         ${panel("What-if 收益模拟 · 现实可达地板", "每项为达现实地板（业界可达上限）时单独可回收的收益（实测%→地板%）；勾选后底部「已启用组合」实时叠加",
-          `<table class="tbl"><thead><tr><th style="width:38px">启用</th><th>优化项</th><th>单独节省(s)</th><th>单独节省(%)</th><th>端到端 MFU</th></tr></thead>`
+          `<table class="tbl"><thead><tr><th style="width:38px">启用</th><th>优化项</th><th>${multiStep ? "单步平均节省(s)" : "单独节省(s)"}</th><th>单独节省(%)</th><th>端到端 MFU</th></tr></thead>`
           + `<tbody>${theo.available ? (baseRow + leverRows + `<tr id="wi-combined" style="border-top:2px solid rgba(94,224,184,.35)"></tr>`) : `<tr><td colspan=5 class="empty">—</td></tr>`}</tbody></table>
            ${cb ? (cb.peak_inconsistent
              ? banner("warn","⚠️", "观测吞吐超过所选芯片/精度峰值；MFU 与算子 What-if 已停用，请核对 active chip、dtype 与 shape 语义。")
@@ -112,17 +125,20 @@
     const r = theo.realistic || {};
     const levers = r.levers || [];
     if (!levers.length) return "";
+    const stepCount = Number(theo.window_step_count || 1);
+    const shownUs = (v) => fmt.us((v || 0) / stepCount);
+    const stepWord = stepCount > 1 ? "平均 step" : "step";
     const miniH = (t) => `<div style="font-size:11.5px;font-weight:600;color:var(--text-mut);margin-bottom:5px">${esc(t)}</div>`;
     const ul = (xs) => `<ul style="margin:0;padding-left:17px;font-size:12px;line-height:1.65">${(xs || []).map(x => `<li>${esc(x)}</li>`).join("")}</ul>`;
     const items = levers.map(lv => {
       const zero = lv.can_reach_zero ? "可减到 0" : "不能减到 0（有不可消除下限）";
       const caveats = (lv.caveats || []).map(c => banner("warn", "⚠️", esc(c))).join("");
       const line =
-        `实测 <strong>${fmt.us(lv.measured_us)}</strong>（step ${fmt.pct(lv.measured_pct)}）`
-        + ` → 现实地板 ≈ <strong style="color:var(--accent-2)">${fmt.us(lv.floor_us)}</strong>（step ${fmt.pct(lv.floor_pct)}）`
-        + ` · 可回收 ≈ <strong style="color:var(--accent)">${fmt.us(lv.recoverable_us)}</strong>`
-        + `（区间 ${fmt.us(lv.recoverable_lo_us)}–${fmt.us(lv.recoverable_hi_us)}）`
-        + ` · 优化后 step ${fmt.us(lv.new_step_us)} / 端到端 MFU ${fmt.mfu(lv.new_mfu)}`;
+        `实测 <strong>${shownUs(lv.measured_us)}</strong>（${stepWord} ${fmt.pct(lv.measured_pct)}）`
+        + ` → 现实地板 ≈ <strong style="color:var(--accent-2)">${shownUs(lv.floor_us)}</strong>（${stepWord} ${fmt.pct(lv.floor_pct)}）`
+        + ` · 可回收 ≈ <strong style="color:var(--accent)">${shownUs(lv.recoverable_us)}</strong>`
+        + `（区间 ${shownUs(lv.recoverable_lo_us)}–${shownUs(lv.recoverable_hi_us)}）`
+        + ` · 优化后${stepWord} ${shownUs(lv.new_step_us)} / 端到端 MFU ${fmt.mfu(lv.new_mfu)}`;
       return `<div style="margin:13px 0;padding-top:11px;border-top:1px solid var(--border)">`
         + miniH(`${lv.title} · 能减到 0？${zero}`)
         + `<div class="sub" style="margin-bottom:7px">${esc(lv.floor_basis)}</div>`
@@ -135,8 +151,8 @@
     const c = r.combined || {};
     const comb = (c && c.new_step_us != null)
       ? banner("info", "🎯",
-          `<strong>综合现实地板</strong>：优化后 step ≈ <strong>${fmt.us(c.new_step_us)}</strong>`
-          + `（区间 ${fmt.us(c.new_step_hi_us)}–${fmt.us(c.new_step_lo_us)}），`
+          `<strong>综合现实地板</strong>：优化后${stepWord} ≈ <strong>${shownUs(c.new_step_us)}</strong>`
+          + `（区间 ${shownUs(c.new_step_hi_us)}–${shownUs(c.new_step_lo_us)}），`
           + `端到端 MFU ≈ <strong>${fmt.mfu(c.new_mfu)}</strong>`
           + `（${fmt.mfu(c.new_mfu_lo)}–${fmt.mfu(c.new_mfu_hi)}），`
           + `省 ≈ <strong>${fmt.pct(c.recoverable_pct)}</strong>。${esc(c.basis)}`)
@@ -241,13 +257,14 @@
     };
     const optRows = top.map(t =>
       `<tr><td class="mono">${esc(t.name)}</td><td><span class="tag">${esc(t.bound || "—")}</span></td><td>${fmt.us(t.dur_us)}</td><td>${gainCell(t)}</td></tr>`).join("");
+    const displayedMfu = t => t.mfu != null ? t.mfu : t.mfu_estimated;
     const macGap = t => {
       if (t.mfu == null || t.mac_ratio_weighted == null) return "—";
       const gap = (t.mac_ratio_weighted - t.mfu) * 100;
       return `${gap >= 0 ? "+" : ""}${gap.toFixed(1)} pp`;
     };
     const byType = ef.by_type.slice(0, 20).map(t =>
-      `<tr><td>${esc(t.type)}</td><td class="mono">${t.dtype ? esc(t.dtype) : "—"}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td><td>${t.mfu != null ? fmt.mfu(t.mfu) : "—"}</td><td title="计数器耗时覆盖 ${Number(t.mac_ratio_coverage_pct || 0).toFixed(1)}%">${t.mac_ratio_weighted != null ? fmt.mfu(t.mac_ratio_weighted) : "—"}</td><td>${macGap(t)}</td><td>${t.mbu != null ? fmt.mfu(t.mbu) : "—"}</td><td>${fmt.us(t.reclaim_us != null ? t.reclaim_us : t.wasted_us)}</td></tr>`).join("");
+      `<tr><td>${esc(t.type)}</td><td class="mono">${t.dtype ? esc(t.dtype) : "—"}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td><td>${displayedMfu(t) != null ? fmt.mfu(displayedMfu(t)) + (t.mfu == null ? " 估" : "") : "—"}</td><td title="计数器耗时覆盖 ${Number(t.mac_ratio_coverage_pct || 0).toFixed(1)}%">${t.mac_ratio_weighted != null ? fmt.mfu(t.mac_ratio_weighted) : "—"}</td><td>${macGap(t)}</td><td>${t.mbu != null ? fmt.mfu(t.mbu) : "—"}</td><td>${fmt.us(t.reclaim_us != null ? t.reclaim_us : t.wasted_us)}</td></tr>`).join("");
     const sparseMac = (ef.by_type || []).filter(t =>
       (t.type === "SparseFlashAttention" || t.type === "SparseFlashAttentionGrad") &&
       t.mfu != null && t.mac_ratio_weighted != null);
@@ -262,7 +279,7 @@
       ? `<div class="note" style="margin-top:8px">🎯 算子 MFU 天花板：matmul <strong>${ceilPct(oco.ceilings.matmul)}%</strong> / FA <strong>${ceilPct(oco.ceilings.attention)}%</strong> / FAG <strong>${ceilPct(oco.ceilings.attention_grad)}%</strong>　·　已达天花板 <strong>${oco.n_capped}/${oco.n_modeled}</strong> 个算子（不再优化）　·　全部提升至天花板可回收 <strong>${fmt.us(oco.total_reclaim_us)}</strong>。下方「优化候选 / 排行」已据此筛选。</div>`
       : "";
     const fidelity = !ef.flop_model_complete
-      ? banner("warn", "⚠️", `模型 FLOP 覆盖仅 <strong>${fmt.pct(ef.flop_coverage_pct)}</strong>；未建模：<strong>${esc(Object.keys(ef.unmodeled_flop_types || {}).join("、") || "未知主导算子")}</strong>。完整 MFU/HFU 与算子 What-if 已停用。`)
+      ? banner("warn", "⚠️", `模型 FLOP 公式覆盖 <strong>${fmt.pct(ef.flop_coverage_pct)}</strong>；未建模：<strong>${esc(Object.keys(ef.unmodeled_flop_types || {}).join("、") || "未知主导算子")}</strong>。完整模型 MFU 改用同次采集 MAC/Vector 周期校准估算；未知算子不生成 Roofline 收益。`)
       : "";
     const peakWarning = ef.peak_inconsistent
       ? banner("warn", "⚠️", "观测吞吐超过所选芯片/精度峰值；请核对 active chip、dtype 与 shape 语义。当前 MFU 不作为有效结论。")
@@ -278,7 +295,8 @@
           ? `　|　⚠️ 实测峰值 <strong>${chip.observed_peak_tflops.toFixed(0)} TFLOPS</strong> &gt; 假设值 → 已按实测校准（设真实 SKU 峰值可覆盖）`
           : `（${chip.assumed ? "参考峰值；顶部可切换芯片，或在 config.ChipSpec 校正" : "实测"}）`) +
         `　|　matmul MFU ≈ <strong>${ef.matmul_mfu != null ? (ef.matmul_mfu*100).toFixed(0)+"%" : "—"}</strong>` +
-        (ef.model_mfu_compute != null ? `　|　模型算力 MFU(GEMM+Attn) ≈ <strong>${(ef.model_mfu_compute*100).toFixed(0)}%</strong>` : "") +
+        (ef.model_mfu_compute != null ? `　|　模型算力 MFU(GEMM+Attn) ≈ <strong>${(ef.model_mfu_compute*100).toFixed(0)}%</strong>` :
+         ef.model_mfu_compute_estimated != null ? `　|　模型算力 MFU(est) ≈ <strong>${(ef.model_mfu_compute_estimated*100).toFixed(0)}%</strong>（${fmt.mfu(ef.model_mfu_compute_estimated_lo)}–${fmt.mfu(ef.model_mfu_compute_estimated_hi)}）` : "") +
         `　|　建模 kernel ${fmt.int(ef.kernels_with_flops)}/${fmt.int(ef.kernels_total)}`)}
       ${ocNote}
       <div class="grid cols-2">
@@ -287,7 +305,7 @@
         ${panel("优化空间排行 (Top 15)", "按到各算子 MFU 天花板的可回收时间排序；颜色 = 瓶颈类型", `<div id="ef-waste" class="chart tall"></div>`)}
       </div>
       ${panel("优化候选明细 (Top 15)", "优化收益 = 到 MFU 天花板的可回收时间（matmul/FA/FAG 封顶各自天花板，其余到 Roofline）；已达天花板的算子不入表；括号为优化后的 MFU / MBU", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>算子</th><th>瓶颈</th><th>当前耗时</th><th>优化收益</th></tr></thead><tbody>${optRows}</tbody></table></div>`, "span-2")}
-      ${panel("按算子类型 MFU / MBU / 可回收（MFU 按各算子 cube/vector 峰值）", "MAC周期占比按 kernel 耗时加权；MAC−MFU 为百分点差，不代表未利用算力可直接回收", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>dtype</th><th>Count</th><th>耗时</th><th>MFU</th><th>MAC周期占比(加权)</th><th>MAC−MFU</th><th>MBU</th><th>可回收(vs天花板)</th></tr></thead><tbody>${byType}</tbody></table></div>`, "span-2")}
+      ${panel("按算子类型 MFU / MBU / 可回收（MFU 按各算子 cube/vector 峰值）", "“估”=同次采集计数器校准值；MAC−MFU 仅对公式 MFU 比较，不代表可直接回收", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>dtype</th><th>Count</th><th>耗时</th><th>MFU/估算</th><th>MAC周期占比(加权)</th><th>MAC−MFU</th><th>MBU</th><th>可回收(vs天花板)</th></tr></thead><tbody>${byType}</tbody></table></div>`, "span-2")}
       ${ob.length ? panel(`开销主导算子（MFU & MBU 双低 &lt;2%，共 ${fmt.us(ef.overhead_bound_us)}）`, "这些算子算力和带宽利用率都≈0 → 时间主要花在 kernel launch / 标量 / 调度开销，不在 compute/memory roofline 上。roofline 的「优化到 100%」对它们不成立，已从上方优化候选 / 收益中剔除、单列于此。优化方向在 kernel 层：算子融合、增大 tiling、减少 launch 次数、避免 scalar 路径。", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>dtype</th><th>Count</th><th>耗时</th><th>MFU</th><th>MBU</th></tr></thead><tbody>${obRows}</tbody></table></div>`, "span-2") : ""}`;
     charts([
       ...(sparseMac.length ? [{ id: "ef-sparse-mac", option: mfuMacCompare(sparseMac) }] : []),
@@ -403,6 +421,7 @@
     if (!ho.available) { root.innerHTML = `<div class="empty">无数据</div>`; return; }
     const dev = ho.buckets.filter(b => b.domain === "device" && b.us != null && b.additive !== false);
     const host = ho.buckets.filter(b => b.domain === "host" && b.us != null);
+    const hoStepCount = Number(ho.step_count || 1);
     const cards = ho.buckets.map(b => `
       <div class="panel">
         <h3>${esc(b.label)} <span class="ic-cat">${esc(b.domain)}</span></h3>
@@ -414,7 +433,7 @@
       <div class="grid cols-3">
         ${metric("Device 侧合计", fmt.us(ho.device_total_us), { tone: "warn", foot: "与 step 同口径可比" })}
         ${metric("Host 侧合计", fmt.us(ho.host_total_us), { foot: "下发/同步压力（被 blocking 放大）" })}
-        ${metric("Step 时间", fmt.us(ho.stage_us))}
+        ${metric(hoStepCount > 1 ? `${hoStepCount}-step 窗口` : "Step 时间", fmt.us(ho.stage_us), { foot: hoStepCount > 1 ? `平均 ${fmt.us(ho.average_stage_us)}` : "" })}
       </div>
       <div class="grid cols-2" style="margin-top:16px">
         ${panel("Device 侧隐性开销 (计入 step)", "未掩盖通信 / 空泡 / 格式转换初始化（AICPU 通信执行为同段通信，单列、不入合计）", `<div id="ho-dev" class="chart"></div>`)}
@@ -728,13 +747,15 @@
   V.replay = async function (root) {
     const [ov, meta] = await Promise.all([api("/api/overview"), api("/api/meta")]);
     const step = ov.available ? ov.step : "—";
+    const replaySteps = ov.available ? (ov.steps || []) : [];
+    const replayCount = Number(ov.step_count || 1);
     const r = ov.available ? ov.ratios : {};
     root.innerHTML = `
-      ${banner("info", "🎬", `<strong>全训练回放（骨架）</strong> —— 当前数据为单 step（step ${step}）单帧。回放轴与联动机制已搭好；多 step 全程指标（loss / 吞吐 / 显存 / 通信抖动）随后续多 step + 训练日志采集接入。`)}
-      ${panel("训练时间轴（回放）", "拖动选择 step（当前仅 step " + step + "）",
+      ${banner("info", "🎬", `<strong>全训练回放（骨架）</strong> —— 当前数据为${replayCount > 1 ? `${replayCount}-step 聚合窗口（step ${step}），尚未拆成逐帧指标` : `单 step（step ${step}）单帧`}。回放轴与联动机制已搭好；逐 step 的 loss / 吞吐 / 显存 / 通信抖动需后续接入。`)}
+      ${panel("训练时间轴（回放）", replayCount > 1 ? `当前聚合 step ${step}` : "拖动选择 step（当前仅 step " + step + "）",
         `<div class="slider-row">
            <span class="note" style="margin:0">step</span>
-           <input type="range" min="${step}" max="${step}" value="${step}" disabled>
+           <input type="range" min="${replaySteps[0] || step}" max="${replaySteps[replaySteps.length-1] || step}" value="${replaySteps[0] || step}" disabled>
            <span class="badge"><strong>step ${step}</strong></span>
          </div>`)}
       <div class="section-title">当前帧快照（联动总览）</div>
@@ -742,7 +763,7 @@
         ${metric("有效计算", fmt.pct(r.effective_compute_pct), { tone: "good" })}
         ${metric("未掩盖通信", fmt.pct(r.comm_not_overlapped_pct), { tone: "bad" })}
         ${metric("空闲", fmt.pct(r.free_pct), { tone: "warn" })}
-        ${metric("Step 时间", (r.step_time_s || "—") + " s")}
+        ${metric(replayCount > 1 ? "平均 Step 时间" : "Step 时间", (r.step_time_s || "—") + " s")}
       </div>
       <div class="section-title">回放将支持（设计）</div>
       <div class="grid cols-2">

@@ -17,7 +17,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from llminsight.insight.summarizer import build_summary
 from llminsight.config import SETTINGS
-from llminsight.metrics.core import _recompute_overhead, _single_card, theoretical
+from llminsight.metrics.core import (
+    _recompute_overhead,
+    _single_card,
+    overview,
+    theoretical,
+)
 from llminsight.metrics.efficiency import (
     ATTENTION_TYPES,
     MATMUL_TYPES,
@@ -34,10 +39,14 @@ from llminsight.report import _sec_header
 from llminsight.rules import run_rules
 
 
-def _profile(kernel_details: pd.DataFrame, communication=None) -> ProfileData:
+def _profile(
+    kernel_details: pd.DataFrame,
+    communication=None,
+    step_trace: pd.DataFrame | None = None,
+) -> ProfileData:
     return ProfileData(
         data_dir="synthetic",
-        step_trace=pd.DataFrame(),
+        step_trace=step_trace if step_trace is not None else pd.DataFrame(),
         op_statistic=pd.DataFrame(),
         api_statistic=pd.DataFrame(),
         kernel_details=kernel_details,
@@ -409,6 +418,149 @@ def check_matmul_phase_split() -> None:
     assert phase["exact_group_count"] == 2, phase
 
 
+def check_multistep_window_normalization() -> None:
+    step_trace = pd.DataFrame([
+        {
+            "Device_id": 0, "Step": 4, "Computing": 700.0,
+            "Communication(Not Overlapped)": 200.0, "Overlapped": 100.0,
+            "Communication": 300.0, "Free": 100.0, "Stage": 1000.0,
+            "Bubble": 0.0, "Preparing": 1.0,
+        },
+        {
+            "Device_id": 0, "Step": 5, "Computing": 800.0,
+            "Communication(Not Overlapped)": 250.0, "Overlapped": 150.0,
+            "Communication": 400.0, "Free": 150.0, "Stage": 1200.0,
+            "Bubble": 0.0, "Preparing": 1.0,
+        },
+    ])
+    rows = pd.DataFrame([
+        {
+            "Step Id": step, "Type": "MatMulV3", "Name": f"mm_step_{step}",
+            "Duration(us)": 100.0, "Accelerator Core": "AI_CORE",
+            "Input Shapes": "4,8;16,8", "Input Data Types": "DT_BF16;DT_BF16",
+            "Output Shapes": "4,16", "Output Data Types": "DT_BF16",
+            "aic_mac_ratio": 0.5,
+        }
+        for step in (4, 5)
+    ])
+    prof = _profile(rows, step_trace=step_trace)
+    ov = overview(prof)
+    assert ov["steps"] == [4, 5], ov
+    assert ov["step_count"] == 2 and ov["window_aggregated"] is True, ov
+    assert ov["us"]["stage"] == 2200.0, ov
+    assert ov["avg_us"]["stage"] == 1100.0, ov
+    assert ov["ratios"]["step_time_s"] == 0.0011, ov
+    assert ov["ratios"]["window_time_s"] == 0.0022, ov
+
+    eff = compute_efficiency(prof)
+    theo = theoretical(prof, ov, eff, derive_config(prof))
+    assert theo["current_step_us"] == 2200.0, theo
+    assert theo["window_step_count"] == 2, theo
+    assert theo["average_step_us"] == 1100.0, theo
+    assert theo["model_mac_active_us"] == 100.0, theo
+    assert theo["model_mac_ratio"] == round(100.0 / 2200.0, 4), theo
+
+
+def check_custom_model_families_fail_closed() -> None:
+    rows = pd.DataFrame([
+        {
+            "Type": "MatMulV3", "Name": "modeled_mm", "Duration(us)": 100.0,
+            "Accelerator Core": "AI_CORE", "Input Shapes": "4,8;16,8",
+            "Input Data Types": "DT_BF16;DT_BF16", "Output Shapes": "4,16",
+            "Output Data Types": "DT_BF16", "aic_mac_ratio": 0.8,
+        },
+        {
+            "Type": "chunk_kda_bwd_kernel_wy_dqkg_fused", "Name": "kda_bwd",
+            "Duration(us)": 900.0, "Accelerator Core": "AI_CORE",
+            "Input Shapes": "1,16,64", "Input Data Types": "DT_BF16",
+            "Output Shapes": "1,16,64", "Output Data Types": "DT_BF16",
+            "aic_mac_ratio": 0.1, "aiv_vec_ratio": 0.5,
+        },
+        {
+            "Type": "causal_conv1d_fwd_kernel", "Name": "causal_conv",
+            "Duration(us)": 300.0, "Accelerator Core": "AI_VECTOR_CORE",
+            "Input Shapes": "1,16,64", "Input Data Types": "DT_BF16",
+            "Output Shapes": "1,16,64", "Output Data Types": "DT_BF16",
+            "aic_mac_ratio": 0.0, "aiv_vec_ratio": 0.8,
+        },
+    ])
+    eff = compute_efficiency(_profile(rows))
+    assert eff["flop_model_complete"] is False, eff
+    assert eff["efficiency_reliable"] is False, eff
+    assert eff["useful_flops_total"] is None, eff
+    assert eff["model_mfu_compute"] is None, eff
+    assert eff["model_mfu_compute_partial"] is not None, eff
+    assert eff["model_mfu_compute_estimated"] is not None, eff
+    assert eff["mfu_estimate"]["available"] is True, eff
+    assert eff["useful_flops_estimated_total"] > eff["useful_flops_modeled_partial"], eff
+    assert "chunk_kda_bwd_kernel_wy_dqkg_fused" in eff["unmodeled_flop_types"], eff
+    assert "causal_conv1d_fwd_kernel" in eff["unmodeled_flop_types"], eff
+    causal = next(x for x in eff["by_type"] if x["type"] == "causal_conv1d_fwd_kernel")
+    assert causal["mfu"] is None and causal["reclaim_us"] == 0.0, causal
+
+    causal_only = derive_model(_profile(rows.iloc[[2]].reset_index(drop=True)))
+    causal_arch = causal_only.get("architecture", {}).get("value") or ""
+    assert "KDA" not in causal_arch, causal_only
+
+
+def check_seq_axis_and_family_scoped_recompute() -> None:
+    rms = pd.DataFrame([{
+        "Type": "RmsNorm", "Name": "RmsNorm", "Duration(us)": 10.0,
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "1,16384,7168;7168", "Input Data Types": "DT_BF16;DT_BF16",
+        "Output Shapes": "1,16384,7168", "Output Data Types": "DT_BF16",
+    }])
+    model = derive_model(_profile(rms))
+    assert model["seq_length"]["value"] == 16384, model
+    assert model["seq_length"]["confidence"] == "high", model
+
+    rows = pd.concat([
+        _sparse_rows(),
+        pd.DataFrame([{
+            "Type": "recompute_w_u_fwd_kda_kernel", "Name": "kda_recompute",
+            "Duration(us)": 100.0, "Accelerator Core": "AI_CORE",
+            "Input Shapes": "1,16,64", "Input Data Types": "DT_BF16",
+            "Output Shapes": "1,16,64", "Output Data Types": "DT_BF16",
+            "aic_mac_ratio": 0.08, "aiv_vec_ratio": 0.45,
+        }]),
+    ], ignore_index=True)
+    prof = _profile(rows)
+    capture = derive_capture(prof)
+    rc = capture["recompute"]
+    assert rc["value"] == "selective", rc
+    assert rc["attention_value"] == "full", rc
+    assert rc["scope"] == "model_wide_estimated", rc
+    assert rc["likely_granularity"] == "full", rc
+    assert rc["confidence"] == "medium", rc
+    assert any(x["method"] == "explicit_kernel_name" for x in rc["operator_candidates"]), rc
+    model = derive_model(prof)
+    assert "KDA" in model["architecture"]["value"], model
+    assert derive_config(prof)["flags"]["recompute-granularity"] == "selective"
+
+    old_sparse_mode = SETTINGS.sparse_attention_mode
+    SETTINGS.sparse_attention_mode = 3
+    try:
+        eff = compute_efficiency(prof)
+    finally:
+        SETTINGS.sparse_attention_mode = old_sparse_mode
+    ov = {
+        "available": True,
+        "step_count": 1,
+        "us": {
+            "stage": 1000.0, "computing": 700.0,
+            "comm_not_overlapped": 200.0, "free": 100.0,
+            "communication": 300.0, "overlapped": 100.0,
+        },
+        "ratios": {"comm_not_overlapped_pct": 20.0, "free_pct": 10.0},
+    }
+    theo = theoretical(prof, ov, eff, derive_config(prof))
+    assert theo["step_mfu"] is not None and theo["step_hfu"] is not None, theo
+    assert theo["mfu_estimated"] is True, theo
+    assert theo["recompute"] is not None, theo
+    assert theo["recompute"]["candidates"], theo
+    assert "recompute_off" in {x["id"] for x in theo["whatif"]}, theo
+
+
 def check_smart_timeline_cube_breakdown() -> None:
     geom = {
         "available": True,
@@ -601,7 +753,14 @@ def check_report_uses_generic_semantics() -> None:
     html = _sec_header(
         meta,
         {"step": 1, "device_id": 0},
-        {},
+        {
+            "step_mfu": 0.25,
+            "step_mfu_lo": 0.24,
+            "step_mfu_hi": 0.27,
+            "step_hfu": 0.33,
+            "mfu_estimated": True,
+            "recompute": {"overhead_us": 100.0},
+        },
         {"chip": {"name": "synthetic"}},
         datetime(2026, 1, 1),
     )
@@ -609,12 +768,17 @@ def check_report_uses_generic_semantics() -> None:
     assert "MLA + MoE" not in html
     assert "EP64" not in html
     assert "多卡训练（单 rank 采集）" in html
+    assert "端到端 MFU(est)" in html
+    assert "计数器校准估算" in html
 
 
 if __name__ == "__main__":
     check_sparse_attention_and_capture()
     check_dsa_indexer_flops_and_phase_split()
     check_matmul_phase_split()
+    check_multistep_window_normalization()
+    check_custom_model_families_fail_closed()
+    check_seq_axis_and_family_scoped_recompute()
     check_smart_timeline_cube_breakdown()
     check_smart_timeline_cache_tracks_flop_model()
     check_peak_inconsistency_fails_closed()

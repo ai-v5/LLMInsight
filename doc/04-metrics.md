@@ -8,7 +8,7 @@
 
 ## 4.1 overview · Step 时间构成与关键比率
 
-读 `step_trace_time.csv` 首行，给出时间构成与比率：
+读 `step_trace_time.csv` 中首个 device 的完整 step 窗口，给出时间构成与比率。单 step 时窗口即该 step；多 step 时 `us` 为窗口总量、`avg_us` 为单步平均，界面同时显示两种口径：
 
 - **时间构成**（堆叠条）：Computing / Communication(Not Overlapped) / Free，分母为 `Stage`。
 - **关键比率**：
@@ -16,7 +16,8 @@
   - `comm_not_overlapped_pct = Communication(Not Overlapped) / Stage`（≈ 26%）
   - `free_pct = Free / Stage`（≈ **18.56%**）
   - `overlap_rate_pct = Overlapped / Communication`（计算-通信重叠率 ≈ **12.62%** —— 偏低，重点洞察）
-  - `step_time_s = Stage / 1e6`（≈ **3.13s**）
+  - `step_time_s = avg(Stage) / 1e6`（单步平均）
+  - `window_time_s = sum(Stage) / 1e6`（完整窗口；MFU/HFU 的 kernel 分子也覆盖同一窗口）
 
 ## 4.2 hotspots · 算子热点
 
@@ -68,6 +69,7 @@ ideal_us  = max(t_compute, t_mem) ; wasted_us = max(0, dur - ideal_us)
 bound = "compute" if t_compute >= t_mem else "memory"
 ```
 - 只有「有 FLOP 模型（matmul / 融合注意力）」**或**「向量核访存算子」才建模理想耗时；其它无 FLOP 模型的 cube/MIX 算子在纯访存 Roofline 下会显得 100% 浪费，故**留空不评分**（`_bound_from_ratios` 用流水线占比给个定性 bound）。
+- KDA、gated-delta、GLA、causal-conv 等尚无可靠 FLOP 公式的模型计算族会进入覆盖分母并列入 `unmodeled_flop_types`。完整模型 MFU 必须继续输出：用同一采集内 GEMM/Attention 的公式 FLOPs 校准 `aic_mac_ratio + aiv_vec_ratio` 周期代理，补齐自定义算子工作量，标为 `MFU(est)` 并给 ±25% 自定义算子贡献区间；未知算子仍不生成 Roofline 收益。
 - `top_optimization`：按 `wasted_us`（实测 − 理想）降序，自动圈出「耗时大但 MFU/MBU 低」的 kernel。
 - 通信下发"kernel"（AI_CPU / HCCL）无可建模的计算 / 访存足迹，**从效率排行剔除**（归通信视图与隐性开销）。
 
@@ -140,7 +142,7 @@ bound = "compute" if t_compute >= t_mem else "memory"
 | 消除空泡（Free→0） | Computing + comm_no | Free |
 | 通信掩盖 + 空泡减半 | Computing + Free·0.5 | comm_no + Free·0.5 |
 
-并结合 `matmul_mfu` 给 **compute-bound** 上界：理想 matmul 耗时 = `Computing · matmul_mfu`，余量 = `Computing − ideal`。若 MFU>1 则报「峰值假设偏低」而非负余量。
+并结合 `matmul_mfu` 给 **compute-bound** 上界：理想 matmul 耗时 = `Computing · matmul_mfu`，余量 = `Computing − ideal`。若 MFU>1 则报「峰值假设偏低」而非负余量。混合模型的重计算由三层证据联合判断：显式 `recompute_*` kernel、前向/反向调用数超额、MatMul 方向/次数相位拆分；输出主判断、候选算子、耗时/FLOPs 占比及置信区间，不再因自定义模型族而放弃结论。
 
 ## 4.9 timeline · 时间线（流式 + 缓存）
 

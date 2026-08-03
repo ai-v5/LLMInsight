@@ -2,8 +2,8 @@
 
 8 core files + 3 optional memory-level files (memory_record / npu_module_mem /
 operator_memory) that are only present when the profiler ran at memory level.
-Indexed conceptually by (rank, step). This sample is single-card (rank 0) /
-single-step (step5); the rank dimension is reserved for future multi-card data.
+Indexed conceptually by (rank, step). One export may contain several complete
+steps; the current loader keeps a single rank while preserving that step window.
 """
 from __future__ import annotations
 

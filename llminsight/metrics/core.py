@@ -66,20 +66,64 @@ def overview(prof) -> Dict[str, Any]:
         if ms and (ms.get("compute_us") or ms.get("comm_us")):
             return _overview_msprof(ms)
         return {"available": False}
-    r = st.iloc[0]
-    computing = _f(r.get("Computing"))
-    comm_no = _f(r.get("Communication(Not Overlapped)"))
-    overlapped = _f(r.get("Overlapped"))
-    communication = _f(r.get("Communication"))
-    free = _f(r.get("Free"))
-    stage = _f(r.get("Stage")) or (computing + comm_no + free)
-    bubble = _f(r.get("Bubble"))
-    preparing = _f(r.get("Preparing"))
+    # torch_npu may export several profiled steps into one directory.  Every
+    # other table (kernel_details / op_statistic / api_statistic / communication)
+    # covers that whole capture window, so using only st.iloc[0] here would pair
+    # a multi-step numerator with a one-step denominator and inflate MFU/MAC.
+    # Keep one device (the loader is single-rank today), but SUM every tagged
+    # step for the internal window.  avg_us is exposed separately for the UI's
+    # human-friendly "平均 Step" display.
+    rows = st
+    device_id = None
+    if "Device_id" in st.columns:
+        devices = pd.to_numeric(st["Device_id"], errors="coerce").dropna()
+        if not devices.empty:
+            device_id = int(devices.iloc[0])
+            rows = st[pd.to_numeric(st["Device_id"], errors="coerce") == device_id]
+
+    steps: List[int] = []
+    if "Step" in rows.columns:
+        for value in pd.to_numeric(rows["Step"], errors="coerce").dropna():
+            step = int(value)
+            if step not in steps:
+                steps.append(step)
+    step_count = len(steps) if steps else 1
+
+    def _sum_col(name: str) -> float:
+        if name not in rows.columns:
+            return 0.0
+        return float(pd.to_numeric(rows[name], errors="coerce").fillna(0.0).sum())
+
+    computing = _sum_col("Computing")
+    comm_no = _sum_col("Communication(Not Overlapped)")
+    overlapped = _sum_col("Overlapped")
+    communication = _sum_col("Communication")
+    free = _sum_col("Free")
+    stage = _sum_col("Stage") or (computing + comm_no + free)
+    bubble = _sum_col("Bubble")
+    preparing = _sum_col("Preparing")
+    avg = {
+        "computing": computing / step_count,
+        "comm_not_overlapped": comm_no / step_count,
+        "overlapped": overlapped / step_count,
+        "communication": communication / step_count,
+        "free": free / step_count,
+        "stage": stage / step_count,
+        "bubble": bubble / step_count,
+        "preparing": preparing / step_count,
+    }
+    step_label: Any = steps[0] if len(steps) == 1 else (
+        f"{steps[0]}–{steps[-1]}" if steps else None
+    )
 
     return {
         "available": True,
-        "step": _i(r.get("Step")),
-        "device_id": _i(r.get("Device_id")),
+        "basis": "step_window",
+        "step": step_label,
+        "steps": steps,
+        "step_count": step_count,
+        "window_aggregated": step_count > 1,
+        "device_id": device_id,
         "us": {
             "computing": computing,
             "comm_not_overlapped": comm_no,
@@ -90,6 +134,7 @@ def overview(prof) -> Dict[str, Any]:
             "bubble": bubble,
             "preparing": preparing,
         },
+        "avg_us": avg,
         "composition": [
             {"name": "Computing", "us": computing, "pct": _pct(computing, stage)},
             {"name": "Communication (Not Overlapped)", "us": comm_no, "pct": _pct(comm_no, stage)},
@@ -100,8 +145,11 @@ def overview(prof) -> Dict[str, Any]:
             "comm_not_overlapped_pct": _pct(comm_no, stage),
             "free_pct": _pct(free, stage),
             "overlap_rate_pct": _pct(overlapped, communication),
-            "step_time_s": round(stage / 1e6, 4),
+            "step_time_s": round(avg["stage"] / 1e6, 4),
+            "window_time_s": round(stage / 1e6, 4),
         },
+        "note": (f"采集窗口包含 {step_count} 个 step；内部指标使用窗口总量，"
+                 "Step 时间展示窗口均值。" if step_count > 1 else "单 step 采集窗口。"),
     }
 
 
@@ -411,6 +459,10 @@ def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None) ->
         "device_total_us": round(device_total, 1),
         "host_total_us": round(host_total, 1),
         "stage_us": stage,
+        "step_count": int(ov.get("step_count") or 1),
+        "average_stage_us": round(
+            stage / max(int(ov.get("step_count") or 1), 1), 1
+        ),
         "note": (
             "host 与 device 时间不可直接相加（部分并发/被 blocking 放大）。device 桶与 step 同口径可比；"
             "host 桶反映下发/同步压力。AICPU 集合通信执行与「未掩盖通信」为同一段时间，仅作算子视角展示、"
@@ -699,8 +751,9 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
             "recoverable_us": round(rc_us, 1), "recoverable_pct": _pct(rc_us, stage),
             "recoverable_lo_us": round(rc_lo, 1), "recoverable_hi_us": round(rc_hi, 1),
             "new_step_us": round(stage - rc_us, 1), "new_mfu": _mfu_at(stage - rc_us),
-            "floor_basis": "重算 = 反向重跑前向的额外计算（≈computing×{:.0%}，覆盖全部前向算子）；"
-                           "显存允许时可完全关闭 → 全部回收。".format(recompute.get("flops_share") or 0),
+            "floor_basis": "重算 = 已识别候选相位组在反向重跑前向的额外计算"
+                           "（≈computing×{:.0%}）；显存允许且候选全部关闭时可回收该估计量。"
+                           .format(recompute.get("flops_share") or 0),
             "methods": [
                 "显存有余量时减少/关闭重计算层（--recompute-num-layers↓ 或关 full）",
                 "选择性重计算（只重算激活大、计算省的算子）做显存↔吞吐平衡",
@@ -708,7 +761,7 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
             ],
             "reasons": [
                 "重算是为省激活显存而多做的前向，非模型必需功 → 显存够则可全回收",
-                "回收上限 = 反向重跑前向的实测时间（HFU 与 MFU 之差的时间体现）",
+                "回收上限 = 候选算子反向重跑前向的估计时间（HFU 与 MFU 之差的时间体现）",
             ],
             "caveats": ["关闭重计算抬高激活显存峰值，需先确认显存 headroom（见显存板块），否则 OOM。"],
         })
@@ -895,15 +948,38 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
             "matmul_recompute_flops_lo": matmul_flops.get("recompute_forward_flops_lo"),
             "matmul_recompute_flops_hi": matmul_flops.get("recompute_forward_flops_hi"),
         }
-    rc_ov = _recompute_overhead(
-        computing,
-        rc_state,
-        bwd_fwd_flop_ratio=(attn_flops.get("backward_forward_flop_ratio")
-                            if exact_attn_flops else None),
-        recompute_forward_multiplier=(attn_flops.get("recompute_forward_multiplier")
-                                      if exact_attn_flops else None),
-        component_flops=component_flops,
-    )
+    recompute_est = eff.get("recompute_estimate") or {}
+    if rc_state and recompute_est.get("available") and not eff.get("efficiency_reliable"):
+        r_est = float(recompute_est.get("flops_share") or 0.0)
+        r_lo_est = float(recompute_est.get("flops_share_lo") or r_est)
+        r_hi_est = float(recompute_est.get("flops_share_hi") or r_est)
+        multiplier = float(rc_state.get("recompute_forward_multiplier") or 0.0)
+        rc_ov = {
+            "us": round(computing * r_est, 1),
+            "us_lo": round(computing * r_lo_est, 1),
+            "us_hi": round(computing * r_hi_est, 1),
+            "flops_share": round(r_est, 4),
+            "flops_share_lo": round(r_lo_est, 4),
+            "flops_share_hi": round(r_hi_est, 4),
+            "rho": round(multiplier / (1.0 + multiplier), 4) if multiplier > 0 else 0.0,
+            "recompute_forward_multiplier": round(multiplier, 4),
+            "bwd_fwd_flop_ratio": 2.0,
+            "flop_ratio_source": "operator_candidates_plus_counter_calibration",
+            "granularity": recompute_est.get("likely_granularity") or rc_state.get("value"),
+            "basis": recompute_est.get("basis"),
+            "candidates": recompute_est.get("candidates") or [],
+            "confidence": recompute_est.get("confidence") or "medium",
+        }
+    else:
+        rc_ov = _recompute_overhead(
+            computing,
+            rc_state,
+            bwd_fwd_flop_ratio=(attn_flops.get("backward_forward_flop_ratio")
+                                if exact_attn_flops else None),
+            recompute_forward_multiplier=(attn_flops.get("recompute_forward_multiplier")
+                                          if exact_attn_flops else None),
+            component_flops=component_flops,
+        )
     r_re = rc_ov["flops_share"] if rc_ov else 0.0
     r_re_lo = rc_ov["flops_share_lo"] if rc_ov else 0.0
     r_re_hi = rc_ov["flops_share_hi"] if rc_ov else 0.0
@@ -978,8 +1054,18 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
     # time: new_mfu = step_mfu × (stage / new_step). A shorter step ⇒ higher MFU,
     # which is exactly the payoff of hiding comm / removing bubbles.
     hfu = None
+    mfu_estimated = False
+    mfu_basis = "formula_flops"
+    useful_flops_lo = None
+    useful_flops_hi = None
     if eff.get("available"):
         useful_flops = eff.get("useful_flops_total")
+        if not useful_flops:
+            useful_flops = eff.get("useful_flops_estimated_total")
+            useful_flops_lo = eff.get("useful_flops_estimated_lo")
+            useful_flops_hi = eff.get("useful_flops_estimated_hi")
+            mfu_estimated = bool(useful_flops)
+            mfu_basis = "formula_flops_plus_same_capture_counter_calibration"
         peak_tflops = (eff.get("chip") or {}).get("effective_peak_tflops")
         if useful_flops and peak_tflops and stage > 0:
             # executed-FLOPs step rate = HFU — it counts the forward FLOPs the
@@ -990,8 +1076,15 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
     # now the MODEL MFU; step_hfu carries the executed-FLOPs figure. (rc_ov / r_re were
     # computed at the top so the levers above could use them.)
     step_mfu = (hfu * (1.0 - r_re)) if hfu is not None else None
-    step_mfu_lo = (hfu * (1.0 - r_re_hi)) if hfu is not None else None
-    step_mfu_hi = (hfu * (1.0 - r_re_lo)) if hfu is not None else None
+    if mfu_estimated and useful_flops_lo and useful_flops_hi and peak_tflops and stage > 0:
+        denom = peak_tflops * 1e12 * (stage * 1e-6)
+        re_lo_flops = float(recompute_est.get("recompute_flops_lo") or 0.0)
+        re_hi_flops = float(recompute_est.get("recompute_flops_hi") or 0.0)
+        step_mfu_lo = max(float(useful_flops_lo) - re_hi_flops, 0.0) / denom
+        step_mfu_hi = max(float(useful_flops_hi) - re_lo_flops, 0.0) / denom
+    else:
+        step_mfu_lo = (hfu * (1.0 - r_re_hi)) if hfu is not None else None
+        step_mfu_hi = (hfu * (1.0 - r_re_lo)) if hfu is not None else None
     # Step-normalized model MAC: the numerator is accumulated MAC-active time over
     # GEMM + attention kernels; the denominator is the full training Stage, so
     # exposed communication and Free/bubbles lower it just as they lower MFU/HFU.
@@ -1139,6 +1232,8 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
             "recompute_forward_multiplier": rc_ov["recompute_forward_multiplier"],
             "bwd_fwd_flop_ratio": rc_ov["bwd_fwd_flop_ratio"],
             "flop_ratio_source": rc_ov["flop_ratio_source"],
+            "confidence": rc_ov.get("confidence", "medium"),
+            "candidates": rc_ov.get("candidates") or [],
             "save_us": round(rc_save, 1),
             "save_pct": _pct(rc_save, stage),
             "new_step_us": round(_new_step, 1),
@@ -1155,6 +1250,13 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
     return {
         "available": True,
         "current_step_us": round(stage, 1),
+        # `stage` is the complete capture window.  For a multi-step export the
+        # per-step figure is a display normalization only; all numerators and
+        # What-if slices remain on the same window denominator.
+        "window_step_count": int(ov.get("step_count") or 1),
+        "average_step_us": round(
+            stage / max(int(ov.get("step_count") or 1), 1), 1
+        ),
         "whatif": whatif,
         "whatif_combined": whatif_combined,
         "realistic": realistic,
@@ -1164,6 +1266,20 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         "step_mfu_lo": round(step_mfu_lo, 4) if step_mfu_lo else None,
         "step_mfu_hi": round(step_mfu_hi, 4) if step_mfu_hi else None,
         "step_hfu": round(hfu, 4) if hfu else None,
+        "mfu_estimated": mfu_estimated,
+        "mfu_basis": mfu_basis,
+        "mfu_confidence": (
+            (eff.get("mfu_estimate") or {}).get("confidence")
+            if mfu_estimated else "high"
+        ),
+        "mfu_opinion": (
+            ("端到端 MFU 偏低，重计算与未掩盖通信是主要拖累"
+             if step_mfu is not None and step_mfu < 0.30
+             else "端到端 MFU 中等，仍应优先处理重计算与通信暴露"
+             if step_mfu is not None and step_mfu < 0.50
+             else "端到端 MFU 较高，优化重点转向尾部通信与局部算子")
+            if step_mfu is not None else None
+        ),
         "model_mac_ratio": (
             round(model_mac_ratio, 4) if model_mac_ratio is not None else None
         ),
@@ -1176,6 +1292,7 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         "note": ("端到端 MFU=模型理论FLOPs/(峰值×step)（不含重计算）；HFU 含重计算重复执行的 FLOPs。"
                  "稀疏 Attention/Indexer 按前后向调用计数拆分；matmul 优先按线性层方向/次数拆分，"
                  "无法配对的部分保留 R=2–2.5 训练估计；"
-                 "当主导算子 FLOP 模型不完整或峰值口径不一致时，MFU/HFU 与算子收益保持 unavailable；"
-                 "通信、空泡和重计算仍按各自证据单独估算。"),
+                 "主导算子 FLOP 公式不完整时，使用同一采集内已建模算子校准 MAC/Vector 周期代理，"
+                 "输出带区间的 MFU(est)；未建模算子的 Roofline 收益仍不臆测。"
+                 "峰值口径不一致时才停用 MFU。"),
     }
