@@ -7,6 +7,7 @@ api_key*.txt
 *ASCEND_PROFILER_OUTPUT*/
 *.pb
 *.db
+local_profilings/
 
 # --- Runtime artifacts (restart_insight.sh) ---
 insight.log
@@ -32,6 +33,7 @@ __pycache__/
 scripts/_*
 
 # --- Editor / OS ---
+.claude/
 .vscode/
 .idea/
 *.swp
