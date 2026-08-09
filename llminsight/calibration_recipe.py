@@ -30,6 +30,7 @@ _HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _CASE_ID_RE = re.compile(r"^case_[0-9a-f]{64}$")
 _DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:")
+_POSITIVE_DIM_RE = re.compile(r"^[1-9][0-9]*$")
 
 _PROFILE_LAYOUTS = {
     "TORCH_NPU_ASCEND_PROFILER_OUTPUT",
@@ -141,7 +142,9 @@ def _detect_profile_sources(profile_dir: Path) -> tuple[str, list[dict[str, str]
         selected = [("MINDSTUDIO_DB", mindstudio_db)]
     elif op_summaries:
         layout = "MSPROF_OP_SUMMARY"
-        selected = [("MSPROF_OP_SUMMARY_CSV", op_summaries[0])]
+        # Match parser.msprof._first(), which deliberately selects the final
+        # lexically sorted export when a directory contains multiple snapshots.
+        selected = [("MSPROF_OP_SUMMARY_CSV", op_summaries[-1])]
     else:
         raise RecipeBuildError("no supported profiler source")
 
@@ -212,11 +215,48 @@ def _row_value(row: Mapping[str, Any], key: str) -> Any:
     return value
 
 
+def _strict_matrix_shape_list(raw: Any, tensor_count: int) -> bool:
+    """Require an exact list of positive-integer rank-2 matrices.
+
+    The shared parser intentionally tolerates dirty profiler data, including
+    ``int(float(dim))`` and silently skipped malformed tensor segments. A
+    calibration recipe has a stricter trust boundary, so verify the original
+    lexical representation before reusing that parser.
+    """
+    if raw is None:
+        return False
+    value = str(raw).strip().strip('"').strip()
+    if not value or value.upper() in {"N/A", "NAN", "NONE", "NULL"}:
+        return False
+    tensors = value.split(";")
+    if len(tensors) != tensor_count:
+        return False
+    for tensor in tensors:
+        dimensions = tensor.strip().strip('"').strip().split(",")
+        if len(dimensions) != 2:
+            return False
+        if any(not _POSITIVE_DIM_RE.fullmatch(dim.strip().strip('"').strip()) for dim in dimensions):
+            return False
+    return True
+
+
 def _parse_ordinary_case(
     row: Mapping[str, Any], hint: str
 ) -> tuple[dict[str, Any] | None, str | None, Decimal | None, str | None]:
     raw_in_shapes = _row_value(row, "Input Shapes")
     raw_out_shapes = _row_value(row, "Output Shapes")
+    if not raw_in_shapes or not raw_out_shapes:
+        return None, "MISSING_SHAPE", None, None
+    if not _strict_matrix_shape_list(raw_in_shapes, 2) or not _strict_matrix_shape_list(
+        raw_out_shapes, 1
+    ):
+        raw_values = {str(raw_in_shapes).strip().upper(), str(raw_out_shapes).strip().upper()}
+        reason = (
+            "MISSING_SHAPE"
+            if raw_values.intersection({"", "N/A", "NAN", "NONE", "NULL"})
+            else "CONFLICTING_SHAPE"
+        )
+        return None, reason, None, None
     shapes_in = parse_shapes(raw_in_shapes)
     shapes_out = parse_shapes(raw_out_shapes)
     if not shapes_in or not shapes_out:
@@ -702,6 +742,34 @@ def validate_recipe(recipe: Mapping[str, Any]) -> None:
             raise RecipeValidationError("priority ranks are not contiguous")
         if len(priority_bases) != 1 or score_total != 1_000_000:
             raise RecipeValidationError("priority fields are inconsistent")
+        priority_basis = next(iter(priority_bases))
+        by_id = {case["case_id"]: case for case in cases}
+        if priority_basis == "FREQUENCY":
+            frequency_weights = {
+                case_id: Decimal(case["frequency"]["count"])
+                for case_id, case in by_id.items()
+            }
+            expected_scores = _allocate_scores(frequency_weights)
+            expected_order = sorted(
+                frequency_weights,
+                key=lambda case_id: (-frequency_weights[case_id], case_id),
+            )
+            expected_ranks = {
+                case_id: rank for rank, case_id in enumerate(expected_order, 1)
+            }
+            for case_id, case in by_id.items():
+                if (
+                    case["priority"]["score_ppm"] != expected_scores[case_id]
+                    or case["priority"]["rank"] != expected_ranks[case_id]
+                ):
+                    raise RecipeValidationError("frequency priority is inconsistent")
+        else:
+            ranked_scores = [
+                case["priority"]["score_ppm"]
+                for case in sorted(cases, key=lambda item: item["priority"]["rank"])
+            ]
+            if ranked_scores != sorted(ranked_scores, reverse=True):
+                raise RecipeValidationError("observed-duration priority rank is inconsistent")
     elif ranks or priority_bases or score_total:
         raise RecipeValidationError("empty cases have priority data")
 
@@ -774,8 +842,14 @@ def load_and_validate_recipe(path: str | Path) -> dict[str, Any]:
     return value
 
 
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        del message
+        raise RecipeBuildError("invalid CLI arguments")
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _SafeArgumentParser(
         prog="python -m llminsight.calibration_recipe",
         description="Export a product-neutral profiling-derived GEMM recipe.",
     )
@@ -786,8 +860,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_arg_parser().parse_args(argv)
     try:
+        args = _build_arg_parser().parse_args(argv)
         recipe = export_recipe(args.profile, args.output, args.producer_revision)
     # Parser backends may raise pandas/sqlite exceptions that are intentionally not
     # part of this narrow module's dependency surface. Catch them at the CLI boundary

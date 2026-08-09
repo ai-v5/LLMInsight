@@ -26,6 +26,8 @@ lineage 只保存逻辑 source role 与内容 SHA-256，不保存绝对路径、
 | `MINDSTUDIO_DB` | `MINDSTUDIO_DB` |
 | `MSPROF_OP_SUMMARY` | `MSPROF_OP_SUMMARY_CSV` |
 
+同一目录存在多个 `op_summary_*.csv` 时，lineage 与现有 loader 一致绑定按文件名排序后的最后一个 snapshot；producer 在 parser 前后对该实际 source 重算摘要，内容变化时 fail closed。
+
 `producer_revision` 是调用方显式提供的 40 位小写 Git SHA。producer 不从 profile 推断该值。`source_manifest_sha256` 绑定 canonical `selected_sources` 数组；`capture_scope` 只接受 parser metadata，缺失时必须为 `UNKNOWN + UNAVAILABLE + PARSER_SCOPE_NOT_RECORDED`。
 
 ## v1 映射规则
@@ -33,6 +35,7 @@ lineage 只保存逻辑 source role 与内容 SHA-256，不保存绝对路径、
 v1 只接受大小写不敏感的 exact op type：`MatMul`、`MatMulV3`、`Gemm`、`GemmV3`。一个 accepted row 必须同时满足：
 
 1. 恰有两个 rank-2 输入矩阵和一个 rank-2 输出矩阵；
+   原始 shape 词法必须由正十进制整数组成；小数、指数、空维度或被 parser 容错丢弃的额外 segment 都拒绝；
 2. 输出 shape 能使 `M/N/K` 唯一成立；
 3. 按真实 A/B 维度推导出的 `transpose.a/b` 组合唯一；方阵等多解情况不能猜；
 4. 两个输入和输出 dtype 都存在、可规范化且相同；v1 只接受 `BF16`、`FP16`、`FP32`、`FP8_E4M3`；
@@ -71,7 +74,7 @@ JSON Schema 见 `doc/contracts/llm.profiling-calibration-recipe.v1.schema.json`�
 - 拒绝 float、负数、NaN/Infinity、duplicate JSON key 和 path-like string；
 - source role 必须与 layout 一致且排序、去重；
 - coverage、frequency、unmapped count、ppm 与 case count 必须闭合；
-- cases/unmapped 必须排序、去重；priority rank 必须连续，score 总和必须闭合；
+- cases/unmapped 必须排序、去重；priority rank 必须连续，score 总和必须闭合；`FREQUENCY` 必须从 frequency 精确重算 rank/score，observed-duration rank 必须与 score 单调一致；
 - 重新计算 source manifest、case ID 和 recipe digest，任何不一致都拒绝。
 
 SHA-256 是内容完整性摘要，不是防止有意重签的数字签名；需要外部 authority 的消费者必须另行验证 producer commit/PR 与 trusted registry。
@@ -85,6 +88,6 @@ python -m llminsight.calibration_recipe `
   --producer-revision <40-lowercase-git-sha>
 ```
 
-成功输出只包含 path-free 的 case/mapped/unmapped 聚合计数；失败只输出异常类型，不回显输入路径或 raw row。消费者应先调用 `load_and_validate_recipe`，再依据 trusted registry 在执行阶段绑定目标产品。fixture `tests/fixtures/profiling_recipe/expected_recipe.json` 是 v1 的精确、synthetic consumer fixture。
+成功输出只包含 path-free 的 case/mapped/unmapped 聚合计数；parser 失败和 argparse 参数错误都只输出异常类型，不回显原始 argv、输入路径或 raw row。消费者应先调用 `load_and_validate_recipe`，再依据 trusted registry 在执行阶段绑定目标产品。fixture `tests/fixtures/profiling_recipe/expected_recipe.json` 是 v1 的精确、synthetic consumer fixture。
 
 `PROFILE_OBSERVATION`（独立的时延统计层）是后续工作包；v1 recipe 不内嵌 observation，也不允许由本 producer 直接产出 calibrated latency。

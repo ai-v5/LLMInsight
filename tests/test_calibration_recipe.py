@@ -134,6 +134,54 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
         )
         self.assertNotIn(str(profile), recipe_json_bytes(recipe).decode("utf-8"))
 
+    def test_msprof_lineage_binds_the_same_last_op_summary_as_loader(self) -> None:
+        columns = (
+            "Model Name,Op Name,OP Type,Task Type,Task Start Time(us),Task Duration(us),"
+            "Input Shapes,Input Data Types,Output Shapes,Output Data Types,Task ID\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            first = profile / "op_summary_001.csv"
+            last = profile / "op_summary_999.csv"
+            first.write_text(
+                columns
+                + 'synthetic,first,MatMul,AI_CORE,0,2,"2,3;3,5",BF16;BF16,"2,5",BF16,1\n',
+                encoding="utf-8",
+            )
+            last.write_text(
+                columns
+                + 'synthetic,last,Gemm,AI_CORE,0,3,"4,3;3,7",BF16;BF16,"4,7",BF16,2\n',
+                encoding="utf-8",
+            )
+            last_digest = _sha256(last.read_bytes())
+            recipe = build_recipe(profile, PRODUCER_REVISION)
+
+        self.assertEqual(recipe["cases"][0]["implementation_hint"], "GEMM")
+        self.assertEqual(recipe["cases"][0]["shape"], {"m": 4, "n": 7, "k": 3})
+        self.assertEqual(
+            recipe["lineage"]["selected_sources"],
+            [{"role": "MSPROF_OP_SUMMARY_CSV", "content_sha256": last_digest}],
+        )
+
+    def test_fractional_or_malformed_shape_segments_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            source = profile / "kernel_details.csv"
+            source.write_text(
+                "Name,Type,Accelerator Core,Duration(us),Input Shapes,Input Data Types,"
+                "Output Shapes,Output Data Types\n"
+                'fractional,MatMul,AI_CORE,1,"2.9,3;3,5",BF16;BF16,"2,5",BF16\n'
+                'extra_bad,MatMul,AI_CORE,1,"2,3;3,5;garbage",BF16;BF16,"2,5",BF16\n',
+                encoding="utf-8",
+            )
+            recipe = build_recipe(profile, PRODUCER_REVISION)
+
+        self.assertEqual(recipe["coverage"]["mapped_kernel_rows"], 0)
+        self.assertEqual(
+            recipe["unmapped"],
+            [{"reason": "CONFLICTING_SHAPE", "count": 2}],
+        )
+
     def test_export_is_byte_deterministic_and_matches_consumer_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             first = Path(td) / "first.json"
@@ -295,6 +343,22 @@ class CalibrationRecipeValidationTests(unittest.TestCase):
         _resign(non_boolean_transpose)
         self.assertRejected(non_boolean_transpose)
 
+    def test_rejects_resigned_priority_semantic_inconsistency(self) -> None:
+        frequency_lie = copy.deepcopy(self.recipe)
+        for case in frequency_lie["cases"]:
+            case["priority"]["basis"] = "FREQUENCY"
+        _resign(frequency_lie)
+        self.assertRejected(frequency_lie)
+
+        observed_rank_lie = copy.deepcopy(self.recipe)
+        by_rank = sorted(observed_rank_lie["cases"], key=lambda item: item["priority"]["rank"])
+        by_rank[0]["priority"]["rank"], by_rank[-1]["priority"]["rank"] = (
+            by_rank[-1]["priority"]["rank"],
+            by_rank[0]["priority"]["rank"],
+        )
+        _resign(observed_rank_lie)
+        self.assertRejected(observed_rank_lie)
+
     def test_load_rejects_duplicate_keys_and_nonstandard_nan(self) -> None:
         payload = recipe_json_bytes(self.recipe).decode("utf-8")
         duplicate = payload.replace(
@@ -388,6 +452,33 @@ class CalibrationRecipeCliTests(unittest.TestCase):
         self.assertNotIn(str(missing_profile), result.stderr)
         self.assertNotIn(str(output), result.stderr)
         self.assertIn("RecipeBuildError", result.stderr)
+
+    def test_cli_argument_error_does_not_echo_unknown_argv_or_path(self) -> None:
+        marker = "private-path-marker"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-m",
+                "llminsight.calibration_recipe",
+                "--profiel",
+                marker,
+                "--output",
+                marker,
+                "--producer-revision",
+                PRODUCER_REVISION,
+            ],
+            cwd=Path(__file__).parents[1],
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn(marker, result.stderr)
+        self.assertNotIn("--profiel", result.stderr)
+        self.assertEqual(result.stderr.strip(), "recipe_export_error type=RecipeBuildError")
 
 
 if __name__ == "__main__":
