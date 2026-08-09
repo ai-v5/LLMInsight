@@ -39,6 +39,25 @@ def _resign(recipe: dict) -> None:
     recipe["recipe_sha256"] = _sha256(canonical_json_bytes(unsigned))
 
 
+def _write_kernel_rows(profile: Path, rows: list[dict[str, str]]) -> Path:
+    source = profile / "kernel_details.csv"
+    fieldnames = [
+        "Name",
+        "Type",
+        "Accelerator Core",
+        "Duration(us)",
+        "Input Shapes",
+        "Input Data Types",
+        "Output Shapes",
+        "Output Data Types",
+    ]
+    with source.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return source
+
+
 class CalibrationRecipeBuildTests(unittest.TestCase):
     def test_builds_only_unambiguous_ordinary_gemm_cases(self) -> None:
         recipe = build_recipe(FIXTURE_PROFILE, PRODUCER_REVISION)
@@ -71,6 +90,10 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
         self.assertEqual(by_hint["MATMUL"]["dtype"], "FP32")
         self.assertEqual(by_hint["GEMM_V3"]["dtype"], "FP8_E4M3")
         self.assertTrue(all(case["priority"]["basis"] == "OBSERVED_TOTAL_DURATION" for case in cases))
+        self.assertEqual(
+            {hint: case["priority"]["weight"] for hint, case in by_hint.items()},
+            {"MATMUL": 2, "MATMUL_V3": 15, "GEMM": 20, "GEMM_V3": 3},
+        )
 
     def test_rejects_incomplete_candidate_families_without_guessing(self) -> None:
         recipe = build_recipe(FIXTURE_PROFILE, PRODUCER_REVISION)
@@ -182,6 +205,65 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
             [{"reason": "CONFLICTING_SHAPE", "count": 2}],
         )
 
+    def test_shape_lexer_preserves_large_decimal_and_rejects_invalid_forms(self) -> None:
+        rows = []
+        for name, input_shapes, output_shapes in (
+            ("large_exact", "9007199254740993,3;3,5", "9007199254740993,5"),
+            ("fractional", "2.9,3;3,5", "2,5"),
+            ("scientific", "2e3,3;3,5", "2000,5"),
+            ("overflow", "9223372036854775808,3;3,5", "9223372036854775808,5"),
+            ("garbage_tensor", "2,3;3,5;garbage", "2,5"),
+        ):
+            rows.append(
+                {
+                    "Name": name,
+                    "Type": "MatMul",
+                    "Accelerator Core": "AI_CORE",
+                    "Duration(us)": "1",
+                    "Input Shapes": input_shapes,
+                    "Input Data Types": "BF16;BF16",
+                    "Output Shapes": output_shapes,
+                    "Output Data Types": "BF16",
+                }
+            )
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            _write_kernel_rows(profile, rows)
+            recipe = build_recipe(profile, PRODUCER_REVISION)
+
+        self.assertEqual(recipe["coverage"]["mapped_kernel_rows"], 1)
+        self.assertEqual(recipe["cases"][0]["shape"]["m"], 9007199254740993)
+        self.assertEqual(
+            recipe["unmapped"],
+            [{"reason": "CONFLICTING_SHAPE", "count": 4}],
+        )
+
+    def test_shape_lexer_rejects_embedded_quote_garbage(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            _write_kernel_rows(
+                profile,
+                [
+                    {
+                        "Name": "quoted_garbage",
+                        "Type": "MatMul",
+                        "Accelerator Core": "AI_CORE",
+                        "Duration(us)": "1",
+                        "Input Shapes": '2", "3;3,5',
+                        "Input Data Types": "BF16;BF16",
+                        "Output Shapes": "2,5",
+                        "Output Data Types": "BF16",
+                    }
+                ],
+            )
+            recipe = build_recipe(profile, PRODUCER_REVISION)
+
+        self.assertEqual(recipe["coverage"]["mapped_kernel_rows"], 0)
+        self.assertEqual(
+            recipe["unmapped"],
+            [{"reason": "CONFLICTING_SHAPE", "count": 1}],
+        )
+
     def test_export_is_byte_deterministic_and_matches_consumer_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             first = Path(td) / "first.json"
@@ -239,21 +321,63 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
         self.assertEqual(recipe["cases"], [])
         self.assertEqual(recipe["unmapped"], [])
 
-    def test_source_change_during_parse_fails_closed(self) -> None:
+    def test_parser_and_lineage_consume_the_same_snapshot_across_aba_change(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             profile = Path(td)
-            source = profile / "kernel_details.csv"
-            shutil.copyfile(FIXTURE_PROFILE / "kernel_details.csv", source)
+            source = _write_kernel_rows(
+                profile,
+                [
+                    {
+                        "Name": "content_a",
+                        "Type": "MatMul",
+                        "Accelerator Core": "AI_CORE",
+                        "Duration(us)": "1",
+                        "Input Shapes": "2,3;3,5",
+                        "Input Data Types": "BF16;BF16",
+                        "Output Shapes": "2,5",
+                        "Output Data Types": "BF16",
+                    }
+                ],
+            )
+            content_a = source.read_bytes()
+            content_b = content_a.replace(b"content_a", b"content_b").replace(
+                b'2,3;3,5', b'4,3;3,7'
+            ).replace(b'2,5', b'4,7')
 
-            def load_then_change(path: str):
+            def load_during_aba(path: str):
+                source.write_bytes(content_b)
+                try:
+                    return parser_load_profile(path)
+                finally:
+                    source.write_bytes(content_a)
+
+            with mock.patch(
+                "llminsight.calibration_recipe.load_profile",
+                side_effect=load_during_aba,
+            ):
+                recipe = build_recipe(profile, PRODUCER_REVISION)
+
+        self.assertEqual(recipe["cases"][0]["shape"], {"m": 2, "n": 5, "k": 3})
+        self.assertEqual(
+            recipe["lineage"]["selected_sources"],
+            [{"role": "KERNEL_DETAILS_CSV", "content_sha256": _sha256(content_a)}],
+        )
+
+    def test_snapshot_change_during_parse_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            shutil.copyfile(FIXTURE_PROFILE / "kernel_details.csv", profile / "kernel_details.csv")
+
+            def load_then_change_snapshot(path: str):
                 parsed = parser_load_profile(path)
-                source.write_bytes(source.read_bytes() + b"\n")
+                snapshot_source = Path(path) / "kernel_details.csv"
+                snapshot_source.write_bytes(snapshot_source.read_bytes() + b"\n")
                 return parsed
 
             with (
                 mock.patch(
                     "llminsight.calibration_recipe.load_profile",
-                    side_effect=load_then_change,
+                    side_effect=load_then_change_snapshot,
                 ),
                 self.assertRaises(RecipeBuildError),
             ):
@@ -358,6 +482,52 @@ class CalibrationRecipeValidationTests(unittest.TestCase):
         )
         _resign(observed_rank_lie)
         self.assertRejected(observed_rank_lie)
+
+        observed_score_and_rank_lie = copy.deepcopy(self.recipe)
+        self.assertTrue(
+            all("weight" in case["priority"] for case in observed_score_and_rank_lie["cases"])
+        )
+        ordered = sorted(observed_score_and_rank_lie["cases"], key=lambda item: item["case_id"])
+        for rank, case in enumerate(reversed(ordered), 1):
+            case["priority"]["rank"] = rank
+            case["priority"]["score_ppm"] = 250000
+        _resign(observed_score_and_rank_lie)
+        self.assertRejected(observed_score_and_rank_lie)
+
+        observed_noncanonical_weights = copy.deepcopy(self.recipe)
+        for case in observed_noncanonical_weights["cases"]:
+            case["priority"]["weight"] *= 2
+        _resign(observed_noncanonical_weights)
+        self.assertRejected(observed_noncanonical_weights)
+
+    def test_observed_priority_tie_break_is_recomputed_from_case_id(self) -> None:
+        rows = []
+        for name, op_type in (("matmul", "MatMul"), ("gemm", "Gemm")):
+            rows.append(
+                {
+                    "Name": name,
+                    "Type": op_type,
+                    "Accelerator Core": "AI_CORE",
+                    "Duration(us)": "1",
+                    "Input Shapes": "2,3;3,5",
+                    "Input Data Types": "BF16;BF16",
+                    "Output Shapes": "2,5",
+                    "Output Data Types": "BF16",
+                }
+            )
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            _write_kernel_rows(profile, rows)
+            tied = build_recipe(profile, PRODUCER_REVISION)
+
+        by_rank = sorted(tied["cases"], key=lambda item: item["priority"]["rank"])
+        self.assertEqual(
+            [case["case_id"] for case in by_rank],
+            sorted(case["case_id"] for case in tied["cases"]),
+        )
+        by_rank[0]["priority"]["rank"], by_rank[1]["priority"]["rank"] = 2, 1
+        _resign(tied)
+        self.assertRejected(tied)
 
     def test_load_rejects_duplicate_keys_and_nonstandard_nan(self) -> None:
         payload = recipe_json_bytes(self.recipe).decode("utf-8")

@@ -47,6 +47,11 @@
       "type": "integer",
       "minimum": 1
     },
+    "dimension": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
     "ppm": {
       "type": "integer",
       "minimum": 0,
@@ -190,9 +195,9 @@
       "additionalProperties": false,
       "required": ["m", "n", "k"],
       "properties": {
-        "m": {"$ref": "#/$defs/positiveInteger"},
-        "n": {"$ref": "#/$defs/positiveInteger"},
-        "k": {"$ref": "#/$defs/positiveInteger"}
+        "m": {"$ref": "#/$defs/dimension"},
+        "n": {"$ref": "#/$defs/dimension"},
+        "k": {"$ref": "#/$defs/dimension"}
       }
     },
     "transpose": {
@@ -212,15 +217,32 @@
         "count": {"$ref": "#/$defs/positiveInteger"}
       }
     },
-    "priority": {
+    "priorityFrequency": {
       "type": "object",
       "additionalProperties": false,
       "required": ["basis", "rank", "score_ppm"],
       "properties": {
-        "basis": {"enum": ["OBSERVED_TOTAL_DURATION", "FREQUENCY"]},
+        "basis": {"const": "FREQUENCY"},
         "rank": {"$ref": "#/$defs/positiveInteger"},
         "score_ppm": {"$ref": "#/$defs/ppm"}
       }
+    },
+    "priorityObserved": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["basis", "rank", "score_ppm", "weight"],
+      "properties": {
+        "basis": {"const": "OBSERVED_TOTAL_DURATION"},
+        "rank": {"$ref": "#/$defs/positiveInteger"},
+        "score_ppm": {"$ref": "#/$defs/ppm"},
+        "weight": {"$ref": "#/$defs/positiveInteger"}
+      }
+    },
+    "priority": {
+      "oneOf": [
+        {"$ref": "#/$defs/priorityFrequency"},
+        {"$ref": "#/$defs/priorityObserved"}
+      ]
     },
     "sourceEvidence": {
       "type": "object",

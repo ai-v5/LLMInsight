@@ -15,7 +15,7 @@ recipe 不接受 `target`、`product_ref` 或其它 configured product 字段。
 
 ## 输入与复用边界
 
-CLI 必须指向现有 LLMInsight loader 能读取的 profile 目录。producer 调用 `llminsight.parser.load_profile`，复用统一 `ProfileData`、`parse_shapes`、`parse_dtypes` 和 `_matmul_mnk`，不建立第二套 profile parser。
+CLI 必须指向现有 LLMInsight loader 能读取的 profile 目录。producer 先把 loader 实际选择的源复制到 task-private 临时 snapshot，再对 snapshot 摘要、调用 `llminsight.parser.load_profile` 并复核摘要；parser 与 lineage 因而消费同一份内容，原目录在 loader 期间发生 A→B→A 变化也不能混合 case 与 lineage。临时 snapshot 随调用结束删除。producer 复用统一 `ProfileData`、`parse_dtypes` 和 `_matmul_mnk`，只在 recipe 信任边界使用严格 shape lexer，不建立第二套 profile loader。
 
 lineage 只保存逻辑 source role 与内容 SHA-256，不保存绝对路径、用户名、真实 basename、raw row、文件大小、DB 路径或 trace 路径：
 
@@ -26,7 +26,7 @@ lineage 只保存逻辑 source role 与内容 SHA-256，不保存绝对路径、
 | `MINDSTUDIO_DB` | `MINDSTUDIO_DB` |
 | `MSPROF_OP_SUMMARY` | `MSPROF_OP_SUMMARY_CSV` |
 
-同一目录存在多个 `op_summary_*.csv` 时，lineage 与现有 loader 一致绑定按文件名排序后的最后一个 snapshot；producer 在 parser 前后对该实际 source 重算摘要，内容变化时 fail closed。
+同一目录存在多个 `op_summary_*.csv` 时，lineage 与现有 loader 一致绑定按文件名排序后的最后一个 source。lineage 摘要、loader 输入和 parser 后摘要都来自同一 task-private snapshot；snapshot 内容变化时 fail closed。
 
 `producer_revision` 是调用方显式提供的 40 位小写 Git SHA。producer 不从 profile 推断该值。`source_manifest_sha256` 绑定 canonical `selected_sources` 数组；`capture_scope` 只接受 parser metadata，缺失时必须为 `UNKNOWN + UNAVAILABLE + PARSER_SCOPE_NOT_RECORDED`。
 
@@ -35,7 +35,7 @@ lineage 只保存逻辑 source role 与内容 SHA-256，不保存绝对路径、
 v1 只接受大小写不敏感的 exact op type：`MatMul`、`MatMulV3`、`Gemm`、`GemmV3`。一个 accepted row 必须同时满足：
 
 1. 恰有两个 rank-2 输入矩阵和一个 rank-2 输出矩阵；
-   原始 shape 词法必须由正十进制整数组成；小数、指数、空维度或被 parser 容错丢弃的额外 segment 都拒绝；
+   原始 shape 词法必须由范围 `1..9223372036854775807` 的正十进制整数组成；解析直接使用十进制整数，不经过 float；小数、指数、引号垃圾、空维度、溢出或额外 segment 都拒绝；
 2. 输出 shape 能使 `M/N/K` 唯一成立；
 3. 按真实 A/B 维度推导出的 `transpose.a/b` 组合唯一；方阵等多解情况不能猜；
 4. 两个输入和输出 dtype 都存在、可规范化且相同；v1 只接受 `BF16`、`FP16`、`FP32`、`FP8_E4M3`；
@@ -55,7 +55,7 @@ BatchMatMul、GroupedMatMul、Attention 和 fused MatMul/GEMM 在 v1 一律进�
 
 不得以 `0` 冒充可用覆盖率。
 
-只有全部 mapped rows 的 duration 都是有限正数时，所有 case 才统一使用 `OBSERVED_TOTAL_DURATION` 排优先级；任何 mapped duration 不可用时，整份 recipe 统一回退到 `FREQUENCY`。`score_ppm` 总和为 1,000,000，稳定 tie-break 使用 `case_id`。recipe 不包含 duration、latency、mean、percentile 或最大/最小时延统计。
+只有全部 mapped rows 的 duration 都是有限正数时，所有 case 才统一使用 `OBSERVED_TOTAL_DURATION` 排优先级；任何 mapped duration 不可用时，整份 recipe 统一回退到 `FREQUENCY`。observed basis 额外输出 `priority.weight`：它是各 case duration total 的无量纲、最大公约数归一化正整数比，只用于让消费者独立重算 rank、score 和 tie-break，不是 duration 或 latency statistic。`score_ppm` 总和为 1,000,000，稳定 tie-break 使用 `case_id`。recipe 不包含 duration、latency、mean、percentile 或最大/最小时延统计。
 
 ## Canonical JSON 与 fail-closed 验证
 
@@ -74,7 +74,7 @@ JSON Schema 见 `doc/contracts/llm.profiling-calibration-recipe.v1.schema.json`�
 - 拒绝 float、负数、NaN/Infinity、duplicate JSON key 和 path-like string；
 - source role 必须与 layout 一致且排序、去重；
 - coverage、frequency、unmapped count、ppm 与 case count 必须闭合；
-- cases/unmapped 必须排序、去重；priority rank 必须连续，score 总和必须闭合；`FREQUENCY` 必须从 frequency 精确重算 rank/score，observed-duration rank 必须与 score 单调一致；
+- cases/unmapped 必须排序、去重；priority rank 必须连续，score 总和必须闭合；`FREQUENCY` 从 frequency 精确重算 rank/score，`OBSERVED_TOTAL_DURATION` 从规范化 `weight` 精确重算 rank/score，两者 tie-break 都使用 `case_id`；
 - 重新计算 source manifest、case ID 和 recipe digest，任何不一致都拒绝。
 
 SHA-256 是内容完整性摘要，不是防止有意重签的数字签名；需要外部 authority 的消费者必须另行验证 producer commit/PR 与 trusted registry。

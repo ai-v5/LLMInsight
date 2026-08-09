@@ -10,7 +10,10 @@ import hashlib
 import json
 import math
 import re
+import shutil
+import stat
 import sys
+import tempfile
 from collections import Counter
 from collections.abc import Iterable, Mapping, MutableMapping, Sequence
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation
@@ -19,7 +22,7 @@ from typing import Any
 
 from .metrics.efficiency import _matmul_mnk
 from .parser import load_profile
-from .parser.shapes import parse_dtypes, parse_shapes
+from .parser.shapes import parse_dtypes
 
 SCHEMA_NAME = "llm.profiling-calibration-recipe"
 SCHEMA_VERSION = "v1"
@@ -31,6 +34,19 @@ _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _CASE_ID_RE = re.compile(r"^case_[0-9a-f]{64}$")
 _DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:")
 _POSITIVE_DIM_RE = re.compile(r"^[1-9][0-9]*$")
+_MAX_DIMENSION = 2**63 - 1
+
+_TORCH_NPU_AUXILIARY_FILES = (
+    "step_trace_time.csv",
+    "op_statistic.csv",
+    "api_statistic.csv",
+    "operator_details.csv",
+    "communication.json",
+    "communication_matrix.json",
+    "memory_record.csv",
+    "npu_module_mem.csv",
+    "operator_memory.csv",
+)
 
 _PROFILE_LAYOUTS = {
     "TORCH_NPU_ASCEND_PROFILER_OUTPUT",
@@ -121,7 +137,7 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _detect_profile_sources(profile_dir: Path) -> tuple[str, list[dict[str, str]]]:
+def _select_profile_sources(profile_dir: Path) -> tuple[str, list[tuple[str, Path]]]:
     kernel_csv = profile_dir / "kernel_details.csv"
     mindstudio_db = profile_dir / "mindstudio_insight_data.db"
     op_summaries = sorted(profile_dir.glob("op_summary_*.csv"), key=lambda item: item.name)
@@ -148,11 +164,47 @@ def _detect_profile_sources(profile_dir: Path) -> tuple[str, list[dict[str, str]
     else:
         raise RecipeBuildError("no supported profiler source")
 
-    sources = [
+    return layout, sorted(selected, key=lambda item: item[0])
+
+
+def _source_manifest(selected: Sequence[tuple[str, Path]]) -> list[dict[str, str]]:
+    return [
         {"role": role, "content_sha256": _sha256_file(path)}
-        for role, path in sorted(selected, key=lambda item: item[0])
+        for role, path in selected
     ]
-    return layout, sources
+
+
+def _snapshot_profile(
+    source_dir: Path,
+    snapshot_dir: Path,
+    selected: Sequence[tuple[str, Path]],
+) -> list[tuple[str, Path]]:
+    destinations = {
+        "KERNEL_DETAILS_CSV": "kernel_details.csv",
+        "MINDSTUDIO_DB": "mindstudio_insight_data.db",
+    }
+    snapshot_selected: list[tuple[str, Path]] = []
+    try:
+        for role, source in selected:
+            destination = snapshot_dir / destinations.get(role, source.name)
+            shutil.copyfile(source, destination)
+            snapshot_selected.append((role, destination))
+
+        if any(role == "KERNEL_DETAILS_CSV" for role, _ in selected):
+            for name in _TORCH_NPU_AUXILIARY_FILES:
+                source = source_dir / name
+                if source.is_file():
+                    shutil.copyfile(source, snapshot_dir / name)
+        elif any(role == "MSPROF_OP_SUMMARY_CSV" for role, _ in selected):
+            for source in sorted(source_dir.glob("task_time_slice_*.csv")):
+                if source.is_file():
+                    shutil.copyfile(source, snapshot_dir / source.name)
+    except OSError as exc:
+        raise RecipeBuildError("profile snapshot is unavailable") from exc
+    for snapshot_file in snapshot_dir.iterdir():
+        if snapshot_file.is_file():
+            snapshot_file.chmod(stat.S_IREAD)
+    return snapshot_selected
 
 
 def _capture_scope(meta: Mapping[str, Any]) -> dict[str, str]:
@@ -215,29 +267,29 @@ def _row_value(row: Mapping[str, Any], key: str) -> Any:
     return value
 
 
-def _strict_matrix_shape_list(raw: Any, tensor_count: int) -> bool:
-    """Require an exact list of positive-integer rank-2 matrices.
-
-    The shared parser intentionally tolerates dirty profiler data, including
-    ``int(float(dim))`` and silently skipped malformed tensor segments. A
-    calibration recipe has a stricter trust boundary, so verify the original
-    lexical representation before reusing that parser.
-    """
+def _parse_strict_matrix_shapes(raw: Any, tensor_count: int) -> list[list[int]] | None:
+    """Parse an exact list of positive-decimal rank-2 matrices."""
     if raw is None:
-        return False
-    value = str(raw).strip().strip('"').strip()
+        return None
+    value = str(raw).strip()
     if not value or value.upper() in {"N/A", "NAN", "NONE", "NULL"}:
-        return False
+        return None
     tensors = value.split(";")
     if len(tensors) != tensor_count:
-        return False
+        return None
+    parsed: list[list[int]] = []
     for tensor in tensors:
-        dimensions = tensor.strip().strip('"').strip().split(",")
+        dimensions = tensor.strip().split(",")
         if len(dimensions) != 2:
-            return False
-        if any(not _POSITIVE_DIM_RE.fullmatch(dim.strip().strip('"').strip()) for dim in dimensions):
-            return False
-    return True
+            return None
+        tokens = [dimension.strip() for dimension in dimensions]
+        if any(not _POSITIVE_DIM_RE.fullmatch(token) for token in tokens):
+            return None
+        values = [int(token, 10) for token in tokens]
+        if any(value > _MAX_DIMENSION for value in values):
+            return None
+        parsed.append(values)
+    return parsed
 
 
 def _parse_ordinary_case(
@@ -247,9 +299,9 @@ def _parse_ordinary_case(
     raw_out_shapes = _row_value(row, "Output Shapes")
     if not raw_in_shapes or not raw_out_shapes:
         return None, "MISSING_SHAPE", None, None
-    if not _strict_matrix_shape_list(raw_in_shapes, 2) or not _strict_matrix_shape_list(
-        raw_out_shapes, 1
-    ):
+    shapes_in = _parse_strict_matrix_shapes(raw_in_shapes, 2)
+    shapes_out = _parse_strict_matrix_shapes(raw_out_shapes, 1)
+    if shapes_in is None or shapes_out is None:
         raw_values = {str(raw_in_shapes).strip().upper(), str(raw_out_shapes).strip().upper()}
         reason = (
             "MISSING_SHAPE"
@@ -257,17 +309,6 @@ def _parse_ordinary_case(
             else "CONFLICTING_SHAPE"
         )
         return None, reason, None, None
-    shapes_in = parse_shapes(raw_in_shapes)
-    shapes_out = parse_shapes(raw_out_shapes)
-    if not shapes_in or not shapes_out:
-        return None, "MISSING_SHAPE", None, None
-    if (
-        len(shapes_in) != 2
-        or any(len(shape) != 2 for shape in shapes_in)
-        or len(shapes_out) != 1
-        or len(shapes_out[0]) != 2
-    ):
-        return None, "CONFLICTING_SHAPE", None, None
 
     a, b = shapes_in
     out_m, out_n = shapes_out[0]
@@ -328,7 +369,7 @@ def _parse_ordinary_case(
     return semantic, None, duration, evidence_digest
 
 
-def _allocate_scores(weights: Mapping[str, Decimal]) -> dict[str, int]:
+def _allocate_scores(weights: Mapping[str, Decimal | int]) -> dict[str, int]:
     if not weights:
         return {}
     total = sum(weights.values(), Decimal(0))
@@ -352,6 +393,26 @@ def _allocate_scores(weights: Mapping[str, Decimal]) -> dict[str, int]:
     return scores
 
 
+def _normalize_decimal_weights(weights: Mapping[str, Decimal]) -> dict[str, int]:
+    """Return a lossless, dimensionless integer ratio for positive Decimals."""
+    if not weights:
+        return {}
+    decimal_places = max(max(-weight.as_tuple().exponent, 0) for weight in weights.values())
+    integers: dict[str, int] = {}
+    for case_id, weight in weights.items():
+        parts = weight.as_tuple()
+        coefficient = 0
+        for digit in parts.digits:
+            coefficient = coefficient * 10 + digit
+        integers[case_id] = coefficient * 10 ** (decimal_places + parts.exponent)
+    divisor = 0
+    for weight in integers.values():
+        divisor = math.gcd(divisor, weight)
+    if divisor <= 0:
+        raise RecipeBuildError("priority weight is not positive")
+    return {case_id: weight // divisor for case_id, weight in integers.items()}
+
+
 def _mapped_ppm(mapped: int, candidates: int) -> int:
     return int(
         (Decimal(mapped) * Decimal(1_000_000) / Decimal(candidates)).to_integral_value(
@@ -368,11 +429,28 @@ def build_recipe(profile_dir: str | Path, producer_revision: str) -> dict[str, A
     if not source_dir.is_dir():
         raise RecipeBuildError("profile directory is unavailable")
 
-    layout, selected_sources = _detect_profile_sources(source_dir)
-    profile = load_profile(str(source_dir))
-    layout_after_load, sources_after_load = _detect_profile_sources(source_dir)
-    if layout_after_load != layout or sources_after_load != selected_sources:
-        raise RecipeBuildError("profile sources changed while being parsed")
+    layout, selected_paths = _select_profile_sources(source_dir)
+    with tempfile.TemporaryDirectory(prefix="llminsight-recipe-") as temporary_dir:
+        snapshot_dir = Path(temporary_dir)
+        snapshot_selected = _snapshot_profile(source_dir, snapshot_dir, selected_paths)
+        snapshot_layout, detected_snapshot_sources = _select_profile_sources(snapshot_dir)
+        if (
+            snapshot_layout != layout
+            or [role for role, _ in detected_snapshot_sources]
+            != [role for role, _ in snapshot_selected]
+        ):
+            raise RecipeBuildError("profile snapshot layout is inconsistent")
+        selected_sources = _source_manifest(snapshot_selected)
+        try:
+            profile = load_profile(str(snapshot_dir))
+        except OSError as exc:
+            raise RecipeBuildError("profile snapshot could not be parsed") from exc
+        layout_after_load, sources_after_load = _select_profile_sources(snapshot_dir)
+        if (
+            layout_after_load != layout
+            or _source_manifest(sources_after_load) != selected_sources
+        ):
+            raise RecipeBuildError("profile snapshot changed while being parsed")
     kernel_details = profile.kernel_details
     if kernel_details is None:
         raise RecipeBuildError("profile parser did not return kernel details")
@@ -423,17 +501,13 @@ def build_recipe(profile_dir: str | Path, producer_revision: str) -> dict[str, A
         else "FREQUENCY"
     )
     cases: list[dict[str, Any]] = []
-    ranking_weights: dict[str, Decimal] = {}
+    observed_weights: dict[str, Decimal] = {}
     for key in sorted(groups):
         group = groups[key]
         semantic = group["semantic"]
         case_id = "case_" + _sha256_bytes(canonical_json_bytes(semantic))
-        weight = (
-            group["duration_total"]
-            if priority_basis == "OBSERVED_TOTAL_DURATION"
-            else Decimal(group["count"])
-        )
-        ranking_weights[case_id] = weight
+        if priority_basis == "OBSERVED_TOTAL_DURATION":
+            observed_weights[case_id] = group["duration_total"]
         cases.append(
             {
                 "case_id": case_id,
@@ -453,6 +527,15 @@ def build_recipe(profile_dir: str | Path, producer_revision: str) -> dict[str, A
             }
         )
 
+    if priority_basis == "OBSERVED_TOTAL_DURATION":
+        ranking_weights: dict[str, int] = _normalize_decimal_weights(observed_weights)
+        for case in cases:
+            case["priority"]["weight"] = ranking_weights[case["case_id"]]
+    else:
+        ranking_weights = {
+            case["case_id"]: case["frequency"]["count"]
+            for case in cases
+        }
     scores = _allocate_scores(ranking_weights)
     priority_order = sorted(
         ranking_weights,
@@ -672,6 +755,7 @@ def validate_recipe(recipe: Mapping[str, Any]) -> None:
     mapped_frequency = 0
     ranks: list[int] = []
     priority_bases: set[str] = set()
+    observed_priority_weights: dict[str, int] = {}
     score_total = 0
     for index, case in enumerate(cases):
         case_obj = _exact_keys(
@@ -695,7 +779,7 @@ def validate_recipe(recipe: Mapping[str, Any]) -> None:
         _require_string(case_obj["canonical_op"], {"GEMM"}, "canonical_op")
         shape = _exact_keys(case_obj["shape"], {"m", "n", "k"}, "case shape")
         for dim in ("m", "n", "k"):
-            _require_int(shape[dim], f"shape.{dim}", 1)
+            _require_int(shape[dim], f"shape.{dim}", 1, _MAX_DIMENSION)
         dtype = _require_string(case_obj["dtype"], _DTYPES, "case dtype")
         transpose = _exact_keys(case_obj["transpose"], {"a", "b"}, "transpose")
         if type(transpose["a"]) is not bool or type(transpose["b"]) is not bool:
@@ -706,12 +790,25 @@ def validate_recipe(recipe: Mapping[str, Any]) -> None:
         frequency = _exact_keys(case_obj["frequency"], {"count"}, "frequency")
         count = _require_int(frequency["count"], "frequency count", 1)
         mapped_frequency += count
-        priority = _exact_keys(case_obj["priority"], {"basis", "rank", "score_ppm"}, "priority")
-        priority_bases.add(
-            _require_string(
-                priority["basis"], {"OBSERVED_TOTAL_DURATION", "FREQUENCY"}, "priority basis"
-            )
+        raw_priority = case_obj["priority"]
+        if type(raw_priority) is not dict:
+            raise RecipeValidationError("priority must be an object")
+        basis = _require_string(
+            raw_priority.get("basis"),
+            {"OBSERVED_TOTAL_DURATION", "FREQUENCY"},
+            "priority basis",
         )
+        priority_keys = (
+            {"basis", "rank", "score_ppm", "weight"}
+            if basis == "OBSERVED_TOTAL_DURATION"
+            else {"basis", "rank", "score_ppm"}
+        )
+        priority = _exact_keys(raw_priority, priority_keys, "priority")
+        priority_bases.add(basis)
+        if basis == "OBSERVED_TOTAL_DURATION":
+            observed_priority_weights[case_id] = _require_int(
+                priority["weight"], "priority weight", 1
+            )
         ranks.append(_require_int(priority["rank"], "priority rank", 1))
         score_total += _require_int(priority["score_ppm"], "priority score", 0, 1_000_000)
         source_evidence = _exact_keys(
@@ -745,32 +842,32 @@ def validate_recipe(recipe: Mapping[str, Any]) -> None:
         priority_basis = next(iter(priority_bases))
         by_id = {case["case_id"]: case for case in cases}
         if priority_basis == "FREQUENCY":
-            frequency_weights = {
+            priority_weights: dict[str, Decimal | int] = {
                 case_id: Decimal(case["frequency"]["count"])
                 for case_id, case in by_id.items()
             }
-            expected_scores = _allocate_scores(frequency_weights)
-            expected_order = sorted(
-                frequency_weights,
-                key=lambda case_id: (-frequency_weights[case_id], case_id),
-            )
-            expected_ranks = {
-                case_id: rank for rank, case_id in enumerate(expected_order, 1)
-            }
-            for case_id, case in by_id.items():
-                if (
-                    case["priority"]["score_ppm"] != expected_scores[case_id]
-                    or case["priority"]["rank"] != expected_ranks[case_id]
-                ):
-                    raise RecipeValidationError("frequency priority is inconsistent")
         else:
-            ranked_scores = [
-                case["priority"]["score_ppm"]
-                for case in sorted(cases, key=lambda item: item["priority"]["rank"])
-            ]
-            if ranked_scores != sorted(ranked_scores, reverse=True):
-                raise RecipeValidationError("observed-duration priority rank is inconsistent")
-    elif ranks or priority_bases or score_total:
+            priority_weights = observed_priority_weights
+            weight_divisor = 0
+            for weight in observed_priority_weights.values():
+                weight_divisor = math.gcd(weight_divisor, weight)
+            if weight_divisor != 1:
+                raise RecipeValidationError("observed priority weights are not normalized")
+        expected_scores = _allocate_scores(priority_weights)
+        expected_order = sorted(
+            priority_weights,
+            key=lambda case_id: (-priority_weights[case_id], case_id),
+        )
+        expected_ranks = {
+            case_id: rank for rank, case_id in enumerate(expected_order, 1)
+        }
+        for case_id, case in by_id.items():
+            if (
+                case["priority"]["score_ppm"] != expected_scores[case_id]
+                or case["priority"]["rank"] != expected_ranks[case_id]
+            ):
+                raise RecipeValidationError("priority is inconsistent with its weight basis")
+    elif ranks or priority_bases or observed_priority_weights or score_total:
         raise RecipeValidationError("empty cases have priority data")
 
     unmapped = top["unmapped"]
