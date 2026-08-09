@@ -171,13 +171,15 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
         self.assertNotIn(str(profile), recipe_json_bytes(recipe).decode("utf-8"))
 
     def test_capture_scope_auxiliary_sources_are_content_bound_in_lineage(self) -> None:
-        communication = b"{}"
-        communication_matrix = b'{"rank":{"collective":{"peer":{}}}}'
+        communication = (
+            b'{"step":{"collective":{"hcom_AllReduce_1":'
+            b'{"Communication Time Info":{"Elapse Time(ms)":1}}},"p2p":{}}}'
+        )
+        communication_matrix = b'{"rank":{"collective":{"peer":{}},"p2p":{}}}'
         with tempfile.TemporaryDirectory() as td:
             profile = Path(td)
             shutil.copyfile(FIXTURE_PROFILE / "kernel_details.csv", profile / "kernel_details.csv")
             (profile / "communication.json").write_bytes(communication)
-            (profile / "communication_matrix.json").write_bytes(communication_matrix)
             recipe = build_recipe(profile, PRODUCER_REVISION)
 
         selected = recipe["lineage"]["selected_sources"]
@@ -185,10 +187,6 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
             selected,
             [
                 {"role": "COMMUNICATION_JSON", "content_sha256": _sha256(communication)},
-                {
-                    "role": "COMMUNICATION_MATRIX_JSON",
-                    "content_sha256": _sha256(communication_matrix),
-                },
                 {
                     "role": "KERNEL_DETAILS_CSV",
                     "content_sha256": _sha256(
@@ -201,7 +199,48 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
             recipe["lineage"]["source_manifest_sha256"],
             _sha256(canonical_json_bytes(selected)),
         )
-        self.assertEqual(recipe["lineage"]["capture_scope"]["scope"], "MULTI_RANK_MATRIX")
+        self.assertEqual(
+            recipe["lineage"]["capture_scope"]["scope"],
+            "SINGLE_RANK_OR_MATRIX_MISSING",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            shutil.copyfile(FIXTURE_PROFILE / "kernel_details.csv", profile / "kernel_details.csv")
+            (profile / "communication_matrix.json").write_bytes(communication_matrix)
+            matrix_recipe = build_recipe(profile, PRODUCER_REVISION)
+
+        self.assertEqual(
+            [source["role"] for source in matrix_recipe["lineage"]["selected_sources"]],
+            ["COMMUNICATION_MATRIX_JSON", "KERNEL_DETAILS_CSV"],
+        )
+        self.assertEqual(
+            matrix_recipe["lineage"]["capture_scope"]["scope"],
+            "MULTI_RANK_MATRIX",
+        )
+
+        invalid_sources = (
+            ("communication.json", b""),
+            ("communication.json", b"{}"),
+            ("communication_matrix.json", b"{"),
+            ("communication_matrix.json", b"{}"),
+            ("communication.json", communication_matrix),
+            ("communication_matrix.json", communication),
+            ("communication.json", b"[]"),
+        )
+        for filename, payload in invalid_sources:
+            with (
+                self.subTest(filename=filename, payload_sha256=_sha256(payload)),
+                tempfile.TemporaryDirectory() as td,
+            ):
+                profile = Path(td)
+                shutil.copyfile(
+                    FIXTURE_PROFILE / "kernel_details.csv",
+                    profile / "kernel_details.csv",
+                )
+                (profile / filename).write_bytes(payload)
+                with self.assertRaises(RecipeBuildError):
+                    build_recipe(profile, PRODUCER_REVISION)
 
     def test_msprof_lineage_binds_the_same_last_op_summary_as_loader(self) -> None:
         columns = (
@@ -577,23 +616,42 @@ class CalibrationRecipeValidationTests(unittest.TestCase):
                 _resign(resigned)
                 self.assertRejected(resigned)
 
-        with_communication_evidence = copy.deepcopy(self.recipe)
-        with_communication_evidence["lineage"]["selected_sources"].append(
-            {"role": "COMMUNICATION_MATRIX_JSON", "content_sha256": "a" * 64}
+        role_scopes = (
+            ("COMMUNICATION_JSON", "SINGLE_RANK_OR_MATRIX_MISSING"),
+            ("COMMUNICATION_MATRIX_JSON", "MULTI_RANK_MATRIX"),
         )
-        with_communication_evidence["lineage"]["selected_sources"].sort(
-            key=lambda item: item["role"]
+        role_recipes = {}
+        for role, scope in role_scopes:
+            role_recipe = copy.deepcopy(self.recipe)
+            role_recipe["lineage"]["selected_sources"].append(
+                {"role": role, "content_sha256": "a" * 64}
+            )
+            role_recipe["lineage"]["selected_sources"].sort(key=lambda item: item["role"])
+            role_recipe["lineage"]["source_manifest_sha256"] = _sha256(
+                canonical_json_bytes(role_recipe["lineage"]["selected_sources"])
+            )
+            role_recipe["lineage"]["capture_scope"] = {
+                "scope": scope,
+                "evidence": "PARSER_METADATA",
+                "unavailable_reason": "NONE",
+            }
+            _resign(role_recipe)
+            validate_recipe(role_recipe)
+            role_recipes[role] = role_recipe
+
+        for claimed_scope in ("MULTI_RANK_MATRIX", "SINGLE_RANK"):
+            with self.subTest(communication_only_claim=claimed_scope):
+                resigned = copy.deepcopy(role_recipes["COMMUNICATION_JSON"])
+                resigned["lineage"]["capture_scope"]["scope"] = claimed_scope
+                _resign(resigned)
+                self.assertRejected(resigned)
+
+        matrix_resigned = copy.deepcopy(role_recipes["COMMUNICATION_MATRIX_JSON"])
+        matrix_resigned["lineage"]["capture_scope"]["scope"] = (
+            "SINGLE_RANK_OR_MATRIX_MISSING"
         )
-        with_communication_evidence["lineage"]["source_manifest_sha256"] = _sha256(
-            canonical_json_bytes(with_communication_evidence["lineage"]["selected_sources"])
-        )
-        with_communication_evidence["lineage"]["capture_scope"] = {
-            "scope": "MULTI_RANK_MATRIX",
-            "evidence": "PARSER_METADATA",
-            "unavailable_reason": "NONE",
-        }
-        _resign(with_communication_evidence)
-        validate_recipe(with_communication_evidence)
+        _resign(matrix_resigned)
+        self.assertRejected(matrix_resigned)
 
     def test_rejects_unsorted_duplicate_and_invalid_nested_fields(self) -> None:
         unsorted_cases = copy.deepcopy(self.recipe)

@@ -61,6 +61,11 @@ _COMMUNICATION_SOURCE_ROLES = {
     "COMMUNICATION_JSON",
     "COMMUNICATION_MATRIX_JSON",
 }
+_COMMUNICATION_GROUP_FIELDS = {"collective", "p2p"}
+_COMMUNICATION_INFO_FIELDS = {
+    "Communication Time Info",
+    "Communication Bandwidth Info",
+}
 _CAPTURE_SCOPES = {
     "SINGLE_RANK",
     "SINGLE_RANK_OR_MATRIX_MISSING",
@@ -181,6 +186,88 @@ def _source_manifest(selected: Sequence[tuple[str, BinaryIO]]) -> list[dict[str,
     ]
 
 
+def _capture_evidence_object(stream: BinaryIO) -> dict[str, Any]:
+    def reject_duplicate_keys(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise RecipeBuildError("communication evidence JSON is invalid")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> None:
+        del value
+        raise RecipeBuildError("communication evidence JSON is invalid")
+
+    stream.seek(0)
+    try:
+        payload = stream.read().decode("utf-8")
+        value = json.loads(
+            payload,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_constant,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, RecipeBuildError) as exc:
+        raise RecipeBuildError("communication evidence JSON is invalid") from exc
+    finally:
+        stream.seek(0)
+    if type(value) is not dict:
+        raise RecipeBuildError("communication evidence JSON must be an object")
+    return value
+
+
+def _communication_json_has_authority(value: Mapping[str, Any]) -> bool:
+    has_collective = False
+    for groups in value.values():
+        if type(groups) is not dict or not set(groups).issubset(_COMMUNICATION_GROUP_FIELDS):
+            raise RecipeBuildError("communication evidence does not match source role")
+        for entries in groups.values():
+            if type(entries) is not dict:
+                raise RecipeBuildError("communication evidence does not match source role")
+            for op_name, info in entries.items():
+                if (
+                    type(info) is not dict
+                    or not info
+                    or not set(info).issubset(_COMMUNICATION_INFO_FIELDS)
+                    or any(type(section) is not dict for section in info.values())
+                ):
+                    raise RecipeBuildError("communication evidence does not match source role")
+                if not str(op_name).casefold().startswith("total"):
+                    has_collective = True
+    return has_collective
+
+
+def _communication_matrix_json_has_authority(value: Mapping[str, Any]) -> bool:
+    has_matrix = False
+    for groups in value.values():
+        if type(groups) is not dict or not set(groups).issubset(_COMMUNICATION_GROUP_FIELDS):
+            raise RecipeBuildError("communication evidence does not match source role")
+        for entries in groups.values():
+            if type(entries) is not dict:
+                raise RecipeBuildError("communication evidence does not match source role")
+            for matrix_entry in entries.values():
+                if (
+                    type(matrix_entry) is not dict
+                    or set(matrix_entry).intersection(_COMMUNICATION_INFO_FIELDS)
+                ):
+                    raise RecipeBuildError("communication evidence does not match source role")
+                has_matrix = True
+    return has_matrix
+
+
+def _validate_capture_evidence_sources(selected: Sequence[tuple[str, BinaryIO]]) -> None:
+    for role, stream in selected:
+        if role not in _COMMUNICATION_SOURCE_ROLES:
+            continue
+        value = _capture_evidence_object(stream)
+        if role == "COMMUNICATION_JSON":
+            has_authority = _communication_json_has_authority(value)
+        else:
+            has_authority = _communication_matrix_json_has_authority(value)
+        if not has_authority:
+            raise RecipeBuildError("communication evidence does not match source role")
+
+
 def _open_immutable_snapshot_handle(path: Path) -> BinaryIO:
     if os.name != "nt":
         if not sys.platform.startswith("linux") or not hasattr(os, "memfd_create"):
@@ -296,23 +383,13 @@ def _snapshot_profile(
 def _capture_scope(
     meta: Mapping[str, Any], layout: str, source_roles: set[str]
 ) -> dict[str, str]:
+    del meta
     del layout
-    if not source_roles.intersection(_COMMUNICATION_SOURCE_ROLES):
-        return {
-            "scope": "UNKNOWN",
-            "evidence": "UNAVAILABLE",
-            "unavailable_reason": "PARSER_SCOPE_NOT_RECORDED",
-        }
-    raw_scope = str(meta.get("profile_scope") or "").strip().lower()
-    scope_map = {
-        "single_rank": "SINGLE_RANK",
-        "single_rank_or_matrix_missing": "SINGLE_RANK_OR_MATRIX_MISSING",
-        "multi_rank_matrix": "MULTI_RANK_MATRIX",
-    }
-    scope = scope_map.get(raw_scope)
-    if scope is None and bool(meta.get("multi_card")):
+    if "COMMUNICATION_MATRIX_JSON" in source_roles:
+        scope = "MULTI_RANK_MATRIX"
+    elif "COMMUNICATION_JSON" in source_roles:
         scope = "SINGLE_RANK_OR_MATRIX_MISSING"
-    if scope is None:
+    else:
         return {
             "scope": "UNKNOWN",
             "evidence": "UNAVAILABLE",
@@ -504,6 +581,7 @@ def build_recipe(profile_dir: str | Path, producer_revision: str) -> dict[str, A
         snapshot_dir = Path(temporary_dir)
         snapshot_selected = _snapshot_profile(snapshot_dir, selected_paths)
         with _immutable_snapshot_handles(snapshot_selected) as snapshot_handles:
+            _validate_capture_evidence_sources(snapshot_handles)
             snapshot_layout, detected_snapshot_sources = _select_profile_sources(snapshot_dir)
             if (
                 snapshot_layout != layout
@@ -760,13 +838,15 @@ def validate_recipe(recipe: Mapping[str, Any]) -> None:
         {"NONE", "PARSER_SCOPE_NOT_RECORDED"},
         "capture unavailable reason",
     )
-    if scope == "UNKNOWN":
-        if (evidence, unavailable_reason) != ("UNAVAILABLE", "PARSER_SCOPE_NOT_RECORDED"):
-            raise RecipeValidationError("unknown capture scope lacks unavailable reason")
-    elif (evidence, unavailable_reason) != ("PARSER_METADATA", "NONE"):
-        raise RecipeValidationError("known capture scope has inconsistent evidence")
-    if not set(source_roles).intersection(_COMMUNICATION_SOURCE_ROLES) and scope != "UNKNOWN":
-        raise RecipeValidationError("known capture scope lacks communication source evidence")
+    role_set = set(source_roles)
+    if "COMMUNICATION_MATRIX_JSON" in role_set:
+        expected_capture = ("MULTI_RANK_MATRIX", "PARSER_METADATA", "NONE")
+    elif "COMMUNICATION_JSON" in role_set:
+        expected_capture = ("SINGLE_RANK_OR_MATRIX_MISSING", "PARSER_METADATA", "NONE")
+    else:
+        expected_capture = ("UNKNOWN", "UNAVAILABLE", "PARSER_SCOPE_NOT_RECORDED")
+    if (scope, evidence, unavailable_reason) != expected_capture:
+        raise RecipeValidationError("capture scope does not match communication source roles")
 
     coverage = _exact_keys(
         top["coverage"],
