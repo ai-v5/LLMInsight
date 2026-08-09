@@ -274,6 +274,14 @@ def _parse_strict_matrix_shapes(raw: Any, tensor_count: int) -> list[list[int]] 
     value = str(raw).strip()
     if not value or value.upper() in {"N/A", "NAN", "NONE", "NULL"}:
         return None
+    if value.startswith('"') or value.endswith('"'):
+        if len(value) < 2 or value[0] != '"' or value[-1] != '"':
+            return None
+        value = value[1:-1]
+        if '"' in value or "\\" in value:
+            return None
+    elif '"' in value or "\\" in value:
+        return None
     tensors = value.split(";")
     if len(tensors) != tensor_count:
         return None

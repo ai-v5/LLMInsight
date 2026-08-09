@@ -25,6 +25,9 @@ from llminsight.calibration_recipe import (
 from llminsight.parser import load_profile as parser_load_profile
 
 FIXTURE_PROFILE = Path(__file__).parent / "fixtures" / "profiling_recipe"
+WHOLE_SCALAR_QUOTED_PROFILE = (
+    Path(__file__).parent / "fixtures" / "profiling_recipe_whole_scalar"
+)
 EXPECTED_RECIPE = FIXTURE_PROFILE / "expected_recipe.json"
 SCHEMA_FILE = Path(__file__).parents[1] / "doc" / "contracts" / "llm.profiling-calibration-recipe.v1.schema.json"
 PRODUCER_REVISION = "0123456789abcdef0123456789abcdef01234567"
@@ -213,6 +216,8 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
             ("scientific", "2e3,3;3,5", "2000,5"),
             ("overflow", "9223372036854775808,3;3,5", "9223372036854775808,5"),
             ("garbage_tensor", "2,3;3,5;garbage", "2,5"),
+            ("quoted_fractional", '"2.9,3;3,5"', '"2,5"'),
+            ("quoted_extra_tensor", '"2,3;3,5;4,5"', '"2,5"'),
         ):
             rows.append(
                 {
@@ -235,7 +240,7 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
         self.assertEqual(recipe["cases"][0]["shape"]["m"], 9007199254740993)
         self.assertEqual(
             recipe["unmapped"],
-            [{"reason": "CONFLICTING_SHAPE", "count": 4}],
+            [{"reason": "CONFLICTING_SHAPE", "count": 6}],
         )
 
     def test_shape_lexer_rejects_embedded_quote_garbage(self) -> None:
@@ -253,7 +258,17 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
                         "Input Data Types": "BF16;BF16",
                         "Output Shapes": "2,5",
                         "Output Data Types": "BF16",
-                    }
+                    },
+                    {
+                        "Name": "wrapped_quoted_garbage",
+                        "Type": "MatMul",
+                        "Accelerator Core": "AI_CORE",
+                        "Duration(us)": "1",
+                        "Input Shapes": '"2", "3;3,5"',
+                        "Input Data Types": "BF16;BF16",
+                        "Output Shapes": '"2,5"',
+                        "Output Data Types": "BF16",
+                    },
                 ],
             )
             recipe = build_recipe(profile, PRODUCER_REVISION)
@@ -261,8 +276,15 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
         self.assertEqual(recipe["coverage"]["mapped_kernel_rows"], 0)
         self.assertEqual(
             recipe["unmapped"],
-            [{"reason": "CONFLICTING_SHAPE", "count": 1}],
+            [{"reason": "CONFLICTING_SHAPE", "count": 2}],
         )
+
+    def test_shape_lexer_accepts_one_exact_whole_scalar_quote_layer(self) -> None:
+        recipe = build_recipe(WHOLE_SCALAR_QUOTED_PROFILE, PRODUCER_REVISION)
+
+        self.assertEqual(recipe["coverage"]["mapped_kernel_rows"], 1)
+        self.assertEqual(recipe["cases"][0]["shape"], {"m": 2, "n": 5, "k": 3})
+        self.assertEqual(recipe["unmapped"], [])
 
     def test_export_is_byte_deterministic_and_matches_consumer_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as td:
