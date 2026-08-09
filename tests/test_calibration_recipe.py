@@ -5,6 +5,7 @@ import csv
 import hashlib
 import json
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -92,10 +93,14 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
         self.assertEqual(by_hint["GEMM"]["dtype"], "FP16")
         self.assertEqual(by_hint["MATMUL"]["dtype"], "FP32")
         self.assertEqual(by_hint["GEMM_V3"]["dtype"], "FP8_E4M3")
-        self.assertTrue(all(case["priority"]["basis"] == "OBSERVED_TOTAL_DURATION" for case in cases))
         self.assertEqual(
-            {hint: case["priority"]["weight"] for hint, case in by_hint.items()},
-            {"MATMUL": 2, "MATMUL_V3": 15, "GEMM": 20, "GEMM_V3": 3},
+            {hint: case["priority"] for hint, case in by_hint.items()},
+            {
+                "MATMUL_V3": {"basis": "FREQUENCY", "rank": 1, "score_ppm": 400000},
+                "GEMM_V3": {"basis": "FREQUENCY", "rank": 2, "score_ppm": 200000},
+                "MATMUL": {"basis": "FREQUENCY", "rank": 3, "score_ppm": 200000},
+                "GEMM": {"basis": "FREQUENCY", "rank": 4, "score_ppm": 200000},
+            },
         )
 
     def test_rejects_incomplete_candidate_families_without_guessing(self) -> None:
@@ -131,7 +136,11 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
         self.assertEqual(recipe["lineage"]["source_manifest_sha256"], _sha256(canonical_json_bytes(selected)))
         self.assertEqual(
             recipe["lineage"]["capture_scope"],
-            {"scope": "SINGLE_RANK", "evidence": "PARSER_METADATA", "unavailable_reason": "NONE"},
+            {
+                "scope": "UNKNOWN",
+                "evidence": "UNAVAILABLE",
+                "unavailable_reason": "PARSER_SCOPE_NOT_RECORDED",
+            },
         )
 
         for case in recipe["cases"]:
@@ -159,6 +168,39 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
             ["KERNEL_DETAILS_CSV", "MINDSTUDIO_DB"],
         )
         self.assertNotIn(str(profile), recipe_json_bytes(recipe).decode("utf-8"))
+
+    def test_capture_scope_auxiliary_sources_are_content_bound_in_lineage(self) -> None:
+        communication = b"{}"
+        communication_matrix = b'{"rank":{"collective":{"peer":{}}}}'
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            shutil.copyfile(FIXTURE_PROFILE / "kernel_details.csv", profile / "kernel_details.csv")
+            (profile / "communication.json").write_bytes(communication)
+            (profile / "communication_matrix.json").write_bytes(communication_matrix)
+            recipe = build_recipe(profile, PRODUCER_REVISION)
+
+        selected = recipe["lineage"]["selected_sources"]
+        self.assertEqual(
+            selected,
+            [
+                {"role": "COMMUNICATION_JSON", "content_sha256": _sha256(communication)},
+                {
+                    "role": "COMMUNICATION_MATRIX_JSON",
+                    "content_sha256": _sha256(communication_matrix),
+                },
+                {
+                    "role": "KERNEL_DETAILS_CSV",
+                    "content_sha256": _sha256(
+                        (FIXTURE_PROFILE / "kernel_details.csv").read_bytes()
+                    ),
+                },
+            ],
+        )
+        self.assertEqual(
+            recipe["lineage"]["source_manifest_sha256"],
+            _sha256(canonical_json_bytes(selected)),
+        )
+        self.assertEqual(recipe["lineage"]["capture_scope"]["scope"], "MULTI_RANK_MATRIX")
 
     def test_msprof_lineage_binds_the_same_last_op_summary_as_loader(self) -> None:
         columns = (
@@ -312,7 +354,8 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
         for forbidden in ("duration_us", "latency", "mean", "p50", "maximum", "target", "product_ref", "950pr", "950dt"):
             self.assertNotIn(forbidden, lowered)
 
-    def test_invalid_duration_falls_back_all_priorities_to_frequency(self) -> None:
+    def test_duration_does_not_authorize_or_change_frequency_priority(self) -> None:
+        baseline = build_recipe(FIXTURE_PROFILE, PRODUCER_REVISION)
         with tempfile.TemporaryDirectory() as td:
             profile = Path(td)
             shutil.copyfile(FIXTURE_PROFILE / "kernel_details.csv", profile / "kernel_details.csv")
@@ -325,8 +368,17 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
                 writer.writerows(rows)
             recipe = build_recipe(profile, PRODUCER_REVISION)
 
+        self.assertTrue(all(case["priority"]["basis"] == "FREQUENCY" for case in baseline["cases"]))
         self.assertTrue(all(case["priority"]["basis"] == "FREQUENCY" for case in recipe["cases"]))
         self.assertEqual(sum(case["priority"]["score_ppm"] for case in recipe["cases"]), 1000000)
+        self.assertEqual(
+            [case["priority"] for case in recipe["cases"]],
+            [case["priority"] for case in baseline["cases"]],
+        )
+        self.assertEqual(
+            [case["source_evidence"] for case in recipe["cases"]],
+            [case["source_evidence"] for case in baseline["cases"]],
+        )
 
     def test_zero_candidate_coverage_is_unavailable_not_zero(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -400,6 +452,34 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
                 mock.patch(
                     "llminsight.calibration_recipe.load_profile",
                     side_effect=load_then_change_snapshot,
+                ),
+                self.assertRaises(RecipeBuildError),
+            ):
+                build_recipe(profile, PRODUCER_REVISION)
+
+    def test_snapshot_aba_change_during_parse_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td)
+            shutil.copyfile(FIXTURE_PROFILE / "kernel_details.csv", profile / "kernel_details.csv")
+
+            def load_during_snapshot_aba(path: str):
+                snapshot_source = Path(path) / "kernel_details.csv"
+                content_a = snapshot_source.read_bytes()
+                content_b = content_a.replace(b'"3,2;3,5"', b'"3,4;3,7"', 1).replace(
+                    b'"2,5"', b'"4,7"', 1
+                )
+                snapshot_source.chmod(stat.S_IREAD | stat.S_IWRITE)
+                snapshot_source.write_bytes(content_b)
+                try:
+                    return parser_load_profile(path)
+                finally:
+                    snapshot_source.write_bytes(content_a)
+                    snapshot_source.chmod(stat.S_IREAD)
+
+            with (
+                mock.patch(
+                    "llminsight.calibration_recipe.load_profile",
+                    side_effect=load_during_snapshot_aba,
                 ),
                 self.assertRaises(RecipeBuildError),
             ):
@@ -490,39 +570,28 @@ class CalibrationRecipeValidationTests(unittest.TestCase):
         self.assertRejected(non_boolean_transpose)
 
     def test_rejects_resigned_priority_semantic_inconsistency(self) -> None:
-        frequency_lie = copy.deepcopy(self.recipe)
-        for case in frequency_lie["cases"]:
-            case["priority"]["basis"] = "FREQUENCY"
-        _resign(frequency_lie)
-        self.assertRejected(frequency_lie)
-
-        observed_rank_lie = copy.deepcopy(self.recipe)
-        by_rank = sorted(observed_rank_lie["cases"], key=lambda item: item["priority"]["rank"])
+        frequency_rank_lie = copy.deepcopy(self.recipe)
+        by_rank = sorted(frequency_rank_lie["cases"], key=lambda item: item["priority"]["rank"])
         by_rank[0]["priority"]["rank"], by_rank[-1]["priority"]["rank"] = (
             by_rank[-1]["priority"]["rank"],
             by_rank[0]["priority"]["rank"],
         )
-        _resign(observed_rank_lie)
-        self.assertRejected(observed_rank_lie)
+        _resign(frequency_rank_lie)
+        self.assertRejected(frequency_rank_lie)
 
-        observed_score_and_rank_lie = copy.deepcopy(self.recipe)
-        self.assertTrue(
-            all("weight" in case["priority"] for case in observed_score_and_rank_lie["cases"])
-        )
-        ordered = sorted(observed_score_and_rank_lie["cases"], key=lambda item: item["case_id"])
-        for rank, case in enumerate(reversed(ordered), 1):
-            case["priority"]["rank"] = rank
-            case["priority"]["score_ppm"] = 250000
-        _resign(observed_score_and_rank_lie)
-        self.assertRejected(observed_score_and_rank_lie)
+        observed_full_resign = copy.deepcopy(self.recipe)
+        ordered = sorted(observed_full_resign["cases"], key=lambda item: item["case_id"])
+        for index, case in enumerate(ordered, 1):
+            case["priority"] = {
+                "basis": "OBSERVED_TOTAL_DURATION",
+                "rank": len(ordered) - index + 1,
+                "score_ppm": index * 100000,
+                "weight": index,
+            }
+        _resign(observed_full_resign)
+        self.assertRejected(observed_full_resign)
 
-        observed_noncanonical_weights = copy.deepcopy(self.recipe)
-        for case in observed_noncanonical_weights["cases"]:
-            case["priority"]["weight"] *= 2
-        _resign(observed_noncanonical_weights)
-        self.assertRejected(observed_noncanonical_weights)
-
-    def test_observed_priority_tie_break_is_recomputed_from_case_id(self) -> None:
+    def test_frequency_priority_tie_break_is_recomputed_from_case_id(self) -> None:
         rows = []
         for name, op_type in (("matmul", "MatMul"), ("gemm", "Gemm")):
             rows.append(
@@ -543,6 +612,7 @@ class CalibrationRecipeValidationTests(unittest.TestCase):
             tied = build_recipe(profile, PRODUCER_REVISION)
 
         by_rank = sorted(tied["cases"], key=lambda item: item["priority"]["rank"])
+        self.assertTrue(all(case["priority"]["basis"] == "FREQUENCY" for case in tied["cases"]))
         self.assertEqual(
             [case["case_id"] for case in by_rank],
             sorted(case["case_id"] for case in tied["cases"]),

@@ -9,24 +9,24 @@ Producer v1 把 LLMInsight 已解析的 profiling 中、语义可无歧义重建
 - `readiness=PROFILE_DERIVED_RECIPE`
 - `evidence_role=DERIVED_FROM_PROFILING`
 
-允许声明仅限“从 profiling 派生出 ordinary GEMM 候选及其来源完整性、频次、相对优先级和映射覆盖率”。禁止把 recipe 声明为 `CALIBRATED`、隔离单算子校准结果、真机校准曲线或 product 已绑定结果。observed kernel duration 只参与相对优先级和交叉检查，不是校准时延，也不写入 recipe。
+允许声明仅限“从 profiling 派生出 ordinary GEMM 候选及其来源完整性、频次、基于频次的相对优先级和映射覆盖率”。禁止把 recipe 声明为 `CALIBRATED`、隔离单算子校准结果、真机校准曲线或 product 已绑定结果。v1 不使用 observed kernel duration 排优先级，也不把它写入 recipe 或 source evidence。
 
 recipe 不接受 `target`、`product_ref` 或其它 configured product 字段。Ascend 950PR、950DT 等产品身份只能由 LLMSim 执行阶段的 trusted registry 绑定；profile 中的 family、format 或 capture scope 不能升级为产品权威。portable `recipe_sha256` 因此不含目标产品。
 
 ## 输入与复用边界
 
-CLI 必须指向现有 LLMInsight loader 能读取的 profile 目录。producer 先把 loader 实际选择的源复制到 task-private 临时 snapshot，再对 snapshot 摘要、调用 `llminsight.parser.load_profile` 并复核摘要；parser 与 lineage 因而消费同一份内容，原目录在 loader 期间发生 A→B→A 变化也不能混合 case 与 lineage。临时 snapshot 随调用结束删除。producer 复用统一 `ProfileData`、`parse_dtypes` 和 `_matmul_mnk`，只在 recipe 信任边界使用严格 shape lexer，不建立第二套 profile loader。
+CLI 必须指向现有 LLMInsight loader 能读取的 profile 目录。producer 先把 loader 实际选择的源复制到 task-private 临时 snapshot，再把每个 snapshot 文件绑定到不可写 handle：Windows 使用 deny-write/delete sharing，Linux 使用 sealed memory file 并冻结 snapshot namespace；其它平台缺少等价原语时 fail closed。lineage 摘要直接从这些 handle 读取，parser 只在同一组 handle 保持打开期间消费对应路径。producer 不通过 parser 后路径重读来自证，因此 snapshot 内 A→B→A 不能混合 case 与 lineage。临时 snapshot 随调用结束删除。producer 复用统一 `ProfileData`、`parse_dtypes` 和 `_matmul_mnk`，只在 recipe 信任边界使用严格 shape lexer，不建立第二套 profile loader。
 
 lineage 只保存逻辑 source role 与内容 SHA-256，不保存绝对路径、用户名、真实 basename、raw row、文件大小、DB 路径或 trace 路径：
 
 | `profile_layout` | `selected_sources.role` |
 | --- | --- |
-| `TORCH_NPU_ASCEND_PROFILER_OUTPUT` | `KERNEL_DETAILS_CSV` |
-| `HYBRID_TORCH_NPU_MINDSTUDIO_DB` | `KERNEL_DETAILS_CSV`, `MINDSTUDIO_DB` |
+| `TORCH_NPU_ASCEND_PROFILER_OUTPUT` | `KERNEL_DETAILS_CSV`，存在时另含 `COMMUNICATION_JSON`、`COMMUNICATION_MATRIX_JSON` |
+| `HYBRID_TORCH_NPU_MINDSTUDIO_DB` | `KERNEL_DETAILS_CSV`, `MINDSTUDIO_DB`，存在时另含上述 communication sources |
 | `MINDSTUDIO_DB` | `MINDSTUDIO_DB` |
 | `MSPROF_OP_SUMMARY` | `MSPROF_OP_SUMMARY_CSV` |
 
-同一目录存在多个 `op_summary_*.csv` 时，lineage 与现有 loader 一致绑定按文件名排序后的最后一个 source。lineage 摘要、loader 输入和 parser 后摘要都来自同一 task-private snapshot；snapshot 内容变化时 fail closed。
+同一目录存在多个 `op_summary_*.csv` 时，lineage 与现有 loader 一致绑定按文件名排序后的最后一个 source。只有会影响 cases、coverage 或 capture scope 的文件进入 snapshot；其中 torch_npu capture scope 受 `communication.json` / `communication_matrix.json` 影响，因此两者存在时必须进入同一 content lineage。两者都缺失时不从“文件缺失”推断单卡，scope 固定为 `UNKNOWN + UNAVAILABLE`。
 
 `producer_revision` 是调用方显式提供的 40 位小写 Git SHA。producer 不从 profile 推断该值。`source_manifest_sha256` 绑定 canonical `selected_sources` 数组；`capture_scope` 只接受 parser metadata，缺失时必须为 `UNKNOWN + UNAVAILABLE + PARSER_SCOPE_NOT_RECORDED`。
 
@@ -55,7 +55,7 @@ BatchMatMul、GroupedMatMul、Attention 和 fused MatMul/GEMM 在 v1 一律进�
 
 不得以 `0` 冒充可用覆盖率。
 
-只有全部 mapped rows 的 duration 都是有限正数时，所有 case 才统一使用 `OBSERVED_TOTAL_DURATION` 排优先级；任何 mapped duration 不可用时，整份 recipe 统一回退到 `FREQUENCY`。observed basis 额外输出 `priority.weight`：它是各 case duration total 的无量纲、最大公约数归一化正整数比，只用于让消费者独立重算 rank、score 和 tie-break，不是 duration 或 latency statistic。`score_ppm` 总和为 1,000,000，稳定 tie-break 使用 `case_id`。recipe 不包含 duration、latency、mean、percentile 或最大/最小时延统计。
+Producer v1 的 priority basis 固定为 `FREQUENCY`；`score_ppm` 和 rank 只能从 `frequency.count` 重算，score 总和为 1,000,000，稳定 tie-break 使用 `case_id`。validator 拒绝 `OBSERVED_TOTAL_DURATION`、`weight` 或其它无独立 authority 的 priority 输入，即使调用方同时重算 score、rank 与 recipe digest。recipe 不包含 duration、latency、mean、percentile 或最大/最小时延统计。
 
 ## Canonical JSON 与 fail-closed 验证
 
@@ -74,7 +74,7 @@ JSON Schema 见 `doc/contracts/llm.profiling-calibration-recipe.v1.schema.json`�
 - 拒绝 float、负数、NaN/Infinity、duplicate JSON key 和 path-like string；
 - source role 必须与 layout 一致且排序、去重；
 - coverage、frequency、unmapped count、ppm 与 case count 必须闭合；
-- cases/unmapped 必须排序、去重；priority rank 必须连续，score 总和必须闭合；`FREQUENCY` 从 frequency 精确重算 rank/score，`OBSERVED_TOTAL_DURATION` 从规范化 `weight` 精确重算 rank/score，两者 tie-break 都使用 `case_id`；
+- cases/unmapped 必须排序、去重；priority basis 必须为 `FREQUENCY`，rank 必须连续，score 总和必须闭合，并从 frequency 精确重算 rank/score；tie-break 使用 `case_id`；
 - 重新计算 source manifest、case ID 和 recipe digest，任何不一致都拒绝。
 
 SHA-256 是内容完整性摘要，不是防止有意重签的数字签名；需要外部 authority 的消费者必须另行验证 producer commit/PR 与 trusted registry。

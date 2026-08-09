@@ -6,19 +6,22 @@ It does not turn profiler observations into calibrated performance results.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import stat
 import sys
 import tempfile
 from collections import Counter
-from collections.abc import Iterable, Mapping, MutableMapping, Sequence
-from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation
+from collections.abc import Iterable, Iterator, Mapping, MutableMapping, Sequence
+from contextlib import contextmanager
+from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from .metrics.efficiency import _matmul_mnk
 from .parser import load_profile
@@ -36,16 +39,9 @@ _DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:")
 _POSITIVE_DIM_RE = re.compile(r"^[1-9][0-9]*$")
 _MAX_DIMENSION = 2**63 - 1
 
-_TORCH_NPU_AUXILIARY_FILES = (
-    "step_trace_time.csv",
-    "op_statistic.csv",
-    "api_statistic.csv",
-    "operator_details.csv",
-    "communication.json",
-    "communication_matrix.json",
-    "memory_record.csv",
-    "npu_module_mem.csv",
-    "operator_memory.csv",
+_OUTPUT_AUXILIARY_SOURCES = (
+    ("COMMUNICATION_JSON", "communication.json"),
+    ("COMMUNICATION_MATRIX_JSON", "communication_matrix.json"),
 )
 
 _PROFILE_LAYOUTS = {
@@ -58,6 +54,8 @@ _SOURCE_ROLES = {
     "KERNEL_DETAILS_CSV",
     "MINDSTUDIO_DB",
     "MSPROF_OP_SUMMARY_CSV",
+    "COMMUNICATION_JSON",
+    "COMMUNICATION_MATRIX_JSON",
 }
 _CAPTURE_SCOPES = {
     "SINGLE_RANK",
@@ -129,11 +127,12 @@ def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def _sha256_file(path: Path) -> str:
+def _sha256_stream(stream: BinaryIO) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
+    stream.seek(0)
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+    stream.seek(0)
     return digest.hexdigest()
 
 
@@ -153,6 +152,10 @@ def _select_profile_sources(profile_dir: Path) -> tuple[str, list[tuple[str, Pat
         else:
             layout = "TORCH_NPU_ASCEND_PROFILER_OUTPUT"
             selected = [("KERNEL_DETAILS_CSV", kernel_csv)]
+        for role, filename in _OUTPUT_AUXILIARY_SOURCES:
+            auxiliary = profile_dir / filename
+            if auxiliary.is_file():
+                selected.append((role, auxiliary))
     elif mindstudio_db.is_file():
         layout = "MINDSTUDIO_DB"
         selected = [("MINDSTUDIO_DB", mindstudio_db)]
@@ -167,21 +170,109 @@ def _select_profile_sources(profile_dir: Path) -> tuple[str, list[tuple[str, Pat
     return layout, sorted(selected, key=lambda item: item[0])
 
 
-def _source_manifest(selected: Sequence[tuple[str, Path]]) -> list[dict[str, str]]:
+def _source_manifest(selected: Sequence[tuple[str, BinaryIO]]) -> list[dict[str, str]]:
     return [
-        {"role": role, "content_sha256": _sha256_file(path)}
-        for role, path in selected
+        {"role": role, "content_sha256": _sha256_stream(stream)}
+        for role, stream in selected
     ]
 
 
+def _open_immutable_snapshot_handle(path: Path) -> BinaryIO:
+    if os.name != "nt":
+        if not sys.platform.startswith("linux") or not hasattr(os, "memfd_create"):
+            raise RecipeBuildError("immutable snapshot handles are unavailable")
+        import fcntl
+
+        descriptor = os.memfd_create(
+            "llminsight-recipe-source",
+            getattr(os, "MFD_ALLOW_SEALING", 0x0002),
+        )
+        try:
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(descriptor, view)
+                        view = view[written:]
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            seals = (
+                fcntl.F_SEAL_SEAL
+                | fcntl.F_SEAL_SHRINK
+                | fcntl.F_SEAL_GROW
+                | fcntl.F_SEAL_WRITE
+            )
+            fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, seals)
+            path.unlink()
+            path.symlink_to(f"/proc/self/fd/{descriptor}")
+            return os.fdopen(descriptor, "rb")
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    import msvcrt
+    from ctypes import wintypes
+
+    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        0x80000000,  # GENERIC_READ
+        0x00000001,  # FILE_SHARE_READ: deny write/delete while held
+        None,
+        3,  # OPEN_EXISTING
+        0x00000080,  # FILE_ATTRIBUTE_NORMAL
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise OSError(ctypes.get_last_error(), "immutable snapshot handle unavailable")
+    try:
+        descriptor = msvcrt.open_osfhandle(
+            handle,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0),
+        )
+    except Exception:
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
+        raise
+    return os.fdopen(descriptor, "rb")
+
+
+@contextmanager
+def _immutable_snapshot_handles(
+    selected: Sequence[tuple[str, Path]],
+) -> Iterator[list[tuple[str, BinaryIO]]]:
+    handles: list[tuple[str, BinaryIO]] = []
+    snapshot_dir = selected[0][1].parent if selected else None
+    try:
+        for role, path in selected:
+            handles.append((role, _open_immutable_snapshot_handle(path)))
+        if snapshot_dir is not None and os.name != "nt":
+            snapshot_dir.chmod(stat.S_IREAD | stat.S_IEXEC)
+        yield handles
+    finally:
+        if snapshot_dir is not None and os.name != "nt":
+            snapshot_dir.chmod(stat.S_IREAD | stat.S_IWRITE | stat.S_IEXEC)
+        for _, stream in reversed(handles):
+            stream.close()
+
+
 def _snapshot_profile(
-    source_dir: Path,
     snapshot_dir: Path,
     selected: Sequence[tuple[str, Path]],
 ) -> list[tuple[str, Path]]:
     destinations = {
         "KERNEL_DETAILS_CSV": "kernel_details.csv",
         "MINDSTUDIO_DB": "mindstudio_insight_data.db",
+        "COMMUNICATION_JSON": "communication.json",
+        "COMMUNICATION_MATRIX_JSON": "communication_matrix.json",
     }
     snapshot_selected: list[tuple[str, Path]] = []
     try:
@@ -190,15 +281,6 @@ def _snapshot_profile(
             shutil.copyfile(source, destination)
             snapshot_selected.append((role, destination))
 
-        if any(role == "KERNEL_DETAILS_CSV" for role, _ in selected):
-            for name in _TORCH_NPU_AUXILIARY_FILES:
-                source = source_dir / name
-                if source.is_file():
-                    shutil.copyfile(source, snapshot_dir / name)
-        elif any(role == "MSPROF_OP_SUMMARY_CSV" for role, _ in selected):
-            for source in sorted(source_dir.glob("task_time_slice_*.csv")):
-                if source.is_file():
-                    shutil.copyfile(source, snapshot_dir / source.name)
     except OSError as exc:
         raise RecipeBuildError("profile snapshot is unavailable") from exc
     for snapshot_file in snapshot_dir.iterdir():
@@ -207,7 +289,20 @@ def _snapshot_profile(
     return snapshot_selected
 
 
-def _capture_scope(meta: Mapping[str, Any]) -> dict[str, str]:
+def _capture_scope(
+    meta: Mapping[str, Any], layout: str, source_roles: set[str]
+) -> dict[str, str]:
+    if layout in {
+        "TORCH_NPU_ASCEND_PROFILER_OUTPUT",
+        "HYBRID_TORCH_NPU_MINDSTUDIO_DB",
+    } and not source_roles.intersection(
+        {"COMMUNICATION_JSON", "COMMUNICATION_MATRIX_JSON"}
+    ):
+        return {
+            "scope": "UNKNOWN",
+            "evidence": "UNAVAILABLE",
+            "unavailable_reason": "PARSER_SCOPE_NOT_RECORDED",
+        }
     raw_scope = str(meta.get("profile_scope") or "").strip().lower()
     scope_map = {
         "single_rank": "SINGLE_RANK",
@@ -302,11 +397,11 @@ def _parse_strict_matrix_shapes(raw: Any, tensor_count: int) -> list[list[int]] 
 
 def _parse_ordinary_case(
     row: Mapping[str, Any], hint: str
-) -> tuple[dict[str, Any] | None, str | None, Decimal | None, str | None]:
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
     raw_in_shapes = _row_value(row, "Input Shapes")
     raw_out_shapes = _row_value(row, "Output Shapes")
     if not raw_in_shapes or not raw_out_shapes:
-        return None, "MISSING_SHAPE", None, None
+        return None, "MISSING_SHAPE", None
     shapes_in = _parse_strict_matrix_shapes(raw_in_shapes, 2)
     shapes_out = _parse_strict_matrix_shapes(raw_out_shapes, 1)
     if shapes_in is None or shapes_out is None:
@@ -316,7 +411,7 @@ def _parse_ordinary_case(
             if raw_values.intersection({"", "N/A", "NAN", "NONE", "NULL"})
             else "CONFLICTING_SHAPE"
         )
-        return None, reason, None, None
+        return None, reason, None
 
     a, b = shapes_in
     out_m, out_n = shapes_out[0]
@@ -328,25 +423,25 @@ def _parse_ordinary_case(
             if min(m, n, k_a) > 0 and k_a == k_b and (m, n) == (out_m, out_n):
                 orientations.append((m, n, k_a, transpose_a, transpose_b))
     if not orientations:
-        return None, "CONFLICTING_SHAPE", None, None
+        return None, "CONFLICTING_SHAPE", None
     if len(set(orientations)) != 1:
-        return None, "AMBIGUOUS_TRANSPOSE", None, None
+        return None, "AMBIGUOUS_TRANSPOSE", None
 
     m, n, k, transpose_a, transpose_b = orientations[0]
     mnk = _matmul_mnk(shapes_in, shapes_out)
     if mnk is None or tuple(mnk) != (m, n, k, 1):
-        return None, "CONFLICTING_SHAPE", None, None
+        return None, "CONFLICTING_SHAPE", None
 
     raw_in_dtypes = parse_dtypes(_row_value(row, "Input Data Types"))
     raw_out_dtypes = parse_dtypes(_row_value(row, "Output Data Types"))
     if len(raw_in_dtypes) != 2 or len(raw_out_dtypes) != 1:
-        return None, "MISSING_DTYPE", None, None
+        return None, "MISSING_DTYPE", None
     in_dtypes = [_canonical_dtype(value) for value in raw_in_dtypes]
     out_dtype = _canonical_dtype(raw_out_dtypes[0])
     if any(value is None for value in in_dtypes) or out_dtype is None:
-        return None, "MISSING_DTYPE", None, None
+        return None, "MISSING_DTYPE", None
     if in_dtypes[0] != in_dtypes[1] or in_dtypes[0] != out_dtype:
-        return None, "CONFLICTING_DTYPE", None, None
+        return None, "CONFLICTING_DTYPE", None
     dtype = str(in_dtypes[0])
 
     semantic = {
@@ -357,24 +452,15 @@ def _parse_ordinary_case(
         "implementation_hint": hint,
     }
 
-    duration: Decimal | None
-    try:
-        duration = Decimal(str(_row_value(row, "Duration(us)")))
-        if not duration.is_finite() or duration <= 0:
-            duration = None
-    except (InvalidOperation, TypeError, ValueError):
-        duration = None
-
     evidence = {
         "implementation_hint": hint,
         "input_shapes": shapes_in,
         "output_shapes": shapes_out,
         "dtype": dtype,
         "transpose": semantic["transpose"],
-        "duration_us": format(duration, "f") if duration is not None else "UNAVAILABLE",
     }
     evidence_digest = _sha256_bytes(canonical_json_bytes(evidence))
-    return semantic, None, duration, evidence_digest
+    return semantic, None, evidence_digest
 
 
 def _allocate_scores(weights: Mapping[str, Decimal | int]) -> dict[str, int]:
@@ -401,26 +487,6 @@ def _allocate_scores(weights: Mapping[str, Decimal | int]) -> dict[str, int]:
     return scores
 
 
-def _normalize_decimal_weights(weights: Mapping[str, Decimal]) -> dict[str, int]:
-    """Return a lossless, dimensionless integer ratio for positive Decimals."""
-    if not weights:
-        return {}
-    decimal_places = max(max(-weight.as_tuple().exponent, 0) for weight in weights.values())
-    integers: dict[str, int] = {}
-    for case_id, weight in weights.items():
-        parts = weight.as_tuple()
-        coefficient = 0
-        for digit in parts.digits:
-            coefficient = coefficient * 10 + digit
-        integers[case_id] = coefficient * 10 ** (decimal_places + parts.exponent)
-    divisor = 0
-    for weight in integers.values():
-        divisor = math.gcd(divisor, weight)
-    if divisor <= 0:
-        raise RecipeBuildError("priority weight is not positive")
-    return {case_id: weight // divisor for case_id, weight in integers.items()}
-
-
 def _mapped_ppm(mapped: int, candidates: int) -> int:
     return int(
         (Decimal(mapped) * Decimal(1_000_000) / Decimal(candidates)).to_integral_value(
@@ -440,25 +506,20 @@ def build_recipe(profile_dir: str | Path, producer_revision: str) -> dict[str, A
     layout, selected_paths = _select_profile_sources(source_dir)
     with tempfile.TemporaryDirectory(prefix="llminsight-recipe-") as temporary_dir:
         snapshot_dir = Path(temporary_dir)
-        snapshot_selected = _snapshot_profile(source_dir, snapshot_dir, selected_paths)
-        snapshot_layout, detected_snapshot_sources = _select_profile_sources(snapshot_dir)
-        if (
-            snapshot_layout != layout
-            or [role for role, _ in detected_snapshot_sources]
-            != [role for role, _ in snapshot_selected]
-        ):
-            raise RecipeBuildError("profile snapshot layout is inconsistent")
-        selected_sources = _source_manifest(snapshot_selected)
-        try:
-            profile = load_profile(str(snapshot_dir))
-        except OSError as exc:
-            raise RecipeBuildError("profile snapshot could not be parsed") from exc
-        layout_after_load, sources_after_load = _select_profile_sources(snapshot_dir)
-        if (
-            layout_after_load != layout
-            or _source_manifest(sources_after_load) != selected_sources
-        ):
-            raise RecipeBuildError("profile snapshot changed while being parsed")
+        snapshot_selected = _snapshot_profile(snapshot_dir, selected_paths)
+        with _immutable_snapshot_handles(snapshot_selected) as snapshot_handles:
+            snapshot_layout, detected_snapshot_sources = _select_profile_sources(snapshot_dir)
+            if (
+                snapshot_layout != layout
+                or [role for role, _ in detected_snapshot_sources]
+                != [role for role, _ in snapshot_selected]
+            ):
+                raise RecipeBuildError("profile snapshot layout is inconsistent")
+            selected_sources = _source_manifest(snapshot_handles)
+            try:
+                profile = load_profile(str(snapshot_dir))
+            except OSError as exc:
+                raise RecipeBuildError("profile snapshot could not be parsed") from exc
     kernel_details = profile.kernel_details
     if kernel_details is None:
         raise RecipeBuildError("profile parser did not return kernel details")
@@ -467,7 +528,6 @@ def build_recipe(profile_dir: str | Path, producer_revision: str) -> dict[str, A
     unmapped_counts: Counter[str] = Counter()
     candidate_rows = 0
     mapped_rows = 0
-    all_mapped_durations_valid = True
 
     for raw_row in kernel_details.to_dict(orient="records"):
         kind, classification = _classify_candidate(raw_row.get("Type"))
@@ -478,7 +538,7 @@ def build_recipe(profile_dir: str | Path, producer_revision: str) -> dict[str, A
             unmapped_counts[str(classification)] += 1
             continue
 
-        semantic, reason, duration, row_evidence_digest = _parse_ordinary_case(
+        semantic, reason, row_evidence_digest = _parse_ordinary_case(
             raw_row, str(classification)
         )
         if reason is not None or semantic is None or row_evidence_digest is None:
@@ -486,43 +546,30 @@ def build_recipe(profile_dir: str | Path, producer_revision: str) -> dict[str, A
             continue
 
         mapped_rows += 1
-        if duration is None:
-            all_mapped_durations_valid = False
         key = canonical_json_bytes(semantic)
         group = groups.setdefault(
             key,
             {
                 "semantic": semantic,
                 "count": 0,
-                "duration_total": Decimal(0),
                 "evidence_digests": [],
             },
         )
         group["count"] += 1
-        if duration is not None:
-            group["duration_total"] += duration
         group["evidence_digests"].append(row_evidence_digest)
 
-    priority_basis = (
-        "OBSERVED_TOTAL_DURATION"
-        if mapped_rows > 0 and all_mapped_durations_valid
-        else "FREQUENCY"
-    )
     cases: list[dict[str, Any]] = []
-    observed_weights: dict[str, Decimal] = {}
     for key in sorted(groups):
         group = groups[key]
         semantic = group["semantic"]
         case_id = "case_" + _sha256_bytes(canonical_json_bytes(semantic))
-        if priority_basis == "OBSERVED_TOTAL_DURATION":
-            observed_weights[case_id] = group["duration_total"]
         cases.append(
             {
                 "case_id": case_id,
                 **semantic,
                 "frequency": {"count": group["count"]},
                 "priority": {
-                    "basis": priority_basis,
+                    "basis": "FREQUENCY",
                     "rank": 0,
                     "score_ppm": 0,
                 },
@@ -535,15 +582,10 @@ def build_recipe(profile_dir: str | Path, producer_revision: str) -> dict[str, A
             }
         )
 
-    if priority_basis == "OBSERVED_TOTAL_DURATION":
-        ranking_weights: dict[str, int] = _normalize_decimal_weights(observed_weights)
-        for case in cases:
-            case["priority"]["weight"] = ranking_weights[case["case_id"]]
-    else:
-        ranking_weights = {
-            case["case_id"]: case["frequency"]["count"]
-            for case in cases
-        }
+    ranking_weights = {
+        case["case_id"]: case["frequency"]["count"]
+        for case in cases
+    }
     scores = _allocate_scores(ranking_weights)
     priority_order = sorted(
         ranking_weights,
@@ -569,7 +611,11 @@ def build_recipe(profile_dir: str | Path, producer_revision: str) -> dict[str, A
         "profile_layout": layout,
         "selected_sources": selected_sources,
         "source_manifest_sha256": _sha256_bytes(canonical_json_bytes(selected_sources)),
-        "capture_scope": _capture_scope(profile.meta or {}),
+        "capture_scope": _capture_scope(
+            profile.meta or {},
+            layout,
+            {source["role"] for source in selected_sources},
+        ),
     }
     recipe: dict[str, Any] = {
         "schema": SCHEMA_NAME,
@@ -685,13 +731,18 @@ def validate_recipe(recipe: Mapping[str, Any]) -> None:
         source_roles.append(role)
     if source_roles != sorted(source_roles) or len(source_roles) != len(set(source_roles)):
         raise RecipeValidationError("selected_sources must be sorted and unique")
-    expected_roles = {
+    required_roles = {
         "TORCH_NPU_ASCEND_PROFILER_OUTPUT": ["KERNEL_DETAILS_CSV"],
         "HYBRID_TORCH_NPU_MINDSTUDIO_DB": ["KERNEL_DETAILS_CSV", "MINDSTUDIO_DB"],
         "MINDSTUDIO_DB": ["MINDSTUDIO_DB"],
         "MSPROF_OP_SUMMARY": ["MSPROF_OP_SUMMARY_CSV"],
     }[layout]
-    if source_roles != sorted(expected_roles):
+    allowed_roles = set(required_roles)
+    if "KERNEL_DETAILS_CSV" in required_roles:
+        allowed_roles.update({"COMMUNICATION_JSON", "COMMUNICATION_MATRIX_JSON"})
+    if not set(required_roles).issubset(source_roles) or not set(source_roles).issubset(
+        allowed_roles
+    ):
         raise RecipeValidationError("source roles do not match profile layout")
     manifest_digest = _require_string(
         lineage["source_manifest_sha256"], None, "source manifest digest"
@@ -763,7 +814,6 @@ def validate_recipe(recipe: Mapping[str, Any]) -> None:
     mapped_frequency = 0
     ranks: list[int] = []
     priority_bases: set[str] = set()
-    observed_priority_weights: dict[str, int] = {}
     score_total = 0
     for index, case in enumerate(cases):
         case_obj = _exact_keys(
@@ -798,25 +848,13 @@ def validate_recipe(recipe: Mapping[str, Any]) -> None:
         frequency = _exact_keys(case_obj["frequency"], {"count"}, "frequency")
         count = _require_int(frequency["count"], "frequency count", 1)
         mapped_frequency += count
-        raw_priority = case_obj["priority"]
-        if type(raw_priority) is not dict:
-            raise RecipeValidationError("priority must be an object")
-        basis = _require_string(
-            raw_priority.get("basis"),
-            {"OBSERVED_TOTAL_DURATION", "FREQUENCY"},
-            "priority basis",
+        priority = _exact_keys(
+            case_obj["priority"],
+            {"basis", "rank", "score_ppm"},
+            "priority",
         )
-        priority_keys = (
-            {"basis", "rank", "score_ppm", "weight"}
-            if basis == "OBSERVED_TOTAL_DURATION"
-            else {"basis", "rank", "score_ppm"}
-        )
-        priority = _exact_keys(raw_priority, priority_keys, "priority")
+        basis = _require_string(priority["basis"], {"FREQUENCY"}, "priority basis")
         priority_bases.add(basis)
-        if basis == "OBSERVED_TOTAL_DURATION":
-            observed_priority_weights[case_id] = _require_int(
-                priority["weight"], "priority weight", 1
-            )
         ranks.append(_require_int(priority["rank"], "priority rank", 1))
         score_total += _require_int(priority["score_ppm"], "priority score", 0, 1_000_000)
         source_evidence = _exact_keys(
@@ -847,20 +885,11 @@ def validate_recipe(recipe: Mapping[str, Any]) -> None:
             raise RecipeValidationError("priority ranks are not contiguous")
         if len(priority_bases) != 1 or score_total != 1_000_000:
             raise RecipeValidationError("priority fields are inconsistent")
-        priority_basis = next(iter(priority_bases))
         by_id = {case["case_id"]: case for case in cases}
-        if priority_basis == "FREQUENCY":
-            priority_weights: dict[str, Decimal | int] = {
-                case_id: Decimal(case["frequency"]["count"])
-                for case_id, case in by_id.items()
-            }
-        else:
-            priority_weights = observed_priority_weights
-            weight_divisor = 0
-            for weight in observed_priority_weights.values():
-                weight_divisor = math.gcd(weight_divisor, weight)
-            if weight_divisor != 1:
-                raise RecipeValidationError("observed priority weights are not normalized")
+        priority_weights: dict[str, Decimal | int] = {
+            case_id: Decimal(case["frequency"]["count"])
+            for case_id, case in by_id.items()
+        }
         expected_scores = _allocate_scores(priority_weights)
         expected_order = sorted(
             priority_weights,
@@ -874,8 +903,8 @@ def validate_recipe(recipe: Mapping[str, Any]) -> None:
                 case["priority"]["score_ppm"] != expected_scores[case_id]
                 or case["priority"]["rank"] != expected_ranks[case_id]
             ):
-                raise RecipeValidationError("priority is inconsistent with its weight basis")
-    elif ranks or priority_bases or observed_priority_weights or score_total:
+                raise RecipeValidationError("priority is inconsistent with frequency basis")
+    elif ranks or priority_bases or score_total:
         raise RecipeValidationError("empty cases have priority data")
 
     unmapped = top["unmapped"]
