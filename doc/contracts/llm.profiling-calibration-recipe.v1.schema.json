@@ -1,0 +1,294 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:llm:profiling-calibration-recipe:v1",
+  "title": "LLM profiling-derived calibration recipe v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "readiness",
+    "evidence_role",
+    "lineage",
+    "coverage",
+    "cases",
+    "unmapped",
+    "recipe_sha256"
+  ],
+  "properties": {
+    "schema": {"const": "llm.profiling-calibration-recipe"},
+    "version": {"const": "v1"},
+    "readiness": {"const": "PROFILE_DERIVED_RECIPE"},
+    "evidence_role": {"const": "DERIVED_FROM_PROFILING"},
+    "lineage": {"$ref": "#/$defs/lineage"},
+    "coverage": {"$ref": "#/$defs/coverage"},
+    "cases": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/case"},
+      "uniqueItems": true
+    },
+    "unmapped": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/unmapped"},
+      "uniqueItems": true
+    },
+    "recipe_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nonNegativeInteger": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "positiveInteger": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "dimension": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "ppm": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000000
+    },
+    "captureScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "evidence", "unavailable_reason"],
+      "properties": {
+        "scope": {
+          "enum": [
+            "SINGLE_RANK",
+            "SINGLE_RANK_OR_MATRIX_MISSING",
+            "MULTI_RANK_MATRIX",
+            "UNKNOWN"
+          ]
+        },
+        "evidence": {"enum": ["PARSER_METADATA", "UNAVAILABLE"]},
+        "unavailable_reason": {
+          "enum": ["NONE", "PARSER_SCOPE_NOT_RECORDED"]
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "scope": {
+              "enum": [
+                "SINGLE_RANK",
+                "SINGLE_RANK_OR_MATRIX_MISSING",
+                "MULTI_RANK_MATRIX"
+              ]
+            },
+            "evidence": {"const": "PARSER_METADATA"},
+            "unavailable_reason": {"const": "NONE"}
+          }
+        },
+        {
+          "properties": {
+            "scope": {"const": "UNKNOWN"},
+            "evidence": {"const": "UNAVAILABLE"},
+            "unavailable_reason": {"const": "PARSER_SCOPE_NOT_RECORDED"}
+          }
+        }
+      ]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "content_sha256"],
+      "properties": {
+        "role": {
+          "enum": [
+            "KERNEL_DETAILS_CSV",
+            "MINDSTUDIO_DB",
+            "MSPROF_OP_SUMMARY_CSV",
+            "COMMUNICATION_JSON",
+            "COMMUNICATION_MATRIX_JSON"
+          ]
+        },
+        "content_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "producer_revision",
+        "profile_layout",
+        "selected_sources",
+        "source_manifest_sha256",
+        "capture_scope"
+      ],
+      "properties": {
+        "producer_revision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "profile_layout": {
+          "enum": [
+            "TORCH_NPU_ASCEND_PROFILER_OUTPUT",
+            "HYBRID_TORCH_NPU_MINDSTUDIO_DB",
+            "MINDSTUDIO_DB",
+            "MSPROF_OP_SUMMARY"
+          ]
+        },
+        "selected_sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/source"}
+        },
+        "source_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "capture_scope": {"$ref": "#/$defs/captureScope"}
+      }
+    },
+    "mappingAvailable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "mapped_ppm"],
+      "properties": {
+        "status": {"const": "AVAILABLE"},
+        "mapped_ppm": {"$ref": "#/$defs/ppm"}
+      }
+    },
+    "mappingUnavailable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason"],
+      "properties": {
+        "status": {"const": "UNAVAILABLE"},
+        "reason": {"const": "NO_CANDIDATE_ROWS"}
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_kernel_rows",
+        "candidate_kernel_rows",
+        "mapped_kernel_rows",
+        "unmapped_candidate_kernel_rows",
+        "mapped_case_count",
+        "mapping"
+      ],
+      "properties": {
+        "profile_kernel_rows": {"$ref": "#/$defs/nonNegativeInteger"},
+        "candidate_kernel_rows": {"$ref": "#/$defs/nonNegativeInteger"},
+        "mapped_kernel_rows": {"$ref": "#/$defs/nonNegativeInteger"},
+        "unmapped_candidate_kernel_rows": {"$ref": "#/$defs/nonNegativeInteger"},
+        "mapped_case_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "mapping": {
+          "oneOf": [
+            {"$ref": "#/$defs/mappingAvailable"},
+            {"$ref": "#/$defs/mappingUnavailable"}
+          ]
+        }
+      }
+    },
+    "shape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["m", "n", "k"],
+      "properties": {
+        "m": {"$ref": "#/$defs/dimension"},
+        "n": {"$ref": "#/$defs/dimension"},
+        "k": {"$ref": "#/$defs/dimension"}
+      }
+    },
+    "transpose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["a", "b"],
+      "properties": {
+        "a": {"type": "boolean"},
+        "b": {"type": "boolean"}
+      }
+    },
+    "frequency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count"],
+      "properties": {
+        "count": {"$ref": "#/$defs/positiveInteger"}
+      }
+    },
+    "priority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["basis", "rank", "score_ppm"],
+      "properties": {
+        "basis": {"const": "FREQUENCY"},
+        "rank": {"$ref": "#/$defs/positiveInteger"},
+        "score_ppm": {"$ref": "#/$defs/ppm"}
+      }
+    },
+    "sourceEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest_sha256", "confidence"],
+      "properties": {
+        "digest_sha256": {"$ref": "#/$defs/sha256"},
+        "confidence": {"const": "HIGH"}
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "canonical_op",
+        "shape",
+        "dtype",
+        "transpose",
+        "implementation_hint",
+        "frequency",
+        "priority",
+        "source_evidence"
+      ],
+      "properties": {
+        "case_id": {
+          "type": "string",
+          "pattern": "^case_[0-9a-f]{64}$"
+        },
+        "canonical_op": {"const": "GEMM"},
+        "shape": {"$ref": "#/$defs/shape"},
+        "dtype": {"enum": ["BF16", "FP16", "FP32", "FP8_E4M3"]},
+        "transpose": {"$ref": "#/$defs/transpose"},
+        "implementation_hint": {
+          "enum": ["MATMUL", "MATMUL_V3", "GEMM", "GEMM_V3"]
+        },
+        "frequency": {"$ref": "#/$defs/frequency"},
+        "priority": {"$ref": "#/$defs/priority"},
+        "source_evidence": {"$ref": "#/$defs/sourceEvidence"}
+      }
+    },
+    "unmapped": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "count"],
+      "properties": {
+        "reason": {
+          "enum": [
+            "MISSING_SHAPE",
+            "CONFLICTING_SHAPE",
+            "AMBIGUOUS_TRANSPOSE",
+            "MISSING_DTYPE",
+            "CONFLICTING_DTYPE",
+            "BATCH_MATMUL_SEMANTICS_INCOMPLETE",
+            "GROUPED_MATMUL_SEMANTICS_INCOMPLETE",
+            "ATTENTION_SEMANTICS_INCOMPLETE",
+            "FUSED_SEMANTICS_INCOMPLETE"
+          ]
+        },
+        "count": {"$ref": "#/$defs/positiveInteger"}
+      }
+    }
+  }
+}

@@ -1,0 +1,2 @@
+Name,Type,Accelerator Core,Duration(us),Input Shapes,Input Data Types,Output Shapes,Output Data Types
+whole_scalar_quoted,MatMul,AI_CORE,1,"""2,3;3,5""",BF16;BF16,"""2,5""",BF16

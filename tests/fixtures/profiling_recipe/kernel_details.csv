@@ -1,0 +1,16 @@
+Name,Type,Accelerator Core,Duration(us),Input Shapes,Input Data Types,Output Shapes,Output Data Types,Task ID,Start Time(us)
+synthetic_matmul_a,MatMulV3,AI_CORE,10.0,"3,2;3,5",BF16;BF16,"2,5",BF16,1,0.0
+synthetic_matmul_b,matmulv3,AI_CORE,5.0,"3,2;3,5",DT_BF16;BFLOAT16,"2,5",BF16,2,10.0
+synthetic_gemm,Gemm,AI_CORE,20.0,"4,3;7,3",FLOAT16;DT_FLOAT16,"4,7",FP16,3,15.0
+synthetic_matmul_both_t,MatMul,AI_CORE,2.0,"3,4;7,3",FLOAT;FLOAT,"4,7",DT_FLOAT,4,35.0
+synthetic_gemm_v3,GemmV3,AI_CORE,3.0,"6,4;4,8",FLOAT8_E4M3;DT_FLOAT8_E4M3,"6,8",FP8_E4M3,5,37.0
+synthetic_missing_shape,MatMul,AI_CORE,1.0,N/A,BF16;BF16,"2,5",BF16,6,40.0
+synthetic_conflicting_shape,MatMul,AI_CORE,1.0,"2,3;4,5",BF16;BF16,"2,5",BF16,7,41.0
+synthetic_ambiguous_transpose,MatMul,AI_CORE,1.0,"4,4;4,4",BF16;BF16,"4,4",BF16,8,42.0
+synthetic_missing_dtype,MatMul,AI_CORE,1.0,"2,3;3,5",N/A,"2,5",BF16,9,43.0
+synthetic_conflicting_dtype,MatMul,AI_CORE,1.0,"2,3;3,5",BF16;FP16,"2,5",BF16,10,44.0
+synthetic_batch,BatchMatMul,AI_CORE,1.0,N/A,N/A,N/A,N/A,11,45.0
+synthetic_grouped,GroupedMatmul,AI_CORE,1.0,N/A,N/A,N/A,N/A,12,46.0
+synthetic_attention,FlashAttentionScore,AI_CORE,1.0,N/A,N/A,N/A,N/A,13,47.0
+synthetic_fused,FusedMatMul,AI_CORE,1.0,N/A,N/A,N/A,N/A,14,48.0
+synthetic_non_candidate,Add,AI_VECTOR_CORE,1.0,"2,5;2,5",BF16;BF16,"2,5",BF16,15,49.0
