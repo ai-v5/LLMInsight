@@ -175,7 +175,9 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
             b'{"step":{"collective":{"hcom_AllReduce_1":'
             b'{"Communication Time Info":{"Elapse Time(ms)":1}}},"p2p":{}}}'
         )
-        communication_matrix = b'{"rank":{"collective":{"peer":{}},"p2p":{}}}'
+        communication_matrix = (
+            b'{"rank":{"collective":{"peer":{"Transit Size(MB)":1}},"p2p":{}}}'
+        )
         with tempfile.TemporaryDirectory() as td:
             profile = Path(td)
             shutil.copyfile(FIXTURE_PROFILE / "kernel_details.csv", profile / "kernel_details.csv")
@@ -224,6 +226,39 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
             ("communication.json", b"{}"),
             ("communication_matrix.json", b"{"),
             ("communication_matrix.json", b"{}"),
+            (
+                "communication.json",
+                (
+                    b'{"step":{"collective":{"hcom_AllReduce_1":'
+                    b'{"Communication Time Info":{}}}}}'
+                ),
+            ),
+            (
+                "communication.json",
+                (
+                    b'{"step":{"collective":{"hcom_AllReduce_1":'
+                    b'{"Communication Time Info":{"Elapse Time(ms)":0}}}}}'
+                ),
+            ),
+            (
+                "communication.json",
+                (
+                    b'{"step":{"collective":{"hcom_AllReduce_1":'
+                    b'{"Communication Time Info":{"noise":1}}}}}'
+                ),
+            ),
+            (
+                "communication_matrix.json",
+                b'{"rank":{"collective":{"peer":{}}}}',
+            ),
+            (
+                "communication_matrix.json",
+                b'{"rank":{"collective":{"peer":{"link":{}}}}}',
+            ),
+            (
+                "communication_matrix.json",
+                b'{"rank":{"collective":{"peer":{"label":"x"}}}}',
+            ),
             ("communication.json", communication_matrix),
             ("communication_matrix.json", communication),
             ("communication.json", b"[]"),

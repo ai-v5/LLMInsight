@@ -66,6 +66,21 @@ _COMMUNICATION_INFO_FIELDS = {
     "Communication Time Info",
     "Communication Bandwidth Info",
 }
+_COMMUNICATION_TIME_EVIDENCE_FIELDS = {
+    "Elapse Time(ms)",
+    "Transit Time(ms)",
+    "Wait Time(ms)",
+    "Synchronization Time(ms)",
+    "Idle Time(ms)",
+    "Wait Time Ratio",
+    "Synchronization Time Ratio",
+    "Start Timestamp(us)",
+}
+_TRANSIT_EVIDENCE_FIELDS = {
+    "Transit Size(MB)",
+    "Transit Time(ms)",
+    "Bandwidth(GB/s)",
+}
 _CAPTURE_SCOPES = {
     "SINGLE_RANK",
     "SINGLE_RANK_OR_MATRIX_MISSING",
@@ -216,6 +231,42 @@ def _capture_evidence_object(stream: BinaryIO) -> dict[str, Any]:
     return value
 
 
+def _has_positive_numeric_evidence(value: Mapping[str, Any], fields: set[str]) -> bool:
+    if not value or not set(value).issubset(fields):
+        return False
+    numbers = list(value.values())
+    if any(
+        type(number) not in {int, float}
+        or not math.isfinite(float(number))
+        or number < 0
+        for number in numbers
+    ):
+        return False
+    return any(number > 0 for number in numbers)
+
+
+def _communication_info_has_authority(info: Mapping[str, Any]) -> bool:
+    for field, section in info.items():
+        if type(section) is not dict:
+            return False
+        if field == "Communication Time Info":
+            if not _has_positive_numeric_evidence(
+                section,
+                _COMMUNICATION_TIME_EVIDENCE_FIELDS,
+            ):
+                return False
+        elif not section or any(
+            type(link_evidence) is not dict
+            or not _has_positive_numeric_evidence(
+                link_evidence,
+                _TRANSIT_EVIDENCE_FIELDS,
+            )
+            for link_evidence in section.values()
+        ):
+            return False
+    return bool(info)
+
+
 def _communication_json_has_authority(value: Mapping[str, Any]) -> bool:
     has_collective = False
     for groups in value.values():
@@ -229,12 +280,23 @@ def _communication_json_has_authority(value: Mapping[str, Any]) -> bool:
                     type(info) is not dict
                     or not info
                     or not set(info).issubset(_COMMUNICATION_INFO_FIELDS)
-                    or any(type(section) is not dict for section in info.values())
+                    or not _communication_info_has_authority(info)
                 ):
                     raise RecipeBuildError("communication evidence does not match source role")
                 if not str(op_name).casefold().startswith("total"):
                     has_collective = True
     return has_collective
+
+
+def _matrix_entry_has_authority(value: Mapping[str, Any]) -> bool:
+    if _has_positive_numeric_evidence(value, _TRANSIT_EVIDENCE_FIELDS):
+        return True
+    if not value or any(type(peer_evidence) is not dict for peer_evidence in value.values()):
+        return False
+    return all(
+        _has_positive_numeric_evidence(peer_evidence, _TRANSIT_EVIDENCE_FIELDS)
+        for peer_evidence in value.values()
+    )
 
 
 def _communication_matrix_json_has_authority(value: Mapping[str, Any]) -> bool:
@@ -249,6 +311,7 @@ def _communication_matrix_json_has_authority(value: Mapping[str, Any]) -> bool:
                 if (
                     type(matrix_entry) is not dict
                     or set(matrix_entry).intersection(_COMMUNICATION_INFO_FIELDS)
+                    or not _matrix_entry_has_authority(matrix_entry)
                 ):
                     raise RecipeBuildError("communication evidence does not match source role")
                 has_matrix = True
