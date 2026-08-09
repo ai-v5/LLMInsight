@@ -16,6 +16,7 @@ from unittest import mock
 from llminsight.calibration_recipe import (
     RecipeBuildError,
     RecipeValidationError,
+    _capture_scope,
     build_recipe,
     canonical_json_bytes,
     export_recipe,
@@ -230,6 +231,28 @@ class CalibrationRecipeBuildTests(unittest.TestCase):
             recipe["lineage"]["selected_sources"],
             [{"role": "MSPROF_OP_SUMMARY_CSV", "content_sha256": last_digest}],
         )
+        self.assertEqual(
+            recipe["lineage"]["capture_scope"],
+            {
+                "scope": "UNKNOWN",
+                "evidence": "UNAVAILABLE",
+                "unavailable_reason": "PARSER_SCOPE_NOT_RECORDED",
+            },
+        )
+        expected = {
+            "scope": "UNKNOWN",
+            "evidence": "UNAVAILABLE",
+            "unavailable_reason": "PARSER_SCOPE_NOT_RECORDED",
+        }
+        for layout, source_role in (
+            ("MINDSTUDIO_DB", "MINDSTUDIO_DB"),
+            ("MSPROF_OP_SUMMARY", "MSPROF_OP_SUMMARY_CSV"),
+        ):
+            with self.subTest(layout=layout):
+                self.assertEqual(
+                    _capture_scope({"multi_card": False}, layout, {source_role}),
+                    expected,
+                )
 
     def test_fractional_or_malformed_shape_segments_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -542,6 +565,35 @@ class CalibrationRecipeValidationTests(unittest.TestCase):
         fully_resigned_but_inconsistent["coverage"]["mapped_kernel_rows"] += 1
         _resign(fully_resigned_but_inconsistent)
         self.assertRejected(fully_resigned_but_inconsistent)
+
+        for claimed_scope in ("SINGLE_RANK", "MULTI_RANK_MATRIX"):
+            with self.subTest(claimed_scope=claimed_scope):
+                resigned = copy.deepcopy(self.recipe)
+                resigned["lineage"]["capture_scope"] = {
+                    "scope": claimed_scope,
+                    "evidence": "PARSER_METADATA",
+                    "unavailable_reason": "NONE",
+                }
+                _resign(resigned)
+                self.assertRejected(resigned)
+
+        with_communication_evidence = copy.deepcopy(self.recipe)
+        with_communication_evidence["lineage"]["selected_sources"].append(
+            {"role": "COMMUNICATION_MATRIX_JSON", "content_sha256": "a" * 64}
+        )
+        with_communication_evidence["lineage"]["selected_sources"].sort(
+            key=lambda item: item["role"]
+        )
+        with_communication_evidence["lineage"]["source_manifest_sha256"] = _sha256(
+            canonical_json_bytes(with_communication_evidence["lineage"]["selected_sources"])
+        )
+        with_communication_evidence["lineage"]["capture_scope"] = {
+            "scope": "MULTI_RANK_MATRIX",
+            "evidence": "PARSER_METADATA",
+            "unavailable_reason": "NONE",
+        }
+        _resign(with_communication_evidence)
+        validate_recipe(with_communication_evidence)
 
     def test_rejects_unsorted_duplicate_and_invalid_nested_fields(self) -> None:
         unsorted_cases = copy.deepcopy(self.recipe)

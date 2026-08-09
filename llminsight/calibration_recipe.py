@@ -57,6 +57,10 @@ _SOURCE_ROLES = {
     "COMMUNICATION_JSON",
     "COMMUNICATION_MATRIX_JSON",
 }
+_COMMUNICATION_SOURCE_ROLES = {
+    "COMMUNICATION_JSON",
+    "COMMUNICATION_MATRIX_JSON",
+}
 _CAPTURE_SCOPES = {
     "SINGLE_RANK",
     "SINGLE_RANK_OR_MATRIX_MISSING",
@@ -292,12 +296,8 @@ def _snapshot_profile(
 def _capture_scope(
     meta: Mapping[str, Any], layout: str, source_roles: set[str]
 ) -> dict[str, str]:
-    if layout in {
-        "TORCH_NPU_ASCEND_PROFILER_OUTPUT",
-        "HYBRID_TORCH_NPU_MINDSTUDIO_DB",
-    } and not source_roles.intersection(
-        {"COMMUNICATION_JSON", "COMMUNICATION_MATRIX_JSON"}
-    ):
+    del layout
+    if not source_roles.intersection(_COMMUNICATION_SOURCE_ROLES):
         return {
             "scope": "UNKNOWN",
             "evidence": "UNAVAILABLE",
@@ -310,12 +310,8 @@ def _capture_scope(
         "multi_rank_matrix": "MULTI_RANK_MATRIX",
     }
     scope = scope_map.get(raw_scope)
-    if scope is None and "multi_card" in meta:
-        scope = (
-            "SINGLE_RANK_OR_MATRIX_MISSING"
-            if bool(meta.get("multi_card"))
-            else "SINGLE_RANK"
-        )
+    if scope is None and bool(meta.get("multi_card")):
+        scope = "SINGLE_RANK_OR_MATRIX_MISSING"
     if scope is None:
         return {
             "scope": "UNKNOWN",
@@ -769,6 +765,8 @@ def validate_recipe(recipe: Mapping[str, Any]) -> None:
             raise RecipeValidationError("unknown capture scope lacks unavailable reason")
     elif (evidence, unavailable_reason) != ("PARSER_METADATA", "NONE"):
         raise RecipeValidationError("known capture scope has inconsistent evidence")
+    if not set(source_roles).intersection(_COMMUNICATION_SOURCE_ROLES) and scope != "UNKNOWN":
+        raise RecipeValidationError("known capture scope lacks communication source evidence")
 
     coverage = _exact_keys(
         top["coverage"],

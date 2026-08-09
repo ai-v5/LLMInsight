@@ -26,7 +26,7 @@ lineage 只保存逻辑 source role 与内容 SHA-256，不保存绝对路径、
 | `MINDSTUDIO_DB` | `MINDSTUDIO_DB` |
 | `MSPROF_OP_SUMMARY` | `MSPROF_OP_SUMMARY_CSV` |
 
-同一目录存在多个 `op_summary_*.csv` 时，lineage 与现有 loader 一致绑定按文件名排序后的最后一个 source。只有会影响 cases、coverage 或 capture scope 的文件进入 snapshot；其中 torch_npu capture scope 受 `communication.json` / `communication_matrix.json` 影响，因此两者存在时必须进入同一 content lineage。两者都缺失时不从“文件缺失”推断单卡，scope 固定为 `UNKNOWN + UNAVAILABLE`。
+同一目录存在多个 `op_summary_*.csv` 时，lineage 与现有 loader 一致绑定按文件名排序后的最后一个 source。只有会影响 cases、coverage 或 capture scope 的文件进入 snapshot；其中 torch_npu capture scope 受 `communication.json` / `communication_matrix.json` 影响，因此两者存在时必须进入同一 content lineage。只有 `selected_sources` 包含 `COMMUNICATION_JSON` 或 `COMMUNICATION_MATRIX_JSON` 时，parser metadata 才能支持已知 capture scope；两者都缺失时不得从 `multi_card=False`、文件缺失或完整重签推断单/多 rank，scope 固定为 `UNKNOWN + UNAVAILABLE + PARSER_SCOPE_NOT_RECORDED`。
 
 `producer_revision` 是调用方显式提供的 40 位小写 Git SHA。producer 不从 profile 推断该值。`source_manifest_sha256` 绑定 canonical `selected_sources` 数组；`capture_scope` 只接受 parser metadata，缺失时必须为 `UNKNOWN + UNAVAILABLE + PARSER_SCOPE_NOT_RECORDED`。
 
@@ -72,7 +72,7 @@ JSON Schema 见 `doc/contracts/llm.profiling-calibration-recipe.v1.schema.json`�
 
 - Python `bool` 不得冒充 integer；只有 transpose flags 接受 bool；
 - 拒绝 float、负数、NaN/Infinity、duplicate JSON key 和 path-like string；
-- source role 必须与 layout 一致且排序、去重；
+- source role 必须与 layout 一致且排序、去重；已知 capture scope 必须有 communication source role 支撑，两种 communication source role 均缺失时只接受固定的 `UNKNOWN + UNAVAILABLE + PARSER_SCOPE_NOT_RECORDED`；
 - coverage、frequency、unmapped count、ppm 与 case count 必须闭合；
 - cases/unmapped 必须排序、去重；priority basis 必须为 `FREQUENCY`，rank 必须连续，score 总和必须闭合，并从 frequency 精确重算 rank/score；tie-break 使用 `case_id`；
 - 重新计算 source manifest、case ID 和 recipe digest，任何不一致都拒绝。
