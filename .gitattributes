@@ -1,3 +1,9 @@
 # Shell scripts must keep LF endings — they run on the Linux training host,
 # and a CRLF would make the kernel fail to find the interpreter (`bash\r`).
 *.sh text eol=lf
+
+# Profiling/recipe fixtures are byte-digested by tests (content_sha256 +
+# byte-deterministic export) and must stay LF even under core.autocrlf=true on
+# Windows checkouts, so Windows and Linux see identical fixture bytes.
+tests/fixtures/**/*.csv text eol=lf
+tests/fixtures/**/*.json text eol=lf

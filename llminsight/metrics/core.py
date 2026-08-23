@@ -1013,8 +1013,13 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
     # disjoint from 未掩盖通信 and Free — so this lever stacks with the other two.
     # Kernels already at/above their ceiling are excluded (no further tuning), so the
     # gain is the honest ceiling-relative headroom, not a naive "everything→100%".
+    # 算子极致优化 (op_ceiling_opt) 只覆盖公式建模的 matmul/FA/FAG 行，因此它是否
+    # 可用与「模型级 FLOP 公式覆盖率」无关 —— KDA/causal-conv 等自定义算子未建模时
+    # efficiency_reliable=False（且 counter 校准兜底 estimate），但公式覆盖的算子
+    # 本身的 ceiling 收益仍然成立，杠杆不应被整体隐藏。仅在观测峰值与所选芯片矛盾
+    # （peak_inconsistent，fail-closed）时禁用。
     oco = (eff.get("op_ceiling_opt")
-           if eff.get("available") and eff.get("efficiency_reliable") else None)
+           if eff.get("available") and not eff.get("peak_inconsistent") else None)
     op_reclaim_full = min(float((oco or {}).get("total_reclaim_us") or 0.0), computing)
     # carve the recomputed kernels' ceiling headroom out of 算子余量 so it is disjoint
     # from the 重计算 lever (which removes those kernels wholesale). op_reclaim_full still

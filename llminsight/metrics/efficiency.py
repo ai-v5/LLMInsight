@@ -56,7 +56,7 @@ SPARSE_ATTENTION_TYPES = {"SparseFlashAttention", "SparseFlashAttentionGrad"}
 # denominator even though their semantics-specific FLOP models are not yet
 # implemented.  Omitting them made a GEMM+FA subset look like 100% coverage.
 CUSTOM_MODEL_COMPUTE_MARKERS = (
-    "chunk_kda", "kda_", "gated_delta", "chunk_gla", "causal_conv1d",
+    "chunk_kda", "chunkkda", "kda_", "gated_delta", "chunk_gla", "causal_conv1d",
 )
 # These fused kernels perform repeated sparse gather/scatter work that cannot be
 # reconstructed from the one-time input/output tensor footprint in profiler CSV.
