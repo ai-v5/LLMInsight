@@ -449,6 +449,98 @@ def _estimate_vector_flops(op_type: str, shapes_in, shapes_out) -> Optional[floa
     return factor * n
 
 
+# --------------------------------------------------------------------------- #
+# KDA (Kimi Delta Attention) family — semantic FLOP formulas.
+#
+# KDA is the chunked gated-delta-rule linear attention of Kimi K3 (fla-org
+# `chunk_kda` / `gated_delta_rule`).  Kernel geometry in the profiler CSVs:
+#   q,k,v,g ∈ [B, T, H, K] (head dim K; V=K when no GVA), chunk_size BT=64.
+# Formulas below are order-of-magnitude semantic MACs derived from the recorded
+# tensor shapes — NOT exact instruction counts.  They exist so these key kernels
+# count toward whole-model FLOP coverage instead of being written off as
+# "unmodeled"; the same-capture counter calibration remains the cross-check when
+# shapes are missing (formula returns None and the row falls back to proxy).
+#
+#   chunk fwd:  per token/head ≈ 4·BT·K MAC intra-chunk (Aqk, Akk, w/u WY solve)
+#               + 2·K·V MAC state propagation + output  ->  2·T·H·(4·BT·K + 2·K·V)
+#   bwd split (fractions of the fwd chunk work, fused gradient kernels):
+#       chunk_kda_bwd_kernel_wy_dqkg_fused   ≈ 2×fwd   (dq/dk/dg fused)
+#       chunk_kda_bwd_kernel_intra           ≈ 1×fwd   (intra-chunk gradients)
+#       chunk_kda_bwd_kernel_dAv             ≈ 0.5×fwd (dv only)
+#       chunk_gated_delta_rule_bwd_*         ≈ 2×fwd   (fused dq/dk/dv/dh)
+#       recompute_w_u_fwd_kda_kernel         ≈ 0.5×fwd (WY w/u re-solve)
+#   causal_conv1d (depthwise, width W=4):     2·T·D·W fwd; bwd ≈ 2×fwd (dx+dw)
+#   gate / chunk-cumsum vector kernels:       2·T·H·K   (elementwise + scan)
+# --------------------------------------------------------------------------- #
+_KDA_CHUNK_SIZE = 64
+_KDA_BWD_MULTIPLIERS = {
+    "chunk_kda_bwd_kernel_wy_dqkg_fused": 2.0,
+    "chunk_kda_bwd_kernel_intra": 1.0,
+    "chunk_kda_bwd_kernel_dav": 0.5,
+    "recompute_w_u_fwd_kda_kernel": 0.5,
+    "causal_conv1d_bwd_kernel": 2.0,
+}
+_KDA_GATE_TYPES = {
+    "kda_gate_bwd_kernel",
+    "kda_gate_chunk_cumsum_vector_kernel",
+    "chunk_local_cumsum_vector_kernel",
+}
+
+
+def _kda_chunk_geometry(shapes_in):
+    """(T, H, K, V) from the [B, T, H, K]-shaped chunk operands (q/k/v/g are
+    4-D; intermediate tensors like [B, H, T] decays / scalar params are skipped).
+    V falls back to K (no GVA) when every value tensor matches q/k."""
+    four_d = [s for s in shapes_in if len(s) == 4]
+    if not four_d:
+        # shape-less / non-chunk layout: give up and let the counter proxy decide
+        return None
+    t, h, k = four_d[0][-3], four_d[0][-2], four_d[0][-1]
+    v = four_d[-1][-1] if four_d[-1][-2] == h else k
+    if not (t and h and k and v):
+        return None
+    return float(t), float(h), float(k), float(v)
+
+
+def _kda_causal_conv_flops(shapes_in) -> Optional[float]:
+    """Depthwise causal conv1d: 2·T·D·W.  Activation [1,T,D] (or [T,D]) and
+    depthwise weight [D, W] (width 4 in KDA)."""
+    act = next((s for s in shapes_in if len(s) >= 2), None)
+    wgt = next((s for s in shapes_in if len(s) == 2), None)
+    if act is None:
+        return None
+    t = act[-2]
+    d = act[-1]
+    w = (wgt[-1] if wgt else 4) or 4
+    if not (t and d):
+        return None
+    return 2.0 * t * d * w
+
+
+def _estimate_kda_flops(op_type: str, shapes_in, shapes_out) -> Optional[float]:
+    """Semantic FLOP estimate for a KDA-family kernel (fwd/bwd/gate/conv)."""
+    t = (op_type or "").lower()
+    if t == "causal_conv1d_fwd_kernel":
+        return _kda_causal_conv_flops(shapes_in)
+    if t == "causal_conv1d_bwd_kernel":
+        f = _kda_causal_conv_flops(shapes_in)
+        return 2.0 * f if f else None
+    if t in _KDA_GATE_TYPES:
+        ch = _kda_chunk_geometry(shapes_in)
+        return (2.0 * ch[0] * ch[1] * ch[2]) if ch else None
+    ch = _kda_chunk_geometry(shapes_in)
+    if not ch:
+        return None
+    tt, h, k, v = ch
+    fwd = 2.0 * tt * h * (4.0 * _KDA_CHUNK_SIZE * k + 2.0 * k * v)
+    mult = 1.0
+    if t.startswith("chunk_gated_delta_rule_bwd"):
+        mult = 2.0
+    else:
+        mult = _KDA_BWD_MULTIPLIERS.get(t, 1.0)
+    return fwd * mult
+
+
 def _bound_from_ratios(mac, mte2, vec) -> str:
     mac = mac or 0.0
     mte2 = mte2 or 0.0
@@ -834,6 +926,12 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         elif is_attention:
             flops = _estimate_attention_flops(
                 shapes_in, shapes_out, types[i] in ATTENTION_GRAD_TYPES)
+        elif is_custom_model:
+            # KDA family (chunked gated-delta-rule attention + causal conv1d +
+            # gate/cumsum helpers): semantic formulas so these key kernels count
+            # toward whole-model FLOP coverage.  Falls back to the counter proxy
+            # when shapes are missing (formula returns None).
+            flops = _estimate_kda_flops(types[i], shapes_in, shapes_out)
         elif is_vector:
             # VECTOR-core elementwise / norm / optimizer kernels: approximate FLOPs so
             # their MFU reads against the VECTOR peak and the headroom floor respects
@@ -925,6 +1023,17 @@ def compute_efficiency(prof) -> Dict[str, Any]:
                               and (mbu or 0.0) < _OVERHEAD_EFF)
         if overhead_bound:
             reclaim_us = 0.0
+
+        # Custom KDA formula rows: the semantic FLOP formula is an
+        # order-of-magnitude floor (not an instruction-accurate count), so
+        # duration−ideal reclaim is far too sensitive to formula error to rank
+        # as an optimization candidate — a 2× formula error turns into a 2×
+        # "reclaimable" lie.  Keep the MFU/label display (formula floor vs
+        # counter estimate) but zero the reclaim/waste so these rows never
+        # surface in the optimization ranking or Roofline收益排行.
+        if is_custom_model and flops is not None:
+            reclaim_us = 0.0
+            wasted_us = 0.0
 
         rows.append(
             {

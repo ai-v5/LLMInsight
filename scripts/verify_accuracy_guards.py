@@ -477,14 +477,28 @@ def check_custom_model_families_fail_closed() -> None:
             "aic_mac_ratio": 0.1, "aiv_vec_ratio": 0.5,
         },
         {
+            # shape-less causal conv: the semantic formula cannot apply, so it
+            # must fail closed into the unmodeled set (counter-calibrated only)
             "Type": "causal_conv1d_fwd_kernel", "Name": "causal_conv",
             "Duration(us)": 300.0, "Accelerator Core": "AI_VECTOR_CORE",
-            "Input Shapes": "1,16,64", "Input Data Types": "DT_BF16",
-            "Output Shapes": "1,16,64", "Output Data Types": "DT_BF16",
+            "Input Shapes": "", "Input Data Types": "DT_BF16",
+            "Output Shapes": "", "Output Data Types": "DT_BF16",
             "aic_mac_ratio": 0.0, "aiv_vec_ratio": 0.8,
+        },
+        {
+            # formula-backed KDA chunk kernel: semantic FLOPs, but its reclaim
+            # must stay zero (formula is an order-of-magnitude floor)
+            "Type": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+            "Name": "kda_gdr_fwd", "Duration(us)": 200.0,
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "1,16,4,8;1,16,4,8;1,16,4,8;1,16,4,8",
+            "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;DT_BF16",
+            "Output Shapes": "1,16,4,8", "Output Data Types": "DT_BF16",
+            "aic_mac_ratio": 0.1, "aiv_vec_ratio": 0.4,
         },
     ])
     eff = compute_efficiency(_profile(rows))
+    # coverage stays < 90% (the two shape-less/failed KDA rows are unmodeled)
     assert eff["flop_model_complete"] is False, eff
     assert eff["efficiency_reliable"] is False, eff
     assert eff["useful_flops_total"] is None, eff
@@ -495,8 +509,11 @@ def check_custom_model_families_fail_closed() -> None:
     assert eff["useful_flops_estimated_total"] > eff["useful_flops_modeled_partial"], eff
     assert "chunk_kda_bwd_kernel_wy_dqkg_fused" in eff["unmodeled_flop_types"], eff
     assert "causal_conv1d_fwd_kernel" in eff["unmodeled_flop_types"], eff
+    assert "chunk_gated_delta_rule_fwd_kernel_h_blockdim64" not in eff["unmodeled_flop_types"], eff
     causal = next(x for x in eff["by_type"] if x["type"] == "causal_conv1d_fwd_kernel")
     assert causal["mfu"] is None and causal["reclaim_us"] == 0.0, causal
+    gdr = next(x for x in eff["by_type"] if x["type"] == "chunk_gated_delta_rule_fwd_kernel_h_blockdim64")
+    assert gdr["mfu"] is not None and gdr["reclaim_us"] == 0.0, gdr
 
     causal_only = derive_model(_profile(rows.iloc[[2]].reset_index(drop=True)))
     causal_arch = causal_only.get("architecture", {}).get("value") or ""

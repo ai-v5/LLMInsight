@@ -258,13 +258,24 @@
     const optRows = top.map(t =>
       `<tr><td class="mono">${esc(t.name)}</td><td><span class="tag">${esc(t.bound || "—")}</span></td><td>${fmt.us(t.dur_us)}</td><td>${gainCell(t)}</td></tr>`).join("");
     const displayedMfu = t => t.mfu != null ? t.mfu : t.mfu_estimated;
+    const mfuCell = (t) => {
+      const m = displayedMfu(t);
+      if (m == null) return "—";
+      // custom-KDA rows carry a semantic-formula floor plus a counter-calibrated
+      // estimate; show both and mark the floor so it is not read as measured MFU
+      if (t.mfu != null && t.mfu_estimated != null) {
+        const tip = `语义公式下界 ${fmt.mfu(t.mfu)}；同次采集计数器校准 ${fmt.mfu(t.mfu_estimated)}`;
+        return `<span title="${esc(tip)}">${fmt.mfu(t.mfu)}*</span>`;
+      }
+      return fmt.mfu(m) + (t.mfu == null ? " 估" : "");
+    };
     const macGap = t => {
       if (t.mfu == null || t.mac_ratio_weighted == null) return "—";
       const gap = (t.mac_ratio_weighted - t.mfu) * 100;
       return `${gap >= 0 ? "+" : ""}${gap.toFixed(1)} pp`;
     };
     const byType = ef.by_type.slice(0, 20).map(t =>
-      `<tr><td>${esc(t.type)}</td><td class="mono">${t.dtype ? esc(t.dtype) : "—"}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td><td>${displayedMfu(t) != null ? fmt.mfu(displayedMfu(t)) + (t.mfu == null ? " 估" : "") : "—"}</td><td title="计数器耗时覆盖 ${Number(t.mac_ratio_coverage_pct || 0).toFixed(1)}%">${t.mac_ratio_weighted != null ? fmt.mfu(t.mac_ratio_weighted) : "—"}</td><td>${macGap(t)}</td><td>${t.mbu != null ? fmt.mfu(t.mbu) : "—"}</td><td>${fmt.us(t.reclaim_us != null ? t.reclaim_us : t.wasted_us)}</td></tr>`).join("");
+      `<tr><td>${esc(t.type)}</td><td class="mono">${t.dtype ? esc(t.dtype) : "—"}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td><td>${mfuCell(t)}</td><td title="计数器耗时覆盖 ${Number(t.mac_ratio_coverage_pct || 0).toFixed(1)}%">${t.mac_ratio_weighted != null ? fmt.mfu(t.mac_ratio_weighted) : "—"}</td><td>${macGap(t)}</td><td>${t.mbu != null ? fmt.mfu(t.mbu) : "—"}</td><td>${fmt.us(t.reclaim_us != null ? t.reclaim_us : t.wasted_us)}</td></tr>`).join("");
     const sparseMac = (ef.by_type || []).filter(t =>
       (t.type === "SparseFlashAttention" || t.type === "SparseFlashAttentionGrad") &&
       t.mfu != null && t.mac_ratio_weighted != null);
@@ -305,7 +316,7 @@
         ${panel("优化空间排行 (Top 15)", "按到各算子 MFU 天花板的可回收时间排序；颜色 = 瓶颈类型", `<div id="ef-waste" class="chart tall"></div>`)}
       </div>
       ${panel("优化候选明细 (Top 15)", "优化收益 = 到 MFU 天花板的可回收时间（matmul/FA/FAG 封顶各自天花板，其余到 Roofline）；已达天花板的算子不入表；括号为优化后的 MFU / MBU", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>算子</th><th>瓶颈</th><th>当前耗时</th><th>优化收益</th></tr></thead><tbody>${optRows}</tbody></table></div>`, "span-2")}
-      ${panel("按算子类型 MFU / MBU / 可回收（MFU 按各算子 cube/vector 峰值）", "“估”=同次采集计数器校准值；MAC−MFU 仅对公式 MFU 比较，不代表可直接回收", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>dtype</th><th>Count</th><th>耗时</th><th>MFU/估算</th><th>MAC周期占比(加权)</th><th>MAC−MFU</th><th>MBU</th><th>可回收(vs天花板)</th></tr></thead><tbody>${byType}</tbody></table></div>`, "span-2")}
+      ${panel("按算子类型 MFU / MBU / 可回收（MFU 按各算子 cube/vector 峰值）", "“估”=同次采集计数器校准值；“*”=语义公式下界（KDA chunk/conv，数量级估算，悬停见计数器校准对比）；MAC−MFU 仅对公式 MFU 比较，不代表可直接回收；公式下界行不参与优化排行", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>dtype</th><th>Count</th><th>耗时</th><th>MFU/估算</th><th>MAC周期占比(加权)</th><th>MAC−MFU</th><th>MBU</th><th>可回收(vs天花板)</th></tr></thead><tbody>${byType}</tbody></table></div>`, "span-2")}
       ${ob.length ? panel(`开销主导算子（MFU & MBU 双低 &lt;2%，共 ${fmt.us(ef.overhead_bound_us)}）`, "这些算子算力和带宽利用率都≈0 → 时间主要花在 kernel launch / 标量 / 调度开销，不在 compute/memory roofline 上。roofline 的「优化到 100%」对它们不成立，已从上方优化候选 / 收益中剔除、单列于此。优化方向在 kernel 层：算子融合、增大 tiling、减少 launch 次数、避免 scalar 路径。", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>dtype</th><th>Count</th><th>耗时</th><th>MFU</th><th>MBU</th></tr></thead><tbody>${obRows}</tbody></table></div>`, "span-2") : ""}`;
     charts([
       ...(sparseMac.length ? [{ id: "ef-sparse-mac", option: mfuMacCompare(sparseMac) }] : []),
