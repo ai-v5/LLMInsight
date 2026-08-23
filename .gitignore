@@ -42,3 +42,6 @@ Thumbs.db
 
 # --- Node (frontend uses CDN, but ignore just in case) ---
 node_modules/
+
+# --- DSH worktrees ---
+.dsh_worktrees/
