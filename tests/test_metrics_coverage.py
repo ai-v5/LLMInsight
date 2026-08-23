@@ -55,6 +55,13 @@ def _write_synthetic_profile(root: Path) -> None:
          "DT_BF16;DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;FLOAT",
          "1,8,4,16", "DT_BF16",
          "0.28", "0.3", "0.0", "0.1", "40"],
+        # A KDA-marker custom kernel with NO recorded shapes: the semantic FLOP
+        # formula cannot apply, so it stays unmodeled (and keeps formula coverage
+        # <90%) while its MAC/vector counters still keep the estimate available.
+        ["aclnnKdaUnknown_UnmodeledKernel", "kda_unmodeled_custom",
+         "MIX_AIC", "15000.0",
+         "", "", "", "",
+         "0.1", "0.1", "0.0", "0.1", "40"],
     ]
     with kd.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh)
@@ -80,23 +87,59 @@ class WholeModelCoverageTests(unittest.TestCase):
             prof = load_profile(str(root))
             return compute_all(prof)
 
-    def test_chunkkdafwd_camelcase_is_model_compute_and_gets_counter_estimate(self) -> None:
+    def test_chunkkdafwd_has_semantic_flops_and_counter_estimate(self) -> None:
         m = self._build()
         eff = m["efficiency"]
-        # Custom KDA kernels enter the model-compute denominator (unmodeled list,
-        # no semantic formula yet).
-        self.assertIn("ChunkKdaFwd", eff["unmodeled_flop_types"])
-        self.assertIn("chunk_kda_bwd_kernel_intra", eff["unmodeled_flop_types"])
-        # CamelCase ChunkKdaFwd now gets the same-capture counter-calibrated
-        # MFU estimate as the underscore-named KDA kernels (was None before).
+        # Formula coverage: ChunkKdaFwd + chunk_kda_bwd are now formula-backed
+        # (semantic KDA chunk FLOPs), so they leave the unmodeled list; the
+        # shape-less kda_unmodeled_custom kernel stays unmodeled.
+        self.assertNotIn("ChunkKdaFwd", eff["unmodeled_flop_types"])
+        self.assertNotIn("chunk_kda_bwd_kernel_intra", eff["unmodeled_flop_types"])
+        self.assertIn("kda_unmodeled_custom", eff["unmodeled_flop_types"])
+        # Modeled duration now includes the two formula-backed KDA rows
+        # (397.0 + 20000.0 + 20000.0), not the shape-less custom row.
+        self.assertAlmostEqual(float(eff["model_compute_modeled_us"]), 40397.0, delta=1.0)
+        self.assertGreater(float(eff["model_compute_total_us"]), 55000.0)
+        # Counter calibration still estimates the KDA kernels' MFU.
         by_type = {t["type"]: t for t in eff["by_type"]}
         fwd = by_type.get("ChunkKdaFwd")
         self.assertIsNotNone(fwd)
-        self.assertIsNotNone(fwd.get("mfu_estimated"),
-                             "ChunkKdaFwd should carry a counter-calibrated MFU estimate")
         self.assertEqual(fwd.get("mfu_estimate_basis"), "same_capture_counter_calibration")
         bwd = by_type.get("chunk_kda_bwd_kernel_intra")
         self.assertIsNotNone(bwd.get("mfu_estimated"))
+
+    def test_kda_flop_formulas(self) -> None:
+        from llminsight.metrics.efficiency import _estimate_kda_flops
+        # chunk fwd: 2·T·H·(4·BT·K + 2·K·V) with T=8 H=4 K=16 V=16
+        f = _estimate_kda_flops("ChunkKdaFwd",
+                                [[1, 8, 4, 16]] * 4, [[1, 8, 4, 16]])
+        self.assertAlmostEqual(float(f), 294912.0, delta=1.0)
+        # bwd multipliers
+        f2 = _estimate_kda_flops("chunk_kda_bwd_kernel_wy_dqkg_fused",
+                                 [[1, 8, 4, 16]] * 5, [])
+        self.assertAlmostEqual(float(f2) / float(f), 2.0, delta=1e-6)
+        f3 = _estimate_kda_flops("chunk_kda_bwd_kernel_dAv",
+                                 [[1, 8, 4, 16]] * 3, [])
+        self.assertAlmostEqual(float(f3) / float(f), 0.5, delta=1e-6)
+        f4 = _estimate_kda_flops("chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64",
+                                 [[1, 8, 4, 16]] * 4, [])
+        self.assertAlmostEqual(float(f4) / float(f), 2.0, delta=1e-6)
+        f5 = _estimate_kda_flops("recompute_w_u_fwd_kda_kernel",
+                                 [[1, 8, 4, 16]] * 3, [])
+        self.assertAlmostEqual(float(f5) / float(f), 0.5, delta=1e-6)
+        # causal conv1d: depthwise W=4 -> 2·T·D·W
+        fc = _estimate_kda_flops("causal_conv1d_fwd_kernel",
+                                 [[1, 8, 1024], [1024, 4]], [[1, 8, 1024]])
+        self.assertAlmostEqual(float(fc), 2 * 8 * 1024 * 4, delta=1.0)
+        fcb = _estimate_kda_flops("causal_conv1d_bwd_kernel",
+                                  [[1, 8, 1024], [1, 8, 1024], [1024, 4], [1, 8, 1024]], [])
+        self.assertAlmostEqual(float(fcb), 2 * float(fc), delta=1.0)
+        # gate/cumsum: 2·T·H·K
+        fg = _estimate_kda_flops("kda_gate_bwd_kernel",
+                                 [[1, 8, 4, 16], [4], [64], [1, 8, 4, 16]], [])
+        self.assertAlmostEqual(float(fg), 2 * 8 * 4 * 16, delta=1.0)
+        # shape-less -> None (falls back to counter proxy)
+        self.assertIsNone(_estimate_kda_flops("ChunkKdaFwd", [], []))
 
     def test_estimate_mode_still_surfaces_op_ceiling_lever_and_compute_headroom(self) -> None:
         m = self._build()
