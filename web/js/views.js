@@ -396,8 +396,8 @@
         ${metric("集合通信次数", fmt.int(cm.count))}
         ${metric("总 Elapse", fmt.ms(cm.total_elapse_ms), { foot: "wall-clock" })}
         ${metric("平均等待占比", fmt.pct(cm.overall_wait_pct), { tone: "bad", barPct: cm.overall_wait_pct })}
-        ${metric("平均带宽(含等待)", cm.overall_bandwidth_with_wait_gbps != null ? cm.overall_bandwidth_with_wait_gbps + " GB/s" : "—", { foot: cm.overall_bandwidth_with_wait_gbps != null ? "Σ Transit ÷ Σ Elapse" : "Transit≈0（单卡/全等待）" })}
-        ${metric("有效带宽(去等待)", cm.overall_bandwidth_gbps != null ? cm.overall_bandwidth_gbps + " GB/s" : "—", { foot: cm.overall_bandwidth_gbps != null ? "Σ Transit ÷ Σ Transit Time" : "Transit≈0（单卡/全等待）", tone: cm.overall_bandwidth_gbps != null ? "good" : undefined })}
+        ${metric("平均带宽(含等待)", cm.overall_bandwidth_with_wait_gbps != null ? cm.overall_bandwidth_with_wait_gbps + " GB/s" : "—", { foot: cm.overall_bandwidth_with_wait_gbps != null ? "Σ Transit ÷ Σ Elapse" : "采集未记录链路带宽（Transit≈0）" })}
+        ${metric("有效带宽(去等待)", cm.overall_bandwidth_gbps != null ? cm.overall_bandwidth_gbps + " GB/s" : "—", { foot: cm.overall_bandwidth_gbps != null ? "Σ Transit ÷ Σ Transit Time" : "采集未记录链路带宽（Transit≈0）", tone: cm.overall_bandwidth_gbps != null ? "good" : undefined })}
       </div>
       ${bdHtml}
       ${banner("info", "ℹ️", esc(cm.note))}
