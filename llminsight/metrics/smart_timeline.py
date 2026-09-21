@@ -33,6 +33,17 @@ from ..config import SETTINGS
 from ..parser.trace import iter_events, event_ts_us
 from .efficiency import MATMUL_TYPES, ATTENTION_TYPES
 
+# Mc2 fused expert kernels launch an AI_CPU wrapper around a MIX_AIC task.  The
+# wrapper names contain both ``AlltoAllv`` and ``GroupedMatMul``; generic name
+# heuristics would therefore misclassify them as Communication or Cube when
+# there is no kernel-index metadata for the AI_CPU row.  Keep this list narrow:
+# these are MIX lane occupants, not HCCL collectives and not ordinary GEMMs.
+MIX_AICPU_KERNEL_TYPES = frozenset({
+    "AlltoAllvGroupedMatMulMc2AicpuKernel",
+    "GroupedMatMulAlltoAllvMc2AicpuKernel",
+})
+_MIX_AICPU_KERNEL_NAMES = frozenset(name.lower() for name in MIX_AICPU_KERNEL_TYPES)
+
 # stream key -> (label, color). Colors borrowed from LLMperf's lane palette.
 STREAMS = [
     ("cube",       "Cube / AI_CORE",  "#1565C0"),
@@ -45,7 +56,7 @@ STREAMS = [
 DEVICE_PROC = "Ascend Hardware"
 COMM_PROC = "Communication"
 
-_GEOM_VERSION = "v7"  # geometry cache also tracks the active per-name FLOP model
+_GEOM_VERSION = "v8"  # geometry cache also tracks lane classification/model changes
 
 
 def _kernel_index_signature(kindex: Dict[str, Any]) -> str:
@@ -79,6 +90,8 @@ def _stream_from_meta(typ: Optional[str], core: Optional[str]) -> str:
     """Lane for a device slice that matched kernel_index (has Type / Core)."""
     t = typ or ""
     c = (core or "").upper()
+    if t in MIX_AICPU_KERNEL_TYPES:
+        return "mix"
     if t in ATTENTION_TYPES:
         return "flash_attn"
     if t in MATMUL_TYPES or "CUBE" in c or "AI_CORE" in c or "AICORE" in c:
@@ -96,6 +109,8 @@ def _stream_from_name(name: str) -> str:
     """Heuristic lane for a device slice with no kernel_index match (rare —
     mostly AI_CPU dispatch ops, which efficiency.py excludes from the index)."""
     n = (name or "").lower()
+    if n in _MIX_AICPU_KERNEL_NAMES:
+        return "mix"
     if "flashattention" in n or "fusedinferattention" in n or \
             "promptflashattention" in n or "increflashattention" in n:
         return "flash_attn"

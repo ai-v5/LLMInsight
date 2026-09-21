@@ -160,6 +160,36 @@ class WholeModelCoverageTests(unittest.TestCase):
         self.assertLess(cb.get("ideal_matmul_us") or 0.0,
                         m["overview"]["us"]["computing"])
 
+    def test_mc2_aicpu_wrappers_use_mix_lane(self) -> None:
+        from llminsight.metrics.efficiency import (
+            _is_custom_model_compute_type,
+            _is_kda_model_compute_type,
+        )
+        from llminsight.metrics.smart_timeline import _stream_from_meta, _stream_from_name
+
+        names = (
+            "AlltoAllvGroupedMatMulMc2AicpuKernel",
+            "GroupedMatMulAlltoAllvMc2AicpuKernel",
+        )
+        for name in names:
+            # Name fallback is used for trace events because efficiency excludes
+            # AI_CPU dispatch rows from the kernel index.
+            self.assertEqual(_stream_from_name(name), "mix")
+            # Metadata path is used by the msprof/task_time timeline exporter.
+            self.assertEqual(_stream_from_meta(name, "AI_CPU"), "mix")
+
+        # The paired MIX_AIC task is a fused model-compute family; it must not
+        # disappear from whole-model MFU coverage just because its FLOPs are
+        # counter-calibrated rather than shape-formula backed.
+        self.assertTrue(_is_custom_model_compute_type("AlltoAllvGroupedMatMul"))
+        self.assertTrue(_is_custom_model_compute_type("GroupedMatMulAlltoAllv"))
+        self.assertFalse(_is_kda_model_compute_type("AlltoAllvGroupedMatMul"))
+        self.assertFalse(_is_kda_model_compute_type("GroupedMatMulAlltoAllv"))
+
+        # Ordinary alltoall/HCCL dispatch remains Communication; this guard keeps
+        # the narrow MC2 exception from swallowing real collectives.
+        self.assertEqual(_stream_from_name("hcom_alltoallv_AicpuKernel"), "comm")
+
 
 if __name__ == "__main__":
     unittest.main()

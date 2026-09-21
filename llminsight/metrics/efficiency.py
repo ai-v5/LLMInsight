@@ -55,8 +55,14 @@ SPARSE_ATTENTION_TYPES = {"SparseFlashAttention", "SparseFlashAttentionGrad"}
 # They are model work, so they belong in the whole-model FLOP coverage
 # denominator even though their semantics-specific FLOP models are not yet
 # implemented.  Omitting them made a GEMM+FA subset look like 100% coverage.
-CUSTOM_MODEL_COMPUTE_MARKERS = (
+KDA_MODEL_COMPUTE_MARKERS = (
     "chunk_kda", "chunkkda", "kda_", "gated_delta", "chunk_gla", "causal_conv1d",
+)
+CUSTOM_MODEL_COMPUTE_MARKERS = KDA_MODEL_COMPUTE_MARKERS + (
+    # MC2 fused MoE dispatch+GroupedMatMul kernels.  The paired AI_CPU wrapper
+    # is excluded from efficiency rows, while the MIX_AIC task carries the
+    # model compute and must participate in coverage/counter-calibrated MFU.
+    "alltoallvgroupedmatmul", "groupedmatmulalltoallv",
 )
 # These fused kernels perform repeated sparse gather/scatter work that cannot be
 # reconstructed from the one-time input/output tensor footprint in profiler CSV.
@@ -81,6 +87,11 @@ _OVERHEAD_EFF = 0.02
 def _is_custom_model_compute_type(op_type: str) -> bool:
     value = (op_type or "").lower()
     return any(marker in value for marker in CUSTOM_MODEL_COMPUTE_MARKERS)
+
+
+def _is_kda_model_compute_type(op_type: str) -> bool:
+    value = (op_type or "").lower()
+    return any(marker in value for marker in KDA_MODEL_COMPUTE_MARKERS)
 
 
 def _op_class(op_type: str) -> Optional[str]:
@@ -754,7 +765,8 @@ def _estimate_recompute_from_rows(
         ),
         "basis": (
             "MatMul 方向/次数相位拆分 + forward/backward 超额调用 + 显式 recompute kernel；"
-            "未建模 KDA/causal-conv 工作量使用同一采集内 GEMM/Attention 校准后的 MAC/Vector 周期代理。"
+            "未建模 KDA/causal-conv/MC2 融合 MoE 工作量使用同一采集内 "
+            "GEMM/Attention 校准后的 MAC/Vector 周期代理。"
         ),
     }
 
@@ -926,12 +938,17 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         elif is_attention:
             flops = _estimate_attention_flops(
                 shapes_in, shapes_out, types[i] in ATTENTION_GRAD_TYPES)
-        elif is_custom_model:
+        elif _is_kda_model_compute_type(types[i]):
             # KDA family (chunked gated-delta-rule attention + causal conv1d +
             # gate/cumsum helpers): semantic formulas so these key kernels count
             # toward whole-model FLOP coverage.  Falls back to the counter proxy
             # when shapes are missing (formula returns None).
             flops = _estimate_kda_flops(types[i], shapes_in, shapes_out)
+        elif is_custom_model:
+            # Other recognized model-compute families (currently MC2 fused MoE)
+            # have no shape-safe semantic FLOP formula.  Keep them in the model
+            # coverage denominator and use only the same-capture counter estimate.
+            flops = None
         elif is_vector:
             # VECTOR-core elementwise / norm / optimizer kernels: approximate FLOPs so
             # their MFU reads against the VECTOR peak and the headroom floor respects
@@ -1278,7 +1295,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     model_total_us = sum(r["dur_us"] for r in model_rows)
     model_modeled_us = sum(r["dur_us"] for r in modeled_model_rows)
     # Calibrate raw MAC/Vector active-cycle work against the formula-backed rows
-    # from THIS capture.  This converts custom KDA/causal-conv cycles into an
+    # from THIS capture.  This converts custom KDA/causal-conv/MC2 fused-MoE cycles into an
     # empirical FLOP estimate without importing model-family constants.
     counter_reference_rows = [
         r for r in supported_model_rows
