@@ -25,10 +25,10 @@ PORT="${PORT:-8765}"
 PIDFILE="$REPO_DIR/.insight.pid"
 LOGFILE="$REPO_DIR/insight.log"
 
-# The LLM is enabled by default (the bundled key in secret/api_key.txt
-# authorizes it); override with LLMINSIGHT_LLM_ENABLED=0 for a pure
-# rule-engine run. Only the KB-level metric summary is ever sent upstream.
-export LLMINSIGHT_LLM_ENABLED="${LLMINSIGHT_LLM_ENABLED:-1}"
+# Keep outbound LLM calls disabled by default. Set
+# LLMINSIGHT_LLM_ENABLED=1 explicitly when the operator has approved sending
+# the KB-level metric summary to the configured provider.
+export LLMINSIGHT_LLM_ENABLED="${LLMINSIGHT_LLM_ENABLED:-0}"
 export PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONIOENCODING="utf-8"
 

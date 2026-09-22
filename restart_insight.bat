@@ -27,10 +27,10 @@ if not defined PORT set "PORT=8765"
 set "PIDFILE=%REPO_DIR%\.insight.pid"
 set "LOGFILE=%REPO_DIR%\insight.log"
 
-REM The LLM is enabled by default (the bundled key in secret/api_key.txt authorizes
-REM it); set LLMINSIGHT_LLM_ENABLED=0 for a pure rule-engine run. Only the KB-level
-REM metric summary is ever sent upstream.
-if not defined LLMINSIGHT_LLM_ENABLED set "LLMINSIGHT_LLM_ENABLED=1"
+REM Keep outbound LLM calls disabled by default. Set LLMINSIGHT_LLM_ENABLED=1
+REM explicitly when the operator has approved sending the KB-level metric
+REM summary to the configured provider.
+if not defined LLMINSIGHT_LLM_ENABLED set "LLMINSIGHT_LLM_ENABLED=0"
 set "PYTHONIOENCODING=utf-8"
 if defined PYTHONPATH ( set "PYTHONPATH=%REPO_DIR%;%PYTHONPATH%" ) else ( set "PYTHONPATH=%REPO_DIR%" )
 
