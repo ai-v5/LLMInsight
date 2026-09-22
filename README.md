@@ -25,8 +25,8 @@ pip install -r requirements.txt
 .\restart_insight.bat
 ```
 
-脚本会停止旧进程并启动服务。打开 <http://127.0.0.1:8765/>，选择要分析的
-Profiling 目录。
+脚本会停止旧进程并启动服务。服务固定绑定 `127.0.0.1`，不支持远程监听。打开
+<http://127.0.0.1:8765/>，选择要分析的 Profiling 目录。
 
 ### Linux/macOS
 

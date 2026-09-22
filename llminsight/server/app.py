@@ -48,6 +48,7 @@ def _resolve_web_dir() -> str:
 
 
 WEB_DIR = _resolve_web_dir()
+LOOPBACK_HOST = "127.0.0.1"
 
 _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -464,7 +465,11 @@ def _autoload_enabled() -> bool:
         "1", "true", "yes", "on")
 
 
-def serve(host: str = "127.0.0.1", port: int = 8000, open_browser: bool = True) -> None:
+def serve(host: str = LOOPBACK_HOST, port: int = 8000, open_browser: bool = True) -> None:
+    if host != LOOPBACK_HOST:
+        raise ValueError(
+            f"LLMInsight 仅允许绑定 {LOOPBACK_HOST}，不支持远程监听 (got {host!r})"
+        )
     # Lazy by default: start idle and let the user choose a profiling directory in
     # the UI (POST /api/load). The socket therefore opens immediately. Set
     # LLMINSIGHT_AUTOLOAD=1 to eagerly (re)load the default / LLMINSIGHT_DATA_DIR

@@ -4,7 +4,6 @@
 # Usage:
 #   ./restart_insight.sh                          # restart on default host/port
 #   PORT=9000 ./restart_insight.sh                # override port
-#   HOST=0.0.0.0 PORT=9000 ./restart_insight.sh   # bind all interfaces
 #   LLMINSIGHT_LLM_ENABLED=0 ./restart_insight.sh # start with the LLM off
 #
 # It finds the running instance in three ways, in order: the .insight.pid file,
@@ -19,8 +18,12 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
-# --- config (all overridable from the environment) -------------------------
-HOST="${HOST:-127.0.0.1}"
+# --- config ---------------------------------------------------------------
+if [[ "${HOST:-127.0.0.1}" != "127.0.0.1" ]]; then
+    echo "[restart_insight] ERROR: HOST must be 127.0.0.1; remote listening is disabled." >&2
+    exit 2
+fi
+HOST="127.0.0.1"
 PORT="${PORT:-8765}"
 PIDFILE="$REPO_DIR/.insight.pid"
 LOGFILE="$REPO_DIR/insight.log"

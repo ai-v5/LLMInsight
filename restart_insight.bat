@@ -7,7 +7,6 @@ REM Usage (run from a terminal, cmd.exe or PowerShell - do NOT double-click, or 
 REM server dies when the console closes):
 REM   restart_insight.bat                                  : restart on default host/port
 REM   set "PORT=9000" & restart_insight.bat                : override port
-REM   set "HOST=0.0.0.0" & set "PORT=9000" & restart_insight.bat   : bind all interfaces
 REM   set "LLMINSIGHT_LLM_ENABLED=0" & restart_insight.bat : start with the LLM off
 REM
 REM It finds the running instance three ways, in order: the .insight.pid file, a
@@ -21,8 +20,12 @@ set "REPO_DIR=%~dp0"
 if "%REPO_DIR:~-1%"=="\" set "REPO_DIR=%REPO_DIR:~0,-1%"
 cd /d "%REPO_DIR%" || ( echo [restart_insight] ERROR: cannot cd to %REPO_DIR% 1>&2 & exit /b 1 )
 
-REM --- config (all overridable from the environment) -------------------------
-if not defined HOST set "HOST=127.0.0.1"
+REM --- config ---------------------------------------------------------------
+if defined HOST if not "%HOST%"=="127.0.0.1" (
+  echo [restart_insight] ERROR: HOST must be 127.0.0.1; remote listening is disabled. 1>&2
+  exit /b 2
+)
+set "HOST=127.0.0.1"
 if not defined PORT set "PORT=8765"
 set "PIDFILE=%REPO_DIR%\.insight.pid"
 set "LOGFILE=%REPO_DIR%\insight.log"
@@ -34,9 +37,7 @@ if not defined LLMINSIGHT_LLM_ENABLED set "LLMINSIGHT_LLM_ENABLED=0"
 set "PYTHONIOENCODING=utf-8"
 if defined PYTHONPATH ( set "PYTHONPATH=%REPO_DIR%;%PYTHONPATH%" ) else ( set "PYTHONPATH=%REPO_DIR%" )
 
-REM 0.0.0.0 isn't directly pollable; check readiness over loopback instead.
-set "CHECKHOST=%HOST%"
-if "%HOST%"=="0.0.0.0" set "CHECKHOST=127.0.0.1"
+set "CHECKHOST=127.0.0.1"
 
 REM --- pick a python interpreter ---------------------------------------------
 REM Prefer the project-local virtualenv (.venv) so the server runs with the repo's
