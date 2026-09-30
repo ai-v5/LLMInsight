@@ -215,6 +215,90 @@
     };
   }
 
+  // ============================ 矩阵算力 Matrix power ============================ //
+  V.matrix_power = async function (root) {
+    const mp = await api("/api/matrix_power");
+    if (!mp.available) {
+      root.innerHTML = `<div class="empty">${esc(mp.reason || "当前 profiling 没有可识别的矩阵算子")}</div>`;
+      return;
+    }
+    const groups = mp.groups || [];
+    const rows = mp.rows || [];
+    const operators = [...new Set(rows.map(r => r.operator).filter(Boolean))].sort();
+    const dtypes = [...new Set(rows.map(r => r.dtype).filter(Boolean))].sort();
+    const state = { sort: "dur_us", dir: "desc", operators: new Set(operators), dtypes: new Set(dtypes) };
+    const fmtM = value => value == null ? "—" : fmt.mfu(value);
+    const filterBox = (field, values, label) => `<details class="matrix-filter"><summary>筛选</summary><div class="matrix-filter-menu">`
+      + `<label><input type="checkbox" data-filter-all="${field}" checked> 全选</label>`
+      + values.map(value => `<label><input type="checkbox" data-filter="${field}" value="${esc(value)}" checked> ${esc(value)}</label>`).join("")
+      + `</div></details>`;
+    const head = (field, label, filter) => `<th><button class="matrix-sort" data-sort="${field}">${label}<span class="sort-mark"></span></button>${filter || ""}</th>`;
+    root.innerHTML = `
+      <div class="matrix-intro">${banner("info", "▦", `<strong>矩阵算力</strong>按 ${esc(mp.kernel_count)} 个 MatMul / GroupedMatmul / FA / KDA 矩阵相关 kernel 展开；精度以矩阵输入 dtype 归一为 FP4 / FP8 / FP16 / BF16 / FP32。MFU 为算子级 CUBE 峰值分母，芯片：<strong>${esc((mp.chip || {}).name || "—")}</strong>。`)}</div>
+      <div class="grid cols-2">
+        ${panel("算子@dtype 耗时占比", "矩阵相关 kernel 的 device duration", `<div id="matrix-donut" class="chart"></div>`)}
+        ${panel("算子@dtype MFU", "按 FLOPs /（对应 dtype 峰值 × 耗时）聚合", `<div class="tbl-wrap matrix-summary-wrap"><table class="tbl matrix-summary"><thead><tr><th>算子@dtype</th><th>次数</th><th>耗时</th><th>占比</th><th>MFU</th><th>MBU</th></tr></thead><tbody>${groups.map(g => `<tr><td class="mono">${esc(g.label)}</td><td>${fmt.int(g.count)}</td><td>${fmt.us(g.dur_us)}</td><td>${fmt.pct(g.dur_pct, 2)}</td><td>${fmtM(g.mfu)}</td><td>${fmtM(g.mbu)}</td></tr>`).join("")}</tbody></table></div>`)}
+      </div>
+      ${panel("矩阵算子明细", "点击表头排序；筛选菜单支持多选。shape 为 profiler 记录的输入 → 输出，— 表示该字段无法从本次采集闭合。", `<div class="matrix-toolbar"><span class="matrix-count"></span><button class="btn ghost matrix-reset">重置筛选</button></div><div class="tbl-wrap matrix-detail-wrap"><table class="tbl matrix-detail"><thead><tr>
+        ${head("operator", "算子", filterBox("operator", operators, "算子"))}
+        ${head("dtype", "dtype", filterBox("dtype", dtypes, "dtype"))}
+        ${head("shape", "shape")}${head("dur_us", "耗时")}${head("mfu", "MFU")}${head("mbu", "MBU")}
+      </tr></thead><tbody></tbody></table></div>`, "span-2")}`;
+    charts([{ id: "matrix-donut", option: donut(groups.map(g => ({ name: g.label, value: g.dur_us, pct: g.dur_pct }))) }]);
+
+    // The repository's lightweight view verifier supplies an HTML-only stub;
+    // interactive sorting/filtering is wired when a real DOM is available.
+    if (!root.querySelector) return;
+
+    const tbody = root.querySelector(".matrix-detail tbody");
+    const count = root.querySelector(".matrix-count");
+    const renderRows = () => {
+      const filtered = rows.filter(row => state.operators.has(row.operator) && state.dtypes.has(row.dtype));
+      const dir = state.dir === "asc" ? 1 : -1;
+      filtered.sort((a, b) => {
+        const av = a[state.sort], bv = b[state.sort];
+        if (av == null && bv == null) return 0;
+        if (av == null) return 1;
+        if (bv == null) return -1;
+        return (typeof av === "string" ? av.localeCompare(String(bv)) : av - bv) * dir;
+      });
+      tbody.innerHTML = filtered.map(row => `<tr><td class="mono" title="${esc(row.name)}">${esc(row.operator)}</td><td><span class="tag compute">${esc(row.dtype)}</span></td><td class="mono matrix-shape" title="${esc(row.shape)}">${esc(row.shape)}</td><td>${fmt.us(row.dur_us)}</td><td>${fmtM(row.mfu)}</td><td>${fmtM(row.mbu)}</td></tr>`).join("");
+      count.textContent = `显示 ${filtered.length.toLocaleString("en-US")} / ${rows.length.toLocaleString("en-US")} 个 kernel`;
+      root.querySelectorAll(".matrix-sort").forEach(button => {
+        const mark = button.querySelector(".sort-mark");
+        mark.textContent = button.dataset.sort === state.sort ? (state.dir === "asc" ? " ↑" : " ↓") : "";
+      });
+    };
+    root.querySelectorAll(".matrix-sort").forEach(button => button.addEventListener("click", () => {
+      const field = button.dataset.sort;
+      if (state.sort === field) state.dir = state.dir === "asc" ? "desc" : "asc";
+      else { state.sort = field; state.dir = field === "operator" || field === "dtype" || field === "shape" ? "asc" : "desc"; }
+      renderRows();
+    }));
+    root.querySelectorAll("input[data-filter]").forEach(input => input.addEventListener("change", () => {
+      const target = input.dataset.filter === "operator" ? state.operators : state.dtypes;
+      input.checked ? target.add(input.value) : target.delete(input.value);
+      const all = root.querySelector(`input[data-filter-all="${input.dataset.filter}"]`);
+      if (all) all.checked = target.size === (input.dataset.filter === "operator" ? operators.length : dtypes.length);
+      renderRows();
+    }));
+    root.querySelectorAll("input[data-filter-all]").forEach(input => input.addEventListener("change", () => {
+      const field = input.dataset.filterAll;
+      const target = field === "operator" ? state.operators : state.dtypes;
+      const values = field === "operator" ? operators : dtypes;
+      target.clear();
+      if (input.checked) values.forEach(value => target.add(value));
+      root.querySelectorAll(`input[data-filter="${field}"]`).forEach(item => item.checked = input.checked);
+      renderRows();
+    }));
+    root.querySelector(".matrix-reset").addEventListener("click", () => {
+      state.operators = new Set(operators); state.dtypes = new Set(dtypes);
+      root.querySelectorAll("input[data-filter], input[data-filter-all]").forEach(input => input.checked = true);
+      renderRows();
+    });
+    renderRows();
+  };
+
   // ============================ 算子效率 Roofline ============================ //
   V.efficiency = async function (root) {
     const ef = await api("/api/efficiency");
