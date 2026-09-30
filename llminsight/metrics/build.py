@@ -7,6 +7,7 @@ from ..config import SETTINGS
 from . import core
 from .efficiency import compute_efficiency
 from .memory import compute_memory
+from .matrix_power import compute_matrix_power
 from .timeline import compute_timeline
 from .smart_timeline import compute_smart_timeline
 
@@ -22,6 +23,7 @@ def compute_all(prof, capture: Dict[str, Any] = None) -> Dict[str, Any]:
         capture = derive_config(prof)
     ov = core.overview(prof)
     eff = compute_efficiency(prof)
+    matrix_power = compute_matrix_power(prof)
     # smart_timeline joins trace slices to eff["kernel_index"]; drop that heavy
     # index from the public efficiency payload once the timeline has consumed it.
     smart_tl = compute_smart_timeline(prof, eff)
@@ -34,6 +36,7 @@ def compute_all(prof, capture: Dict[str, Any] = None) -> Dict[str, Any]:
         "overview": ov,
         "hotspots": core.hotspots(prof),
         "efficiency": eff,
+        "matrix_power": matrix_power,
         "communication": core.communication(prof),
         "hidden_overhead": core.hidden_overhead(prof, ov, capture),
         "attribution": core.attribution(prof),

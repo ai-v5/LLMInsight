@@ -236,12 +236,15 @@ class AppState:
             if not set_chip(key):  # loads configs/chips/<key>.yaml (alias-aware)
                 return {"ok": False, "error": f"unknown chip '{key}'"}
             eff = compute_efficiency(self.prof)
+            from ..metrics.matrix_power import compute_matrix_power
+            matrix_power = compute_matrix_power(self.prof)
             # MFU/MBU/算力/带宽 on the smart-timeline scale with the chip; recompute
             # its cheap overlay (the geometry layer hits the trace-signature cache,
             # so no 104MB re-scan) before dropping the heavy index from eff.
             self.metrics["smart_timeline"] = compute_smart_timeline(self.prof, eff)
             eff.pop("kernel_index", None)
             self.metrics["efficiency"] = eff
+            self.metrics["matrix_power"] = matrix_power
             self.metrics["theoretical"] = metrics_core.theoretical(
                 self.prof, self.metrics.get("overview", {}), eff, self.capture)
             self.metrics["meta"] = {**self.metrics.get("meta", {}),
@@ -274,7 +277,7 @@ def _meta() -> Dict[str, Any]:
         "data_dir": STATE.loaded_dir,       # currently-loaded dir (null when idle)
         # the last loaded dir (persisted) seeds the picker; falls back to the sample
         "suggested_dir": load_last_dir() or SETTINGS.data_dir,
-        "sections": ["overview", "hotspots", "efficiency", "communication",
+        "sections": ["overview", "hotspots", "efficiency", "matrix_power", "communication",
                      "hidden_overhead", "attribution", "memory", "theoretical",
                      "timeline", "smart_timeline", "insights"],
     }
@@ -302,6 +305,7 @@ ROUTES: Dict[str, Callable[[], Any]] = {
     "/api/overview": _section("overview"),
     "/api/hotspots": _section("hotspots"),
     "/api/efficiency": _section("efficiency"),
+    "/api/matrix_power": _section("matrix_power"),
     "/api/communication": _section("communication"),
     "/api/hidden_overhead": _section("hidden_overhead"),
     "/api/attribution": _section("attribution"),

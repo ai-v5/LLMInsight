@@ -144,6 +144,31 @@ table.tbl th { color: var(--text-mut); font-weight: 600; position: sticky; top: 
 table.tbl td:first-child, table.tbl th:first-child { text-align: left; }
 table.tbl tr:hover td { background: var(--panel-2); }
 .tbl-wrap { max-height: 300px; overflow: auto; }
+.matrix-summary-wrap { max-height: 248px; }
+.matrix-detail-wrap { max-height: 62vh; min-height: 260px; }
+.matrix-detail { table-layout: fixed; }
+.matrix-detail th:nth-child(1) { width: 17%; }
+.matrix-detail th:nth-child(2) { width: 8%; }
+.matrix-detail th:nth-child(3) { width: 42%; }
+.matrix-detail th:nth-child(4), .matrix-detail th:nth-child(5), .matrix-detail th:nth-child(6) { width: 11%; }
+.matrix-detail td.matrix-shape { max-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+.matrix-sort { padding: 0; border: 0; background: transparent; color: inherit; font: inherit; font-weight: 600; cursor: pointer; }
+.matrix-sort:hover { color: var(--accent); }
+.sort-mark { color: var(--accent-2); }
+.matrix-filter { display: inline-block; margin-left: 5px; position: relative; vertical-align: middle; }
+.matrix-filter summary { list-style: none; cursor: pointer; color: var(--text-mut); font-size: 10px; display: inline-block; }
+.matrix-filter summary::-webkit-details-marker { display: none; }
+.matrix-filter summary::after { content: "▾"; }
+.matrix-filter[open] summary { color: var(--accent); }
+.matrix-filter-menu { position: absolute; z-index: 20; top: 18px; left: 0; min-width: 150px; max-height: 260px; overflow: auto; padding: 7px; background: var(--bg-2); border: 1px solid var(--border-2); border-radius: 7px; box-shadow: var(--shadow); text-align: left; }
+.matrix-filter-menu label { display: block; padding: 3px 4px; color: var(--text-dim); font-weight: 500; white-space: nowrap; }
+.matrix-filter-menu label:hover { background: var(--panel-2); color: var(--text); }
+.matrix-filter-menu input { accent-color: var(--accent); margin-right: 5px; }
+.matrix-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 7px; color: var(--text-mut); font-size: 11.5px; }
+.matrix-toolbar .btn { padding: 4px 9px; font-size: 11.5px; }
+.matrix-intro { margin-bottom: 12px; }
+.matrix-summary td:first-child { text-align: left; }
+@media (max-width: 900px) { .matrix-detail-wrap { max-height: 56vh; } .matrix-detail th:nth-child(3) { width: 34%; } }
 .mono { font-family: "JetBrains Mono", Consolas, monospace; font-size: 12px; }
 .tag { display: inline-block; padding: 1px 7px; border-radius: 5px; font-size: 11px; font-weight: 600; }
 .tag.compute { background: rgba(88,166,255,.16); color: #79b8ff; }
