@@ -65,9 +65,15 @@ CUSTOM_MODEL_COMPUTE_MARKERS = KDA_MODEL_COMPUTE_MARKERS + (
     "alltoallvgroupedmatmul", "groupedmatmulalltoallv", "mega_moe",
     "mhcpre", "mhcpost", "mhcsinkhorn",
 )
+# Recorded matrix-bearing compression/indexer variants have different contracts
+# from the older formula-backed indexers. Count them via counters, not aliases
+# that would silently apply an unverified shape formula.
+COUNTER_MODEL_COMPUTE_TYPES = {
+    "Compressor", "CompressorGrad", "LightningIndexerV2", "SparseLightningIndexerKLLossGrad",
+}
 # These fused kernels perform repeated sparse gather/scatter work that cannot be
 # reconstructed from the one-time input/output tensor footprint in profiler CSV.
-SPARSE_DISCRETE_TRAFFIC_TYPES = (SPARSE_ATTENTION_TYPES | DSA_INDEXER_TYPES
+SPARSE_DISCRETE_TRAFFIC_TYPES = (SPARSE_ATTENTION_TYPES | DSA_INDEXER_TYPES | COUNTER_MODEL_COMPUTE_TYPES
                                 | {"SparseFlashMla", "SparseFlashMlaGrad", "SparseAttnSharedkv"})
 # DeepSeek-V3 attention is causal: FlashAttention skips the masked (upper-triangle)
 # blocks, so it does ~half the dense QK^T+PV work. Without this 0.5 the achieved
@@ -88,7 +94,7 @@ _OVERHEAD_EFF = 0.02
 
 def _is_custom_model_compute_type(op_type: str) -> bool:
     value = (op_type or "").lower()
-    return any(marker in value for marker in CUSTOM_MODEL_COMPUTE_MARKERS)
+    return op_type in COUNTER_MODEL_COMPUTE_TYPES or any(marker in value for marker in CUSTOM_MODEL_COMPUTE_MARKERS)
 
 
 def _is_kda_model_compute_type(op_type: str) -> bool:
