@@ -237,7 +237,7 @@ class AppState:
                 return {"ok": False, "error": f"unknown chip '{key}'"}
             eff = compute_efficiency(self.prof)
             from ..metrics.matrix_power import compute_matrix_power
-            matrix_power = compute_matrix_power(self.prof)
+            matrix_power = compute_matrix_power(self.prof, eff)
             # MFU/MBU/算力/带宽 on the smart-timeline scale with the chip; recompute
             # its cheap overlay (the geometry layer hits the trace-signature cache,
             # so no 104MB re-scan) before dropping the heavy index from eff.

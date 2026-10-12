@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import math
+import re
 
 from ..config import SETTINGS, dtype_bytes
 from ..parser.shapes import numel, parse_dtypes, parse_shapes
@@ -25,7 +27,7 @@ from .efficiency import (
 _FUSED_MARKERS = (
     "flashattention", "flash_attn", "fusedattention", "fused_attention",
     "chunk_kda", "chunkkda", "kda_", "gated_delta", "chunk_gla",
-    "causal_conv1d", "_attn_", "attention",
+    "causal_conv1d", "_attn_", "attention", "mega_moe",
 )
 
 
@@ -116,7 +118,33 @@ def _shape_text(shapes_in: List[List[int]], shapes_out: List[List[int]]) -> str:
     return f"{left} → {right}" if right else left
 
 
-def compute_matrix_power(prof) -> Dict[str, Any]:
+def _mega_matrix_proxy(record, dtype, duration, efficiency):
+    """Only MAC work belongs to this matrix view; the denominator stays fused."""
+    def number(value):
+        try:
+            value = float(value)
+            return value if math.isfinite(value) and value >= 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    active = number(record.get("aic_mac_time(us)"))
+    if active is None:
+        ratio = number(record.get("aic_mac_ratio"))
+        active = ratio * duration if ratio is not None else None
+    calibration = efficiency.get("mfu_estimate") or {}
+    chip = efficiency.get("chip") or {}
+    scale = number(calibration.get("counter_scale"))
+    anchor = number(calibration.get("counter_reference_proxy_flops"))
+    peak_scale = ((chip.get("effective_peak_tflops") or 0) / chip["cube_bf16_tflops"]
+                  if chip.get("cube_bf16_tflops") else 1.0)
+    peak = SETTINGS.chip.peak_cube_flops(dtype) * peak_scale
+    valid = (active is not None and scale and anchor and peak > 0
+             and dtype in {"BF16", "FP16", "FP32", "FP8", "FP4"}
+             and not efficiency.get("peak_inconsistent", True))
+    return active, active * peak * 1e-6 * scale if valid else None, peak
+
+
+def compute_matrix_power(prof, efficiency=None) -> Dict[str, Any]:
     kd = prof.kernel_details
     if kd.empty:
         return {"available": False, "reason": "kernel_details.csv missing"}
@@ -136,6 +164,7 @@ def compute_matrix_power(prof) -> Dict[str, Any]:
         matrix_columns.append("Output Shapes")
     if has_out_dtypes:
         matrix_columns.append("Output Data Types")
+    matrix_columns.extend(c for c in ("Accelerator Core", "aic_mac_time(us)", "aic_mac_ratio") if c in kd.columns)
     for record in kd[matrix_columns].to_dict(orient="records"):
         op_type = str(record.get("Type") or "").strip()
         name = str(record.get("Name") or "").strip()
@@ -146,35 +175,59 @@ def compute_matrix_power(prof) -> Dict[str, Any]:
             duration = 0.0
         if duration <= 0 or not _is_matrix_candidate(op_type, name):
             continue
+        if str(record.get("Accelerator Core", "")).upper() == "AI_CPU":
+            continue
+        fused_moe = "mega_moe" in f"{op_type} {name}".lower()
         shapes_in = parse_shapes(record.get("Input Shapes"))
         shapes_out = parse_shapes(record.get("Output Shapes")) if has_out_shapes else []
         input_dtypes = parse_dtypes(record.get("Input Data Types"))
         output_dtypes = parse_dtypes(record.get("Output Data Types")) if has_out_dtypes else []
         dtype = _matrix_dtype(shapes_in, input_dtypes, output_dtypes)
-        flops = _flops(op_type, shapes_in, shapes_out)
-        bytes_moved = _bytes(shapes_in, input_dtypes, shapes_out, output_dtypes, op_type)
+        dtype_basis = "profiler_dtype"
+        if fused_moe and dtype == "UNKNOWN":
+            for symbol in (op_type, name):
+                # A simple Itanium symbol stores the function-name length before
+                # the identifier; following ABI argument codes are not its name.
+                mangled = re.match(r"_Z(\d+)(.*)", symbol)
+                identifier = mangled[2][:int(mangled[1])] if mangled else symbol
+                match = re.search(r"(?<![a-z0-9])(bf16|fp16|fp32|fp8|fp4)(?![a-z0-9])", identifier.lower())
+                if match:
+                    dtype, dtype_basis = match[1].upper(), "kernel_symbol"
+                    break
+        flops = _flops(op_type, shapes_in, shapes_out) if not fused_moe else None
+        formula_available = flops is not None
+        bytes_moved = _bytes(shapes_in, input_dtypes, shapes_out, output_dtypes, op_type) if not fused_moe else 0.0
         peak = SETTINGS.chip.peak_cube_flops(dtype)
+        mac_active = None
+        if fused_moe:
+            mac_active, flops, peak = _mega_matrix_proxy(record, dtype, duration, efficiency or {})
+        evidence = "FORMULA" if formula_available else "PROXY" if flops is not None else "UNAVAILABLE"
         duration_s = duration * 1e-6
-        mfu = flops / (peak * duration_s) if flops and peak and duration_s else None
+        mfu = flops / (peak * duration_s) if flops is not None and peak and duration_s else None
         mbu_raw = bytes_moved / duration_s / SETTINGS.chip.hbm_bandwidth if bytes_moved and duration_s else None
         mbu = min(mbu_raw, 1.0) if mbu_raw is not None else None
         label = f"{op_type}@{dtype}"
         group = grouped.setdefault(label, {"label": label, "operator": op_type, "dtype": dtype,
                                            "count": 0, "dur_us": 0.0, "flops": 0.0,
-                                           "bytes": 0.0, "peak_time": 0.0})
+                                           "bytes": 0.0, "peak_time": 0.0, "modeled_count": 0,
+                                           "fused_window": fused_moe, "proxy_count": 0})
         group["count"] += 1
         group["dur_us"] += duration
         group["flops"] += flops or 0.0
         group["bytes"] += bytes_moved
-        if flops:
+        if flops is not None:
             group["peak_time"] += peak * duration_s
+            group["modeled_count"] += 1
+        group["proxy_count"] += evidence == "PROXY"
         rows.append({"operator": op_type, "name": name, "dtype": dtype, "label": label,
                      "shape": _shape_text(shapes_in, shapes_out), "dur_us": round(duration, 3),
                      "flops": round(flops, 1) if flops is not None else None,
                      "mfu": round(mfu, 4) if mfu is not None else None,
                      "mbu": round(mbu, 4) if mbu is not None else None,
                      "mbu_raw": round(mbu_raw, 4) if mbu_raw is not None else None,
-                     "formula_available": flops is not None})
+                     "formula_available": formula_available, "evidence_level": evidence,
+                     "fused_window": fused_moe, "mac_active_us": mac_active,
+                     "dtype_basis": dtype_basis})
     if not rows:
         return {"available": False, "reason": "no matrix or matrix-heavy fused kernels"}
     total_us = sum(item["dur_us"] for item in rows)
@@ -182,6 +235,9 @@ def compute_matrix_power(prof) -> Dict[str, Any]:
     for item in grouped.values():
         duration_s = item["dur_us"] * 1e-6
         mfu = item["flops"] / item["peak_time"] if item["peak_time"] else None
+        complete = item["modeled_count"] == item["count"]
+        if item["fused_window"] and not complete:
+            mfu = None
         mbu_raw = item["bytes"] / duration_s / SETTINGS.chip.hbm_bandwidth if item["bytes"] and duration_s else None
         groups.append({"label": item["label"], "operator": item["operator"], "dtype": item["dtype"],
                        "count": item["count"], "dur_us": round(item["dur_us"], 1),
@@ -189,7 +245,10 @@ def compute_matrix_power(prof) -> Dict[str, Any]:
                        "mfu": round(mfu, 4) if mfu is not None else None,
                        "mbu": round(min(mbu_raw, 1.0), 4) if mbu_raw is not None else None,
                        "mbu_raw": round(mbu_raw, 4) if mbu_raw is not None else None,
-                       "flops": round(item["flops"], 1) if item["flops"] else None})
+                       "flops": round(item["flops"], 1) if item["modeled_count"] and (complete or not item["fused_window"]) else None,
+                       "evidence_level": ("PROXY" if complete and item["proxy_count"] else
+                                          "FORMULA" if complete else "UNAVAILABLE"),
+                       "fused_window": item["fused_window"]})
     groups.sort(key=lambda item: item["dur_us"], reverse=True)
     rows.sort(key=lambda item: item["dur_us"], reverse=True)
     formula_rows = sum(1 for item in rows if item["formula_available"])
@@ -199,4 +258,4 @@ def compute_matrix_power(prof) -> Dict[str, Any]:
             "total_dur_us": round(total_us, 1), "groups": groups, "rows": rows,
             "kernel_count": len(rows),
             "formula_coverage_pct": round(formula_rows / len(rows) * 100.0, 1),
-            "note": "MFU 分母按每个算子@dtype 对应的 CUBE 峰值；融合算子仅统计可由 shape 重建的矩阵工作，稀疏离散访存的 MBU 保持不可用。"}
+            "note": "MFU 分母按每个算子@dtype 对应的 CUBE 峰值。MegaMoE 的 PROXY 仅含同采集校准的 MAC/CUBE 工作量，不含 Vector；分母为完整计算/通信融合窗口，不是纯计算 MFU。缺少校准、计数器或 dtype 时保持不可用；内部通信和 MBU 未知。其它融合算子统计可由 shape 重建的矩阵工作。"}
