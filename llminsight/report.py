@@ -286,7 +286,7 @@ def _sec_header(meta: Dict, overview: Dict, theo: Dict,
                 "Overlapped / Communication",
                 "bad" if (r.get("overlap_rate_pct") or 0) < 40 else ""),
         _metric("端到端 MFU(est)" if mfu_estimated else "端到端 MFU", _mfu(step_mfu),
-                (f"{'计数器校准估算 · ' if mfu_estimated else ''}HFU {_mfu(step_hfu)}（含重算）{mfu_band_foot}{model_mac_foot}" if rco_hero.get("overhead_us")
+                (f"{'PROXY 周期估算 · ' if mfu_estimated else ''}模型执行 HFU {_mfu(step_hfu)}（含重算，不含优化器）{mfu_band_foot}{model_mac_foot}" if rco_hero.get("overhead_us")
                  else (f"全优化上界 {_mfu(comb.get('new_mfu'))}" if comb.get("new_mfu") else "达成算力 / 峰值"))),
     ]
     return (
@@ -485,7 +485,8 @@ def _sec_whatif_floor(theo: Dict) -> str:
         caveats = "".join(
             f'<div class="banner" style="margin-top:8px">⚠️ {_e(c)}</div>'
             for c in lv.get("caveats") or [])
-        line = (f'实测 <strong>{shown_us(lv.get("measured_us"))}</strong>'
+        source_label = "候选累计上界" if lv.get("evidence_level") == "PROXY" else "当前量级"
+        line = (f'{source_label} <strong>{shown_us(lv.get("measured_us"))}</strong>'
                 f'（{step_word} {_pct(lv.get("measured_pct"))}）'
                 f' → 现实地板 ≈ <strong>{shown_us(lv.get("floor_us"))}</strong>'
                 f'（{step_word} {_pct(lv.get("floor_pct"))}）'
@@ -583,6 +584,24 @@ def _sec_efficiency(eff: Dict) -> str:
                 f"（{_mfu(eff.get('model_mfu_compute_estimated_lo'))}–"
                 f"{_mfu(eff.get('model_mfu_compute_estimated_hi'))}）")
     warnings = ""
+    accounting = eff.get("workload_accounting") or {}
+    fused = eff.get("fused_moe") or {}
+    if accounting.get("optimizer_kernel_count"):
+        warnings += (f'<div class="banner info">模型 FLOPs 排除优化器窗口的 '
+                     f'{_int(accounting["optimizer_kernel_count"])} 个 kernel；完整 step 分母保留优化器时间。'
+                     '阶段依据为框架注解窗口内的 kernel launch。</div>')
+    if fused.get("available"):
+        fused_rows = [[_e(p["phase"]), _int(p["count"]), _us(p["fused_us"]),
+                       _us(p["mac_active_us"]),
+                       f'{p["estimated_flops"] / 1e12:.2f} TFLOP' if p.get("estimated_flops") is not None else "—",
+                       _mfu(p.get("fused_compute_utilization_estimated")), "未拆分"]
+                      for p in fused["phases"]]
+        warnings += '<h3>融合 MoE · PROXY 周期估算</h3>' + _table(
+            ["阶段", "次数", "融合窗口", "MAC 活跃计数", "估算工作量", "融合吞吐利用率", "内部通信"], fused_rows)
+        warnings += f'<div class="note">{_e(fused.get("note"))}</div>'
+        external = fused.get("external_alltoallv") or {}
+        warnings += (f'<div class="note">同采集外部 alltoallv：{_int(external.get("count"))} 次，'
+                     f'累计 {_us(external.get("elapse_us"))}；不作为融合内部通信，不直接相加。</div>')
     if incomplete:
         missing = "、".join((eff.get("unmodeled_flop_types") or {}).keys()) or "未知算子"
         warnings += ('<div class="banner warn">主导计算算子 FLOP 模型覆盖不足'
@@ -669,7 +688,8 @@ def _sec_attribution(attr: Dict) -> str:
     comm_tbl = _table(["通信归因", "wall-clock", "占比"], comm_rows)
     moe_line = (f'<div class="note">MoE 专属：专家计算 (GroupedMatmul) '
                 f'{_us(moe.get("expert_compute_us"))} vs 分发通信 (alltoallv) '
-                f'{_us(moe.get("dispatch_comm_us"))}。</div>')
+                f'{_us(moe.get("dispatch_comm_us"))}；融合 MoE 窗口 '
+                f'{_us(moe.get("fused_expert_window_us"))}（含内部通信，不与外部通信相加）。</div>')
     return _panel(
         "模型结构归因",
         "按算子命名启发式归因到 Attention / MoE / Norm / Optimizer 等（基于 device 计算时间）",

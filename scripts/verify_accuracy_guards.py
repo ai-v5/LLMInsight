@@ -278,7 +278,9 @@ def check_sparse_attention_and_capture() -> None:
     assert low_mac_coverage["model_mac_ratio"] is None, low_mac_coverage
     assert low_mac_coverage["model_mac_insufficient_coverage"] is True, low_mac_coverage
     expected_attention_recompute = 7488.0
-    expected_matmul_recompute = expected_grouped / 4.0
+    # An unpaired GroupedMatmul does not prove activation replay. Only the
+    # attention forward excess contributes to the point estimate here.
+    expected_matmul_recompute = 0.0
     expected_recompute_share = (
         expected_attention_recompute + expected_matmul_recompute
     ) / (expected_sparse + expected_grouped)
@@ -381,7 +383,7 @@ def check_dsa_indexer_flops_and_phase_split() -> None:
         },
     }
     theo = theoretical(prof, ov, eff, derive_config(prof))
-    expected_recompute = 7488.0 + li_per_call + grouped_total / 4.0
+    expected_recompute = 7488.0 + li_per_call
     expected_hfu = expected_total / (432e12 * 1e-6)
     expected_model_mfu = expected_hfu * (1.0 - expected_recompute / expected_total)
     assert theo["step_hfu"] == round(expected_hfu, 4), theo
@@ -541,6 +543,9 @@ def check_seq_axis_and_family_scoped_recompute() -> None:
             "aic_mac_ratio": 0.08, "aiv_vec_ratio": 0.45,
         }]),
     ], ignore_index=True)
+    # A formula FLOP anchor must also have a recorded counter; a default scale
+    # of one is not evidence of same-capture calibration.
+    rows.loc[rows["Type"] == "GroupedMatmul", "aic_mac_ratio"] = 0.8
     prof = _profile(rows)
     capture = derive_capture(prof)
     rc = capture["recompute"]
@@ -786,7 +791,7 @@ def check_report_uses_generic_semantics() -> None:
     assert "EP64" not in html
     assert "多卡训练（单 rank 采集）" in html
     assert "端到端 MFU(est)" in html
-    assert "计数器校准估算" in html
+    assert "PROXY 周期估算" in html
 
 
 if __name__ == "__main__":

@@ -69,7 +69,7 @@ ideal_us  = max(t_compute, t_mem) ; wasted_us = max(0, dur - ideal_us)
 bound = "compute" if t_compute >= t_mem else "memory"
 ```
 - 只有「有 FLOP 模型（matmul / 融合注意力）」**或**「向量核访存算子」才建模理想耗时；其它无 FLOP 模型的 cube/MIX 算子在纯访存 Roofline 下会显得 100% 浪费，故**留空不评分**（`_bound_from_ratios` 用流水线占比给个定性 bound）。
-- KDA、gated-delta、GLA、causal-conv，以及 MC2 融合 `AlltoAllvGroupedMatMul` / `GroupedMatMulAlltoAllv` 等尚无可靠 FLOP 公式的模型计算族会进入覆盖分母并列入 `unmodeled_flop_types`。完整模型 MFU 必须继续输出：用同一采集内 GEMM/Attention 的公式 FLOPs 校准 `aic_mac_ratio + aiv_vec_ratio` 周期代理，补齐自定义算子工作量，标为 `MFU(est)` 并给 ±25% 自定义算子贡献区间；未知算子仍不生成 Roofline 收益。
+- KDA、gated-delta、GLA、causal-conv，以及 MC2/MegaMoE 融合模型计算族进入覆盖分母并列入 `unmodeled_flop_types`。仅在同采集公式锚与计数器足够时，用实际 MAC/Vector 活跃时间（缺失时退回周期比例）校准工作量，标为 `PROXY MFU(est)`，保留 ±25% 未建模贡献敏感性区间；缺锚、缺计数器或峰值不一致时保持不可用，未知算子不生成 Roofline 收益。时间覆盖率不等于 FLOP 完整性。
 - `top_optimization`：按 `wasted_us`（实测 − 理想）降序，自动圈出「耗时大但 MFU/MBU 低」的 kernel。
 - 通信下发"kernel"（AI_CPU / HCCL）无可建模的计算 / 访存足迹，**从效率排行剔除**（归通信视图与隐性开销）。
 
@@ -155,5 +155,22 @@ bound = "compute" if t_compute >= t_mem else "memory"
 结果 ~100KB，按 trace 文件签名落盘缓存。
 
 ---
+
+## 4.10 框架阶段与融合 MoE 的核算边界
+
+有 `ascend_pytorch_profiler_*.db` 时，只读关联框架注解、CANN launch 与设备任务。
+优化器阶段按同进程 `Optimizer.step` 注解窗口中的 launch 判定，支持工作线程下发；
+这是窗口归属推断，不等同于完整调用树。模型 FLOPs、重计算和模型效率排行排除这些
+任务，完整 step 分母及矩阵算力视图仍保留优化器工作。
+
+MegaMoE 以计算/通信融合窗口单列。框架输入 shape 可补充隐藏维、路由宽度与专家中间维，
+但不从权重切片首维外推总专家数。缺少实际路由 token 数与内部阶段记录时，通信时长、
+通信字节和纯计算时长保持未知；不得用融合时长减 MAC 活跃时间充当通信时间。
+无公式的已识别模型族仅在同采集公式锚和计数器齐备、峰值一致时参与周期代理估算。
+代理结果标为 `PROXY`；贡献敏感性区间不是统计置信区间或真机校准误差。
+
+未配对 GEMM 不自动认定为重计算。重计算候选时间是累计上界，尚未扣除通信或其它
+算子重叠，不能当作已验证的关键路径收益。通信等待按实际区间跨桶分摊，
+`NOTIFY_RECORD` 不计作等待。P2P 可能来自优化器或权重交换，不能据此推断 PP。
 
 上一篇：[03 · 数据与解析](03-data-and-parsing.md) ｜ 下一篇：[05 · 展示视图](05-views.md)

@@ -216,7 +216,10 @@ def load_profile(data_dir: str) -> ProfileData:
     ) if isinstance(comm_matrix, dict) else bool(comm_matrix)
     comm_has_collective = any(c.get("type") != "Total" for c in communication)
 
+    from .semantics import annotate_workload
+    framework_semantics = annotate_workload(data_dir, kernel_details)
     meta = {
+        "framework_semantics": framework_semantics,
         "data_dir": data_dir,
         "rank": 0,                      # reserved; single-card sample
         "device_id": device_id,
