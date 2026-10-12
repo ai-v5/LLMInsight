@@ -495,6 +495,17 @@ def attribution(prof) -> Dict[str, Any]:
     if op.empty:
         return {"available": False}
     df = op.copy()
+    kd = prof.kernel_details
+    optimizer_us = 0.0
+    if "Workload Phase" in kd.columns:
+        device = kd[~kd["Type"].astype(str).str.lower().str.startswith(("hccl", "hcom"))].copy()
+        if "Accelerator Core" in device:
+            device = device[device["Accelerator Core"].astype(str).str.upper() != "AI_CPU"]
+        device["Duration(us)"] = num(device["Duration(us)"])
+        optimizer_us = float(device.loc[device["Workload Phase"] == "optimizer", "Duration(us)"].sum())
+        model = device[device["Workload Phase"] != "optimizer"]
+        df = model.groupby("Type", as_index=False)["Duration(us)"].sum().rename(
+            columns={"Type": "OP Type", "Duration(us)": "Total Time(us)"})
     df["Total Time(us)"] = num(df["Total Time(us)"])
     # Exclude communication-dispatch ops (AI_CPU / HCCL) — they are wall-clock
     # comm, not model compute, and would otherwise dump 676k us into Elementwise.
@@ -505,6 +516,7 @@ def attribution(prof) -> Dict[str, Any]:
         keep &= core_col != "AI_CPU"
     df = df[keep].copy()
     assigned = {name: 0.0 for name, _ in _MODULE_RULES}
+    assigned["Optimizer"] = optimizer_us
     elementwise = 0.0
     seen = set()
     for module, types in _MODULE_RULES:
@@ -517,7 +529,13 @@ def attribution(prof) -> Dict[str, Any]:
             elementwise += _f(row["Total Time(us)"])
 
     # --- device compute ring (consistent device-time basis) ---
+    # Fused expert work keeps its entire window, including internal communication.
+    fused_mask = df["OP Type"].astype(str).str.lower().str.contains("mega_moe", regex=False)
+    fused_us = float(df.loc[fused_mask, "Total Time(us)"].sum())
+    elementwise -= fused_us
     modules = [{"module": m, "us": round(v, 1)} for m, v in assigned.items() if v > 0]
+    if fused_us:
+        modules.append({"module": "MoE fused compute/communication", "us": round(fused_us, 1)})
     modules.append({"module": "Elementwise/Other", "us": round(elementwise, 1)})
     modules.sort(key=lambda x: x["us"], reverse=True)
     total = sum(m["us"] for m in modules)
@@ -542,6 +560,7 @@ def attribution(prof) -> Dict[str, Any]:
     moe_focus = {
         "expert_compute_us": round(moe_compute, 1),
         "dispatch_comm_us": round(comm_moe, 1),
+        "fused_expert_window_us": round(fused_us, 1),
     }
 
     return {
@@ -553,7 +572,8 @@ def attribution(prof) -> Dict[str, Any]:
         "moe_focus": moe_focus,
         "note": (
             "按算子命名启发式归因，基于 device 计算时间；GEMM/Projections 为 Attention 投影 / Router / "
-            "LM-Head 共用未细分。通信为 wall-clock（多为等待），单独列出不并入计算环。"
+            "LM-Head 共用未细分。MoE fused 为包含内部通信的完整窗口，不能解释为纯计算。"
+            "外部通信单独列出，不与融合窗口相加。"
         ),
     }
 
@@ -729,7 +749,7 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
                 "访存类（Cast/ZerosLike/TensorMove）靠算子融合 / 内存复用 / 去无谓 dtype 转换",
             ],
             "reasons": [
-                "计算是有用功，地板 = 有效 FLOPs / 峰值算力，永远 >0",
+            "计算地板仅针对已建模部分；融合通信及未知工作量不能按纯计算回收",
                 "matmul 已接近天花板，余量主要在 FA/FAG 与访存类尾部",
             ],
             "caveats": [],
@@ -741,8 +761,8 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
     # Floor can reach 0 when memory allows full-off → recoverable = the whole recompute time.
     if recompute and (recompute.get("us") or 0) > 0:
         rc_us = min(float(recompute["us"]), computing)
-        rc_lo = min(float(recompute.get("us_lo") or rc_us), computing)   # conservative (smaller)
-        rc_hi = min(float(recompute.get("us_hi") or rc_us), computing)   # optimistic (larger)
+        rc_lo = min(float(recompute["us_lo"] if recompute.get("us_lo") is not None else rc_us), computing)
+        rc_hi = min(float(recompute["us_hi"] if recompute.get("us_hi") is not None else rc_us), computing)
         levers.append({
             "id": "recompute_off", "title": "重计算", "can_reach_zero": True,
             "scenario": "关闭/减少重计算（反向不重跑前向）",
@@ -751,9 +771,8 @@ def _whatif_realistic(stage, computing, comm_no, free, comm_total, overlapped,
             "recoverable_us": round(rc_us, 1), "recoverable_pct": _pct(rc_us, stage),
             "recoverable_lo_us": round(rc_lo, 1), "recoverable_hi_us": round(rc_hi, 1),
             "new_step_us": round(stage - rc_us, 1), "new_mfu": _mfu_at(stage - rc_us),
-            "floor_basis": "重算 = 已识别候选相位组在反向重跑前向的额外计算"
-                           "（≈computing×{:.0%}）；显存允许且候选全部关闭时可回收该估计量。"
-                           .format(recompute.get("flops_share") or 0),
+            "evidence_level": "PROXY",
+            "floor_basis": "重算候选的累计耗时上界；尚未扣除与通信或其它算子的重叠，关键路径收益可能为零。",
             "methods": [
                 "显存有余量时减少/关闭重计算层（--recompute-num-layers↓ 或关 full）",
                 "选择性重计算（只重算激活大、计算省的算子）做显存↔吞吐平衡",
@@ -955,9 +974,9 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         r_hi_est = float(recompute_est.get("flops_share_hi") or r_est)
         multiplier = float(rc_state.get("recompute_forward_multiplier") or 0.0)
         rc_ov = {
-            "us": round(computing * r_est, 1),
-            "us_lo": round(computing * r_lo_est, 1),
-            "us_hi": round(computing * r_hi_est, 1),
+            "us": round(sum(c.get("duration_us", 0) for c in recompute_est.get("candidates", [])), 1),
+            "us_lo": 0.0,
+            "us_hi": round(sum(c.get("duration_us", 0) for c in recompute_est.get("candidates", [])), 1),
             "flops_share": round(r_est, 4),
             "flops_share_lo": round(r_lo_est, 4),
             "flops_share_hi": round(r_hi_est, 4),
@@ -966,7 +985,7 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
             "bwd_fwd_flop_ratio": 2.0,
             "flop_ratio_source": "operator_candidates_plus_counter_calibration",
             "granularity": recompute_est.get("likely_granularity") or rc_state.get("value"),
-            "basis": recompute_est.get("basis"),
+            "basis": "已识别重计算候选算子的累计时间上界；与通信/其它计算的重叠尚未扣除，非关键路径实测收益。",
             "candidates": recompute_est.get("candidates") or [],
             "confidence": recompute_est.get("confidence") or "medium",
         }
@@ -1271,6 +1290,7 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         "step_mfu_lo": round(step_mfu_lo, 4) if step_mfu_lo else None,
         "step_mfu_hi": round(step_mfu_hi, 4) if step_mfu_hi else None,
         "step_hfu": round(hfu, 4) if hfu else None,
+        "step_hfu_basis": "model_execution_excluding_optimizer",
         "mfu_estimated": mfu_estimated,
         "mfu_basis": mfu_basis,
         "mfu_confidence": (
@@ -1278,7 +1298,9 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
             if mfu_estimated else "high"
         ),
         "mfu_opinion": (
-            ("端到端 MFU 偏低，重计算与未掩盖通信是主要拖累"
+            ("MFU 为 PROXY 量级参考；先核对融合算子工作量和阶段归属"
+             if mfu_estimated and (eff.get("fused_moe") or {}).get("available")
+             else "端到端 MFU 偏低，重计算与未掩盖通信是主要拖累"
              if step_mfu is not None and step_mfu < 0.30
              else "端到端 MFU 中等，仍应优先处理重计算与通信暴露"
              if step_mfu is not None and step_mfu < 0.50
@@ -1294,10 +1316,10 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         "model_mac_insufficient_coverage": model_mac_insufficient_coverage,
         "model_mac_inconsistent": model_mac_inconsistent,
         "recompute": recompute,
-        "note": ("端到端 MFU=模型理论FLOPs/(峰值×step)（不含重计算）；HFU 含重计算重复执行的 FLOPs。"
+        "note": ("端到端 MFU=模型有效FLOPs/(峰值×完整step)（不含重计算和优化器工作量）；此处 HFU 为模型执行 FLOPs 利用率，含重算、不含优化器。"
                  "稀疏 Attention/Indexer 按前后向调用计数拆分；matmul 优先按线性层方向/次数拆分，"
-                 "无法配对的部分保留 R=2–2.5 训练估计；"
+                 "无法配对的部分不设重算点估计，仅保留敏感性上界；"
                  "主导算子 FLOP 公式不完整时，使用同一采集内已建模算子校准 MAC/Vector 周期代理，"
-                 "输出带区间的 MFU(est)；未建模算子的 Roofline 收益仍不臆测。"
+                 "输出 PROXY MFU(est)，区间为假设敏感性而非统计置信区间；未建模算子的 Roofline 收益仍不臆测。"
                  "峰值口径不一致时才停用 MFU。"),
     }

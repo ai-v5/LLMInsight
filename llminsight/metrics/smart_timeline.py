@@ -33,6 +33,62 @@ from ..config import SETTINGS
 from ..parser.trace import iter_events, event_ts_us
 from .efficiency import MATMUL_TYPES, ATTENTION_TYPES
 
+
+def _spread_intervals(starts, durations, t0, bin_us, bins):
+    """Accumulate actual interval intersections; full middle bins use a difference array."""
+    import numpy as np
+    s = np.asarray(starts, dtype=float)
+    d = np.asarray(durations, dtype=float)
+    e = np.minimum(s + d, t0 + bin_us * bins)
+    s = np.maximum(s, t0)
+    valid = np.isfinite(s) & np.isfinite(e) & (e > s)
+    s, e = s[valid], e[valid]
+    result = np.zeros(bins)
+    if not len(s) or bin_us <= 0:
+        return result.tolist()
+    first = np.clip(((s - t0) / bin_us).astype(int), 0, bins - 1)
+    last = np.clip(((np.nextafter(e, -np.inf) - t0) / bin_us).astype(int), 0, bins - 1)
+    np.add.at(result, first, np.minimum(e, t0 + (first + 1) * bin_us) - s)
+    cross = last > first
+    np.add.at(result, last[cross], e[cross] - (t0 + last[cross] * bin_us))
+    delta = np.zeros(bins + 1)
+    np.add.at(delta, first[cross] + 1, bin_us)
+    np.add.at(delta, last[cross], -bin_us)
+    return (result + np.cumsum(delta[:-1])).tolist()
+
+
+def _hbm_capacity_lane(prof, t0, bin_us, bins):
+    import numpy as np
+    import pandas as pd
+    from ..parser.profile import num
+    mr = getattr(prof, "memory_record", None)
+    cap_mib = SETTINGS.chip.hbm_capacity_bytes / 2**20
+    lane = {"key": "hbm_cap", "label": "显存容量占用 (HBM)", "available": False,
+            "reason": "缺少 memory_record.csv 的显存容量记录"}
+    if mr is None or mr.empty or not {"Timestamp(us)", "Total Reserved(MB)"}.issubset(mr.columns) or cap_mib <= 0:
+        return lane
+    if "Component" in mr and (mr.Component == "APP").any():
+        mr = mr[mr.Component == "APP"]
+    values = pd.DataFrame({"t": num(mr["Timestamp(us)"]), "v": num(mr["Total Reserved(MB)"])}).dropna().sort_values("t")
+    if values.empty:
+        return lane
+    # Each bucket keeps its observed peak, otherwise carries the last known sample.
+    points = t0 + np.arange(bins) * bin_us
+    pos = np.searchsorted(values.t.to_numpy(), points, side="right") - 1
+    absolute = np.where(pos >= 0, values.v.to_numpy()[np.maximum(pos, 0)], np.nan)
+    inside = values[(values.t >= t0) & (values.t < t0 + bin_us * bins)]
+    bucket = ((inside.t - t0) / bin_us).astype(int)
+    peaks = inside.v.groupby(bucket).max()
+    for b, v in peaks.items():
+        if 0 <= b < bins:
+            absolute[b] = max(absolute[b], v) if np.isfinite(absolute[b]) else v
+    lane.update({"available": True, "reason": None, "unit": "%", "kind": "capacity",
+                 "color": "#bd93f9", "series": [float(v / cap_mib) if np.isfinite(v) else None for v in absolute],
+                 "abs": [round(float(v), 1) if np.isfinite(v) else None for v in absolute],
+                 "abs_unit": "MiB", "peak": round(cap_mib, 1), "peak_unit": "MiB",
+                 "note": "memory_record.csv 已保留显存；按时间桶保峰，与采集时间轴对齐。"})
+    return lane
+
 # Mc2 fused expert kernels launch an AI_CPU wrapper around a MIX_AIC task.  The
 # wrapper names contain both ``AlltoAllv`` and ``GroupedMatMul``; generic name
 # heuristics would therefore misclassify them as Communication or Cube when
@@ -372,14 +428,11 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any], prof=None) -> Dict[st
         kd = getattr(prof, "kernel_details", None)
         if kd is not None and not kd.empty and "Start Time(us)" in kd.columns:
             nm = kd["Name"].astype(str).str.lower()
-            mask = nm.str.startswith("hcom_send") | nm.str.startswith("hcom_receive")
+            mask = (nm.str.startswith("hcom_send") | nm.str.startswith("hcom_receive")
+                    | nm.str.startswith("hcom_batchsendrecv"))
             sts = pd.to_numeric(kd["Start Time(us)"], errors="coerce")
             dus = pd.to_numeric(kd["Duration(us)"], errors="coerce")
-            for s, dd in zip(sts[mask], dus[mask]):
-                if s == s and dd == dd and dd > 0:           # NaN guards
-                    b = int((float(s) - t0) / bin_us)
-                    if 0 <= b < bins:
-                        p2p_occ[b] += float(dd)
+            p2p_occ = _spread_intervals(sts[mask], dus[mask], t0, bin_us, bins)
     comm_tot = [wait_occ[b] + xfer_occ[b] for b in range(bins)]
     wait_frac = [round(wait_occ[b] / comm_tot[b], 4) if comm_tot[b] > 0 else 0.0
                  for b in range(bins)]
@@ -458,7 +511,7 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any], prof=None) -> Dict[st
          "abs": gemm_cube_abs, "abs_unit": "TFLOP/s", "peak": peak_tflops,
          "peak_unit": "TFLOP/s", "kind": "rate",
          "reason": None if cube_available else peak_reason,
-         "note": "MatMul/GEMM 的 ΣFLOPs /（桶时长 × Cube 有效峰值）"},
+         "note": "模型 MatMul/GEMM 的 ΣFLOPs /（桶时长 × Cube 有效峰值）；不含优化器和未建模计算"},
         {"key": "cube_attention", "label": "Attention/Indexer Cube 利用率",
          "available": attention_cube_available, "unit": "%",
          "color": "#a371f7", "series": attention_cube_series,
@@ -472,11 +525,11 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any], prof=None) -> Dict[st
          "abs": vec_abs, "abs_unit": "μs", "peak": bin_us_r,
          "peak_unit": "μs", "kind": "occupancy",
          "note": "Vector 泳道每桶时间占用率（向量算子无 FLOP 模型，按占用计）"},
-        {"key": "hbm_bw", "label": "HBM 利用率", "available": True, "unit": "%",
+        {"key": "hbm_bw", "label": "已建模 HBM 利用率估算", "available": True, "unit": "%",
          "color": "#e3b341", "series": hbm_series,
          "abs": hbm_abs, "abs_unit": "GB/s", "peak": peak_gbps,
          "peak_unit": "GB/s", "kind": "rate",
-         "note": "Σ读写字节 /（桶时长 × HBM 带宽）"},
+         "note": "已建模算子的一次张量读写量估算；不含优化器、融合通信和未建模访存，非全量 HBM 硬件计数"},
         {"key": "comm", "label": "通信 利用率", "available": True, "unit": "%",
          "color": "#f0655c", "series": comm_series,
          "abs": comm_abs, "abs_unit": "μs", "peak": bin_us_r,
@@ -498,12 +551,11 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any], prof=None) -> Dict[st
          "color": "#d29922", "series": p2p_series,
          "abs": [round(v, 1) for v in p2p_occ], "abs_unit": "μs", "peak": bin_us_r,
          "peak_unit": "μs", "kind": "occupancy",
-         "reason": None if any(p2p_occ) else "无 P2P(hcom_send/receive) —— 该 run 无 PP 流水阻塞",
-         "note": "点对点 hcom_send/receive 的 AICPU 阻塞占用——PP 流水的卡间等待，不经 device cube 展开"},
-        {"key": "hbm_cap", "label": "显存容量 (HBM)", "available": False,
-         "reason": "待 memory_record.csv 采集（与「显存洞察」页口径一致）"},
+          "reason": None if any(p2p_occ) else "未识别 P2P 记录；不能据此判定 PP 是否开启",
+          "note": "send/receive/batchSendRecv 的时间占用；也可能来自优化器或权重交换，不能单凭 P2P 推断 PP。"},
+        _hbm_capacity_lane(prof, t0, bin_us, bins),
         {"key": "host_mem", "label": "主机内存", "available": False,
-         "reason": "待 memory_record.csv 采集"},
+          "reason": "当前采集未提供主机内存容量指标"},
     ]
 
     return {
@@ -529,8 +581,8 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any], prof=None) -> Dict[st
             "两条分项使用同一桶时长与 Cube 有效峰值，"
             "Vector = 向量泳道每桶时间占用率（无 FLOP 模型），"
             "HBM = Σ字节 /（桶 × HBM 带宽），通信 = Communication 泳道每桶时间占用率。"
-            "Notify_Wait 同步等待已全程剔除，不进入任何泳道。"
-            "显存容量 / 主机内存待 memory_record.csv 采集。"
+            "Notify_Wait 从算子 Gantt 和计算泳道剔除，在通信等待泳道单独统计。"
+            "显存容量读取 memory_record.csv；主机内存需独立采集。"
             f"切片共 {geom['total_slices']} 个，按时长下采样保留最长 {geom['shown_slices']} 个。"
         ),
     }
@@ -594,17 +646,15 @@ def _wait_xfer_from_task_slices(data_dir, t0, bin_us, bins):
             kt = tdf["kernel_type"].astype(str)
             ts = pd.to_numeric(tdf["task_start(us)"], errors="coerce")
             tt = pd.to_numeric(tdf["task_time(us)"], errors="coerce").fillna(0.0)
-            bi = ((ts - t0) / bin_us).fillna(-1).astype("int64")
-            wmask = kt.str.contains("WAIT|NOTIFY", case=False, na=False, regex=True)
+            wmask = kt.str.contains("WAIT", case=False, na=False, regex=False)
             xmask = kt.str.contains("DMA|MEMCPY", case=False, na=False, regex=True)
             for mask, occ in ((wmask, wait), (xmask, xfer)):
-                grp = tt[mask].groupby(bi[mask]).sum()
-                for b, v in grp.items():
-                    if 0 <= int(b) < bins:
-                        occ[int(b)] += float(v)
+                spread = _spread_intervals(ts[mask], tt[mask], t0, bin_us, bins)
+                for b, value in enumerate(spread):
+                    occ[b] += value
         return {"wait": wait, "xfer": xfer}
 
-    res = cached_json(f"msprof_ts_wx:{sig}:{bins}:{int(t0)}:{int(round(bin_us))}", _build)
+    res = cached_json(f"msprof_ts_wx:v2:{data_dir}:{sig}:{bins}:{t0}:{bin_us}", _build)
     return res["wait"], res["xfer"]
 
 

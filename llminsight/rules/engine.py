@@ -99,13 +99,13 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
         overlap = ratios.get("overlap_rate_pct", 0)
         cno = ratios.get("comm_not_overlapped_pct", 0)
         if cno >= 10 or overlap < 40:
+            dominant = "、".join(t["type"] for t in comm.get("by_type", [])[:2]) or "未知"
             cards.append(_card(
                 "comm_not_overlapped", "high", "通信",
                 f"通信掩盖严重不足：未掩盖通信占 step {cno}%，计算-通信重叠率仅 {overlap}%",
-                "专家并行 alltoall 通信量大，且计算与通信重叠窗口不足；moe-fb-overlap / "
-                "异步通信未能覆盖大部分通信。",
-                "核对 --moe-fb-overlap / --moe-permutation-async-comm 是否生效；增大重叠窗口、"
-                "调整通信切分与下发顺序。",
+                f"外部通信累计耗时最大的类型为 {dominant}；累计时间排序不等于未掩盖关键路径归因。",
+                "沿时间线定位暴露的集合通信；allGather/reduceScatter 核查 FSDP 预取与梯度归约，"
+                "alltoallv 核查专家路由；再调整重叠窗口和下发顺序。",
                 f"理想全掩盖可减少约 {cno}% step 时间（What-if 上界）。",
                 0.9,
                 {"overlap_rate_pct": overlap, "comm_not_overlapped_pct": cno},
@@ -128,8 +128,9 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
             f"AICPU 集合通信执行占 device {aicpu['ratio']}%：HcclLaunchAicpuKernel（单次 max {aicpu['max_us']/1000:.0f}ms，主要是通信等待）",
             "HcclLaunchAicpuKernel 是 AICPU 展开模式下驱动 alltoall / allGather 等集合通信的 AI_CPU 算子，"
             f"其 device 时长是 AICPU 占用在集合通信中的时间，而非内核启动 / 下发延迟（单次达 {aicpu['max_us']/1000:.0f}ms，"
-            "远超任何下发耗时量级）。本次单 rank 采集中集合通信 Transit≈0、几乎 100% 为 Wait，故这段时间主要是"
-            f"「等待对端 / 同步」。它与 step 的 Communication 实为同一段时间（{share_txt}），切勿与「未掩盖通信」相加。",
+            "不能仅按单次时长区分等待与传输）。"
+            f"本次外部通信 Wait 累计 {comm.get('total_wait_ms', 0):.1f}ms、Transit 累计 {comm.get('total_transit_ms', 0):.1f}ms。"
+            f"AICPU 执行与 step 的 Communication 存在重叠（{share_txt} 为累计量对比），切勿与「未掩盖通信」相加。",
             "① 优先把这段通信掩盖到计算下（核对 --moe-fb-overlap / --moe-permutation-async-comm，扩大重叠窗口）；"
             "② 缩短通信本身（HCCL 算法 / HCCL_BUFFSIZE、评估 EP 规模、增大 token 批次以减少 collective 次数）；"
             "③ 仅 per-collective 的调度部分才与「减少下发次数」相关。需多卡复采才能区分「等待对端」与「真实传输」。",
@@ -138,7 +139,9 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
             0.85,
             {"ratio_pct": aicpu["ratio"], "count": aicpu["count"], "max_us": aicpu["max_us"],
              "total_us": aicpu["total_us"], "communication_us": comm_total_us,
-             "share_of_communication_pct": share, "transit_dominated": False, "wait_dominated": True},
+             "share_of_communication_pct": share,
+             "transit_dominated": comm.get("total_transit_ms", 0) > comm.get("total_wait_ms", 0),
+             "wait_dominated": comm.get("total_wait_ms", 0) > comm.get("total_transit_ms", 0)},
         ))
 
     # 3 & 11. capture checkup / host sync blocking -------------------------
@@ -196,10 +199,10 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
             estimate = eff.get("mfu_estimate") or {}
             cards.append(_card(
                 "flop_model_incomplete", "high", "采集体检",
-                f"模型 FLOP 公式覆盖不足：{missing_txt} 改用周期计数校准，MFU 输出为估算值",
+                f"模型 FLOP 公式覆盖不足：{missing_txt}；" + ("MFU 为 PROXY 周期估算" if estimate.get("available") else "缺少完整估算证据，模型 MFU 不可用"),
                 "未建模 KDA/causal-conv 不能只用其余 GEMM 代替；当前用同一采集内 GEMM/Attention "
                 "的公式 FLOPs 校准 MAC/Vector 活跃周期，再补齐端到端工作量。",
-                "保留 MFU(est) 作为调优主判断，同时优先补充对应算子的语义 FLOP 模型；"
+                "MFU(est) 用于量级参考，区间为假设敏感性而非统计置信区间；优先补充语义 FLOP 模型；"
                 "未知算子不进入 Roofline 收益排行。",
                 ("给出可行动的 MFU 点估计与区间；当前公式覆盖 "
                  f"{eff.get('flop_coverage_pct')}%，自定义算子计数器覆盖 "
@@ -271,8 +274,8 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
     # Triggered from the PROFILING-DERIVED granularity (full|selective), not a launch
     # flag — so selective captures fire too. The quantified overhead / MFU gain comes
     # from theoretical.recompute (computing × r_re).
-    rc = _cstate("recompute")                                  # full | selective | off | None
     rco = theo.get("recompute") or {}
+    rc = rco.get("granularity") or _cstate("recompute")
     if rc in ("full", "selective"):
         _mp = lambda x: (f"{x * 100:.1f}%" if isinstance(x, (int, float)) else "—")
         _rk = "全量" if rc == "full" else "选择性"

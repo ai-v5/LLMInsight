@@ -11,8 +11,16 @@
   }
 
   // ============================ 总览 Overview ============================ //
+  function workloadPanel(ef) {
+    const accounting = ef.workload_accounting || {}, fused = ef.fused_moe || {};
+    if (!accounting.optimizer_kernel_count && !fused.available) return "";
+    const rows = (fused.phases || []).map(p => `<tr><td>${esc(p.phase)}</td><td>${fmt.int(p.count)}</td><td>${fmt.us(p.fused_us)}</td><td>${fmt.us(p.mac_active_us)}</td><td>${p.estimated_flops == null ? "—" : (p.estimated_flops / 1e12).toFixed(2) + " TFLOP"}</td><td>${fmt.mfu(p.fused_compute_utilization_estimated)} 估</td><td>未拆分</td></tr>`).join("");
+    return panel("模型工作量核算 · 融合 MoE", "PROXY 周期估算；与纯计算 MFU 区分", `
+      <div class="note">模型分子排除优化器窗口的 ${fmt.int(accounting.optimizer_kernel_count || 0)} 个 kernel（累计 ${fmt.us(accounting.optimizer_us)}）；完整 step 分母保留优化器时间。阶段依据：${accounting.phase_basis ? "框架注解窗口与 kernel 下发时间（窗口归属推断）" : "未提供框架阶段证据"}。</div>
+      ${fused.available ? `<table class="tbl"><thead><tr><th>阶段</th><th>次数</th><th>融合窗口</th><th>MAC 活跃计数</th><th>周期估算工作量</th><th>融合吞吐利用率</th><th>内部通信</th></tr></thead><tbody>${rows}</tbody></table><div class="note">${esc(fused.note)}</div><div class="note">同采集外部 alltoallv：${fmt.int((fused.external_alltoallv || {}).count || 0)} 次，累计 ${fmt.us((fused.external_alltoallv || {}).elapse_us)}；其调用归属需时间线核验，不作为融合内部通信，也不与融合窗口直接相加。</div>` : ""}`, "span-2");
+  }
   V.overview = async function (root) {
-    const [ov, theo] = await Promise.all([api("/api/overview"), api("/api/theoretical")]);
+    const [ov, theo, ef] = await Promise.all([api("/api/overview"), api("/api/theoretical"), api("/api/efficiency")]);
     if (!ov.available) { root.innerHTML = `<div class="empty">无 step_trace 数据</div>`; return; }
     const r = ov.ratios, u = ov.us;
     const stepCount = Number(ov.step_count || 1);
@@ -30,7 +38,7 @@
       ? ` · 估计区间 ${fmt.mfu(smfuLo)}–${fmt.mfu(smfuHi)}`
       : "";
     const mfuFoot = (rco && hfu != null)
-      ? `${mfuEstimated ? "计数器校准估算 · " : ""}HFU ${fmt.mfu(hfu)}（含重算）${mfuBand}${modelMac}`
+      ? `${mfuEstimated ? "PROXY 周期估算 · " : ""}模型执行 HFU ${fmt.mfu(hfu)}（含重算，不含优化器）${mfuBand}${modelMac}`
       : "有效FLOPs /(峰值×step)";
     const cards = [
       metric("有效计算占比", fmt.pct(r.effective_compute_pct), { tone: r.effective_compute_pct >= 60 ? "good" : "warn", foot: "Computing / Stage", barPct: r.effective_compute_pct }),
@@ -93,7 +101,7 @@
       ? banner("warn", "♻️", `<strong>重计算观点：已开启，粒度更接近 ${esc(rco.granularity || "selective")}</strong>；估计占执行 FLOPs <strong>${fmt.pct((rco.flops_share || 0) * 100)}</strong>，平均每 step 约 <strong>${fmt.us((rco.overhead_us || 0) / stepCount)}</strong>。候选算子：${rcCandidates.slice(0, 5).map(x => `<strong>${esc(x.type)}</strong>（${esc(x.evidence || x.method)}）`).join("、") || "前向/反向相位组"}。`)
       : "";
     root.innerHTML = `
-      ${opinion}${rcEvidence}
+      ${opinion}${rcEvidence}${workloadPanel(ef)}
       <div class="grid cols-6">${cards.join("")}</div>
       <div class="grid cols-2" style="margin-top:16px">
         ${panel(multiStep ? `${stepCount}-step 窗口时间构成` : "Step 时间构成", "Computing / 未掩盖通信 / Free（单位 us）", `<div id="ov-donut" class="chart"></div>`)}
@@ -134,7 +142,7 @@
       const zero = lv.can_reach_zero ? "可减到 0" : "不能减到 0（有不可消除下限）";
       const caveats = (lv.caveats || []).map(c => banner("warn", "⚠️", esc(c))).join("");
       const line =
-        `实测 <strong>${shownUs(lv.measured_us)}</strong>（${stepWord} ${fmt.pct(lv.measured_pct)}）`
+        `${lv.evidence_level === "PROXY" ? "候选累计上界" : "当前量级"} <strong>${shownUs(lv.measured_us)}</strong>（${stepWord} ${fmt.pct(lv.measured_pct)}）`
         + ` → 现实地板 ≈ <strong style="color:var(--accent-2)">${shownUs(lv.floor_us)}</strong>（${stepWord} ${fmt.pct(lv.floor_pct)}）`
         + ` · 可回收 ≈ <strong style="color:var(--accent)">${shownUs(lv.recoverable_us)}</strong>`
         + `（区间 ${shownUs(lv.recoverable_lo_us)}–${shownUs(lv.recoverable_hi_us)}）`
@@ -382,7 +390,7 @@
     const modelNotes = (ef.flop_model_notes || []).map(note =>
       banner("info", "🧮", esc(note))).join("");
     root.innerHTML = `
-      ${fidelity}${peakWarning}${modelNotes}
+      ${workloadPanel(ef)}${fidelity}${peakWarning}${modelNotes}
       ${banner(chip.calibrated ? "warn" : "info", "🎯",
         `芯片：<strong>${esc(chip.name)}</strong> · CUBE BF16 <strong>${(chip.cube_bf16_tflops||chip.peak_bf16_tflops).toFixed(0)}</strong> / VECTOR BF16 <strong>${(chip.vector_bf16_tflops||0).toFixed(0)}</strong> TFLOPS · HBM <strong>${chip.hbm_tbps.toFixed(2)} TB/s</strong>` +
         (chip.hbm_capacity_gb ? ` · 显存 <strong>${chip.hbm_capacity_gb.toFixed(0)} GB</strong>` : "") +
@@ -553,10 +561,11 @@
       <div class="grid cols-2">
         ${panel("模型结构归因（device 计算时间）", "按算子命名启发式归因到训练语义模块", `<div id="at-ring" class="chart tall"></div>`)}
         <div>
-          ${panel("MoE 专属：专家计算 vs 分发通信", "GroupedMatmul vs alltoallv",
+          ${panel("MoE 专属：显式算子与融合窗口", "融合窗口含内部通信，不与外部 alltoallv 相加",
             `<div class="grid cols-2">
               ${metric("专家计算 (GroupedMatmul)", fmt.us(mf.expert_compute_us), { tone: "good" })}
               ${metric("分发通信 (alltoallv)", fmt.us(mf.dispatch_comm_us), { tone: "warn" })}
+              ${mf.fused_expert_window_us ? metric("融合 MoE 窗口", fmt.us(mf.fused_expert_window_us), { foot: "计算 / 通信 / 重叠未独立拆分" }) : ""}
             </div>`)}
           ${panel("通信构成（wall-clock，单独列出不并入计算环）", "",
             `<table class="tbl"><thead><tr><th>通信</th><th>耗时</th><th>占比</th></tr></thead><tbody>${
@@ -962,7 +971,7 @@
           name: L.label, type: "bar", xAxisIndex: i, yAxisIndex: i, silent: true,
           barWidth: "100%", barGap: "-100%", z: 2,
           itemStyle: { color: L.color, opacity: .85 },
-          data: L.series.map((v, k) => [+((k + 0.5) * binMs).toFixed(3), +(v * 100).toFixed(1)]),
+          data: L.series.map((v, k) => [+((k + 0.5) * binMs).toFixed(3), v == null ? null : +(v * 100).toFixed(1)]),
         });
         // invisible full-lane-height bars: catch hovers anywhere in the lane (not just
         // on a short bar) and carry the % + absolute value for the tooltip. Overlaid on
@@ -972,7 +981,7 @@
           barGap: "-100%", itemStyle: { opacity: 0 }, emphasis: { disabled: true }, z: 1,
           data: L.series.map((v, k) => ({
             value: [+((k + 0.5) * binMs).toFixed(3), 100],
-            pct: +(v * 100).toFixed(1), abs: (L.abs || [])[k],
+            pct: v == null ? null : +(v * 100).toFixed(1), abs: (L.abs || [])[k],
           })),
         });
       } else {
@@ -1014,14 +1023,14 @@
           if (p.seriesType === "bar") {                       // utilization lane (catcher)
             const m = laneMeta[p.seriesName] || {};
             const ms = (+p.data.value[0]).toFixed(1);
-            const pct = (+p.data.pct).toFixed(0);
+            const pct = p.data.pct == null ? "未采样" : (+p.data.pct).toFixed(0) + "%";
             let line2 = "";
             if (p.data.abs != null) {
               line2 = (m.metric === "occupancy")
                 ? `占用 ${p.data.abs} / ${m.peak} ${m.absUnit}`
                 : `${p.data.abs} ${m.absUnit} / 峰值 ${m.peak} ${m.peakUnit}`;
             }
-            return `<b>${esc(p.seriesName)}</b><br/>t ≈ ${ms} ms · 利用率 <b>${pct}%</b>`
+            return `<b>${esc(p.seriesName)}</b><br/>t ≈ ${ms} ms · 利用率 <b>${pct}</b>`
               + (line2 ? `<br/>${line2}` : "");
           }
           if (p.seriesType === "line") {                       // silent fallback

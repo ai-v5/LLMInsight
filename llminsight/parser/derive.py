@@ -47,7 +47,8 @@ _UNKNOWN = _fact(None, "数据中无可靠信号", "unknown")
 # Their presence is still important: attention-only phase counts must not be
 # promoted to a whole-model recompute conclusion on a hybrid KDA model.
 _CUSTOM_MODEL_MARKERS = (
-    "chunk_kda", "kda_", "gated_delta", "chunk_gla", "causal_conv1d",
+    "chunk_kda", "kda_", "gated_delta", "chunk_gla", "causal_conv1d", "mega_moe",
+    "mhcpre", "mhcpost", "mhcsinkhorn",
 )
 
 
@@ -156,8 +157,8 @@ def derive_model(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
     # guess.  SparseFlashAttention is used by more than one model family; neither
     # its presence nor MoE collectives prove DeepSeek/GLM or a particular EP size.
     type_values = set(kd["Type"].astype(str)) if "Type" in kd.columns else set(_name_series(kd))
-    has_moe = any(t.startswith("GroupedMatmul") for t in type_values)
-    has_sparse_attn = any(t.startswith("SparseFlashAttention") for t in type_values)
+    has_moe = any(t.startswith("GroupedMatmul") or "mega_moe" in t.lower() for t in type_values)
+    has_sparse_attn = any(t.startswith(("SparseFlashAttention", "SparseFlashMla")) for t in type_values)
     has_fused_attn = has_sparse_attn or any("FlashAttention" in t for t in type_values)
     # causal_conv1d is also treated as an unsupported model-compute family for
     # FLOP coverage, but its presence alone does not prove a KDA architecture.
@@ -197,10 +198,24 @@ def derive_model(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
             if len(ops) >= 2 and len(ops[-1]) == 1:
                 gammas.append(ops[-1][0])
         gammas = sorted(set(gammas), reverse=True)
-    hidden = gammas[0] if gammas else None
+    semantics = (getattr(prof, "meta", {}) or {}).get("framework_semantics") or {}
+    moe_shapes = [parse_shapes(s) for s in semantics.get("mega_moe_input_shapes", [])]
+    moe_shapes = [s for s in moe_shapes if len(s) >= 5 and len(s[0]) == 2
+                  and len(s[1]) == 2 and len(s[3]) == len(s[4]) == 3
+                  and s[0][0] == s[1][0] and s[0][1] == s[3][2] == s[4][1]
+                  and s[3][0] == s[4][0] and s[3][1] == 2 * s[4][2]]
+    moe_hidden = {s[0][-1] for s in moe_shapes if s and len(s[0]) == 2}
+    hidden = next(iter(moe_hidden)) if len(moe_hidden) == 1 else (gammas[0] if gammas else None)
+    if len(moe_shapes) == 1:
+        s = moe_shapes[0]
+        facts["moe_router_topk"] = _fact(s[1][1], "MegaMoE 框架路由索引宽度", "high")
+        facts["moe_ffn_hidden_size"] = _fact(s[4][2], "MegaMoE 两个专家权重的中间维交叉核对", "high")
+        facts["local_expert_weight_slices"] = _fact(s[3][0], "记录的专家权重首维；分片语义未知，不外推总专家数", "medium")
     if hidden:
         facts["hidden_size"] = _fact(
-            hidden, f"RmsNorm gamma 宽度集合 {gammas} 取最大", "high")
+            hidden, ("MegaMoE 框架输入隐藏维，与专家权重交叉核对" if len(moe_hidden) == 1
+                     else f"RmsNorm gamma 宽度集合 {gammas} 取最大（候选，非架构定论）"),
+            "high" if len(moe_hidden) == 1 else "medium")
         # Seq can be [S,1,H], [1,S,H], or [S,H].  The old first-axis rule
         # silently returned batch=1 for [1,S,H].  Use the dominant non-unit
         # dimension before H across every hidden-width RmsNorm instead.
@@ -210,8 +225,8 @@ def derive_model(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
                 prefix = [int(x) for x in ops[0][:-1] if int(x) > 1]
                 if prefix:
                     seq_candidates.append(max(prefix))
-        lora = [g for g in gammas if g != hidden]
-        if len(lora) >= 2:
+        lora = [g for g in gammas if g < hidden]
+        if len(lora) >= 2 and not moe_shapes:
             facts["q_lora_rank"] = _fact(
                 lora[0], f"RmsNorm 非 hidden 的低秩宽度，取较大 {lora[0]}", "high")
             facts["kv_lora_rank"] = _fact(
@@ -314,7 +329,7 @@ def derive_model(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
         if widths:
             facts["ffn_hidden_size"] = _fact(
                 max(widths),
-                f"SwiGlu 输出宽度集合 {sorted(set(widths))} 取最大（稠密层 MLP）", "high")
+                f"SwiGlu 输出宽度集合 {sorted(set(widths))} 取最大；仅为当前算子宽度", "medium")
 
     # --- compute dtype, from MatMul inputs ----------------------------------
     mm = _rows_named(kd, "MatMulV3")
@@ -371,7 +386,7 @@ def derive_capture(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
     out["host_sync_stall"] = _fact(
         share >= 0.2,
         f"Synchronize APIs 累计 {ss_t/1e6:.2f}s（{ss_n} 次），占 host API 时间 {share*100:.0f}%"
-        + (f"；最重 host 调用为 {root}（动态 shape D2H 同步）" if root else ""),
+        + (f"；最重 aclnn 调用为 {root}，需时间线核对其与同步的因果关系" if root else ""),
         "high" if total_api_t else "unknown",
     )
 

@@ -62,11 +62,13 @@ CUSTOM_MODEL_COMPUTE_MARKERS = KDA_MODEL_COMPUTE_MARKERS + (
     # MC2 fused MoE dispatch+GroupedMatMul kernels.  The paired AI_CPU wrapper
     # is excluded from efficiency rows, while the MIX_AIC task carries the
     # model compute and must participate in coverage/counter-calibrated MFU.
-    "alltoallvgroupedmatmul", "groupedmatmulalltoallv",
+    "alltoallvgroupedmatmul", "groupedmatmulalltoallv", "mega_moe",
+    "mhcpre", "mhcpost", "mhcsinkhorn",
 )
 # These fused kernels perform repeated sparse gather/scatter work that cannot be
 # reconstructed from the one-time input/output tensor footprint in profiler CSV.
-SPARSE_DISCRETE_TRAFFIC_TYPES = SPARSE_ATTENTION_TYPES | DSA_INDEXER_TYPES
+SPARSE_DISCRETE_TRAFFIC_TYPES = (SPARSE_ATTENTION_TYPES | DSA_INDEXER_TYPES
+                                | {"SparseFlashMla", "SparseFlashMlaGrad", "SparseAttnSharedkv"})
 # DeepSeek-V3 attention is causal: FlashAttention skips the masked (upper-triangle)
 # blocks, so it does ~half the dense QK^T+PV work. Without this 0.5 the achieved
 # rate would exceed silicon peak — i.e. the factor is physically required, not a
@@ -92,6 +94,35 @@ def _is_custom_model_compute_type(op_type: str) -> bool:
 def _is_kda_model_compute_type(op_type: str) -> bool:
     value = (op_type or "").lower()
     return any(marker in value for marker in KDA_MODEL_COMPUTE_MARKERS)
+
+
+def _fused_moe_summary(prof, rows, counter_scale, proxy_available):
+    phases = []
+    for label, backward in (("forward", False), ("backward", True)):
+        group = [r for r in rows if "mega_moe" in r["type"].lower()
+                 and ("backward" in r["type"].lower()) == backward]
+        if not group:
+            continue
+        duration = sum(r["dur_us"] for r in group)
+        covered = [r for r in group if (r.get("counter_proxy_flops_raw") or 0) > 0]
+        flops = sum(r["counter_proxy_flops_raw"] for r in covered) * counter_scale
+        peak_time = sum(r["peak_flops"] * r["dur_us"] * 1e-6 for r in group)
+        phases.append({"phase": label, "count": len(group), "fused_us": round(duration, 1),
+                       "mac_active_us": round(sum(r["mac_active_us"] for r in group), 1),
+                       "estimated_flops": flops if proxy_available and len(covered) == len(group) else None,
+                       "fused_compute_utilization_estimated": flops / peak_time if proxy_available and peak_time and len(covered) == len(group) else None,
+                       "communication_us": None, "communication_bytes": None,
+                       "compute_only_us": None})
+    semantics = (getattr(prof, "meta", {}) or {}).get("framework_semantics") or {}
+    external = [c for c in (getattr(prof, "communication", None) or []) if c.get("type") == "alltoallv"]
+    return {"available": bool(phases), "evidence_level": "PROXY", "phases": phases,
+            "external_alltoallv": {"count": len(external),
+                "elapse_us": round(sum(c.get("elapse_ms", 0) for c in external) * 1000, 1),
+                "wait_us": round(sum(c.get("wait_ms", 0) for c in external) * 1000, 1),
+                "attribution": "same_capture_external_ops_not_internal_fused_phases"},
+            "framework_input_shapes": semantics.get("mega_moe_input_shapes", []),
+            "basis": "same_capture_counter_calibration" if proxy_available else "calibration_unavailable",
+            "note": "融合窗口包含计算、通信及重叠；MAC 活跃时间是计数器视角。缺少实际专家 token 数/内部阶段时，不以融合时长减 MAC 时间推算通信，不生成纯计算 MFU。周期代理含 padding/指令效率不确定性，非语义 FLOPs 实测。"}
 
 
 def _op_class(op_type: str) -> Optional[str]:
@@ -618,8 +649,10 @@ def _estimate_matmul_training_flops(rows: List[Dict[str, Any]]) -> Dict[str, Any
         exact_groups += 1
 
     unmatched_flops = max(executed - matched_flops, 0.0)
-    fallback_recompute = unmatched_flops / 4.0       # m=1, R=2
-    fallback_recompute_lo = unmatched_flops / 4.5    # m=1, R=2.5
+    # Unpaired shapes do not establish any replay. Keep a sensitivity upper
+    # bound, but never manufacture a full-recompute point estimate from them.
+    fallback_recompute = 0.0
+    fallback_recompute_lo = 0.0
     return {
         "available": True,
         "source": "linear_orientation_counts_plus_training_fallback",
@@ -631,7 +664,7 @@ def _estimate_matmul_training_flops(rows: List[Dict[str, Any]]) -> Dict[str, Any
         "fallback_flops": unmatched_flops,
         "recompute_forward_flops": exact_recompute + fallback_recompute,
         "recompute_forward_flops_lo": exact_recompute + fallback_recompute_lo,
-        "recompute_forward_flops_hi": exact_recompute + fallback_recompute,
+        "recompute_forward_flops_hi": exact_recompute + unmatched_flops / 4.0,
         "exact_coverage_pct": 100.0 * matched_flops / executed,
     }
 
@@ -678,7 +711,7 @@ def _estimate_recompute_from_rows(
             "evidence": (
                 f"{matmul_training.get('exact_group_count', 0)} 个方向配对组；"
                 f"精确覆盖 {float(matmul_training.get('exact_coverage_pct') or 0):.1f}%，"
-                "其余按训练 F:B=1:2–2.5 估计"
+                "未配对部分不设重算点估计，仅保留敏感性上界"
             ),
         })
 
@@ -700,6 +733,7 @@ def _estimate_recompute_from_rows(
     pairs = (
         ("FlashAttentionScore", "FlashAttentionScoreGrad"),
         ("SparseFlashAttention", "SparseFlashAttentionGrad"),
+        ("SparseFlashMla", "SparseFlashMlaGrad"),
         ("causal_conv1d_fwd_kernel", "causal_conv1d_bwd_kernel"),
         ("chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
          "chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64"),
@@ -773,6 +807,11 @@ def _estimate_recompute_from_rows(
 
 def compute_efficiency(prof) -> Dict[str, Any]:
     kd = prof.kernel_details
+    phase = kd.get("Workload Phase")
+    optimizer = kd[phase == "optimizer"] if phase is not None else kd.iloc[:0]
+    optimizer_us = float(num(optimizer["Duration(us)"]).sum()) if not optimizer.empty else 0.0
+    if phase is not None:
+        kd = kd[phase != "optimizer"]
     chip = SETTINGS.chip
     if kd.empty:
         return {"available": False, "reason": "kernel_details.csv missing"}
@@ -799,6 +838,13 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     vec_r = vec_series.fillna(0.0).to_numpy() if vec_series is not None else [0.0] * len(kd)
     vec_valid = vec_series.notna().to_numpy() if vec_series is not None else [False] * len(kd)
     cube_u = colf("cube_utilization(%)")
+    mac_time = num(kd["aic_mac_time(us)"]).to_numpy() if "aic_mac_time(us)" in cols else [None] * len(kd)
+    vec_time = num(kd["aiv_vec_time(us)"]).to_numpy() if "aiv_vec_time(us)" in cols else [None] * len(kd)
+
+    def active_us(recorded, ratio, duration):
+        if recorded is not None and recorded == recorded and recorded >= 0:
+            return float(recorded)
+        return float(ratio) * duration
 
     # ---- pre-pass: observed bf16 ceiling -> calibrate an ASSUMED peak ---------
     # A real kernel cannot exceed silicon peak. If the best clean bf16 GEMM's
@@ -978,9 +1024,11 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         # formula replacement by itself.  Later we calibrate it against the
         # simultaneously captured GEMM/Attention rows whose FLOPs are known, then
         # apply that capture-local scale to unmodeled KDA/causal-conv kernels.
+        mac_active = active_us(mac_time[i], mac_r[i], d_us)
+        vec_active = active_us(vec_time[i], vec_r[i], d_us)
         counter_proxy_raw = (
-            (float(mac_r[i]) * peak_for(dtype, True)
-             + float(vec_r[i]) * peak_for(dtype, False)) * d_s
+            (mac_active * peak_for(dtype, True)
+             + vec_active * peak_for(dtype, False)) * 1e-6
             if bool(mac_valid[i] or vec_valid[i]) else None
         )
 
@@ -1078,6 +1126,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
                 "ai": (flops / b_bytes) if (flops and b_bytes) else None,
                 "achieved_tflops": (achieved_flops / 1e12) if achieved_flops else None,
                 "mac_ratio": float(mac_r[i]),
+                "mac_active_us": mac_active,
                 "mac_ratio_available": bool(mac_valid[i]),
                 "vec_ratio": float(vec_r[i]),
                 "vec_ratio_available": bool(vec_valid[i]),
@@ -1274,7 +1323,8 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     # routed peak·time. matmul_mfu stays pure-GEMM (the calibration anchor); this adds
     # attention so the headline reflects the whole model's compute, not just the GEMMs.
     # (End-to-end/step MFU — incl. comm/idle — is theoretical.step_mfu, a different cut.)
-    mc = [r for r in flops_rows if r["type"] in MATMUL_TYPES or r["type"] in ATTENTION_TYPES]
+    mc = [r for r in flops_rows if (r["type"] in MATMUL_TYPES or r["type"] in ATTENTION_TYPES
+                                  or _is_custom_model_compute_type(r["type"]))]
     mc_flops = sum(r["flops"] for r in mc)
     mc_peak_time = sum(r["peak_flops"] * r["dur_us"] * 1e-6 for r in mc if r.get("peak_flops"))
     model_mfu_compute_partial = (mc_flops / mc_peak_time) if mc_peak_time else None
@@ -1309,7 +1359,9 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         counter_reference_flops / counter_reference_proxy
         if counter_reference_proxy > 0 else 1.0
     )
-    custom_model_rows = [r for r in model_rows if _is_custom_model_compute_type(r["type"])]
+    # Every uncovered recognized family needs a proxy, including shape-less
+    # attention/GEMM. Formula-backed custom families are already in mc_flops below.
+    custom_model_rows = [r for r in model_rows if not r.get("flops")]
     custom_counter_rows = [
         r for r in custom_model_rows
         if float(r.get("counter_proxy_flops_raw") or 0.0) > 0
@@ -1324,15 +1376,17 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         if custom_model_rows else 100.0
     )
     estimate_available = bool(
-        mc_flops > 0 and (not custom_model_rows or custom_counter_rows)
+        mc_flops > 0 and (not custom_model_rows or len(custom_counter_rows) == len(custom_model_rows))
+        and (not custom_model_rows or counter_reference_proxy > 0)
         and not peak_inconsistent
     )
     # The point estimate uses the observed same-capture scale.  ±25% on the
     # custom-family contribution is kept as an explicit epistemic band because
     # active-cycle ratios are not semantic FLOP counters.
-    estimated_flops = mc_flops + custom_counter_est
-    estimated_flops_lo = mc_flops + custom_counter_est * 0.75
-    estimated_flops_hi = mc_flops + custom_counter_est * 1.25
+    formula_model_flops = sum(float(r["flops"]) for r in modeled_model_rows)
+    estimated_flops = formula_model_flops + custom_counter_est
+    estimated_flops_lo = formula_model_flops + custom_counter_est * 0.75
+    estimated_flops_hi = formula_model_flops + custom_counter_est * 1.25
     model_peak_time = sum(
         float(r.get("peak_flops") or 0.0) * float(r["dur_us"]) * 1e-6
         for r in model_rows
@@ -1350,9 +1404,10 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         if estimate_available and model_peak_time > 0 else None
     )
     for type_row in type_rows:
-        if not _is_custom_model_compute_type(type_row["type"]):
+        family = [r for r in model_rows if r["type"] == type_row["type"]
+                  and (_is_custom_model_compute_type(r["type"]) or not r.get("flops"))]
+        if not family:
             continue
-        family = [r for r in custom_model_rows if r["type"] == type_row["type"]]
         family_proxy = sum(
             float(r.get("counter_proxy_flops_raw") or 0.0) for r in family
         )
@@ -1362,7 +1417,8 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         )
         estimated = (
             family_proxy * counter_scale / family_peak_time
-            if family_proxy > 0 and family_peak_time > 0 else None
+            if family_proxy > 0 and family_peak_time > 0 and counter_reference_proxy > 0
+            and not peak_inconsistent else None
         )
         type_row["mfu_estimated"] = round(estimated, 4) if estimated is not None else None
         type_row["mfu_estimate_basis"] = (
@@ -1384,9 +1440,11 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         if supported_model_rows else 0.0
     )
     flop_coverage = (model_modeled_us / model_total_us) if model_total_us else 0.0
-    flop_model_complete = bool(model_total_us > 0 and flop_coverage >= 0.90)
+    # Duration coverage is informative, not FLOP completeness: a short unknown
+    # kernel can still carry substantial work and must not vanish from MFU.
+    flop_model_complete = bool(model_rows and len(modeled_model_rows) == len(model_rows))
     recompute_estimate = _estimate_recompute_from_rows(
-        rows,
+        model_rows,
         matmul_training_flops,
         counter_scale,
         estimated_flops,
@@ -1613,6 +1671,13 @@ def compute_efficiency(prof) -> Dict[str, Any]:
 
     return {
         "available": True,
+        "workload_accounting": {
+            "optimizer_kernel_count": len(optimizer), "optimizer_us": round(optimizer_us, 1),
+            "phase_basis": ((getattr(prof, "meta", {}) or {}).get("framework_semantics") or {}).get("source"),
+            "note": "模型 FLOPs 与重计算排除优化器窗口内下发的 kernel；优化器仍计入完整 step 分母和矩阵算力视图。",
+        },
+        "fused_moe": _fused_moe_summary(prof, model_rows, counter_scale,
+                                        counter_reference_proxy > 0 and not peak_inconsistent),
         "kernel_index": kernel_index,
         "chip": {
             "name": chip.name,
@@ -1668,7 +1733,9 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         "mfu_estimate": {
             "available": estimate_available,
             "basis": "formula_flops_plus_same_capture_counter_calibration",
-            "confidence": ("medium" if estimate_available and counter_coverage_pct >= 90 else "low"),
+            "confidence": ("medium" if estimate_available and counter_coverage_pct >= 90
+                           and not any("mega_moe" in r["type"].lower() for r in model_rows) else "low"),
+            "interval_kind": "heuristic_sensitivity_not_statistical_confidence",
             "formula_coverage_pct": round(flop_coverage * 100.0, 1),
             "custom_counter_coverage_pct": round(counter_coverage_pct, 1),
             "counter_scale": round(counter_scale, 6),
