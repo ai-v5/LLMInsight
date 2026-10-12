@@ -23,7 +23,7 @@ def compute_all(prof, capture: Dict[str, Any] = None) -> Dict[str, Any]:
         capture = derive_config(prof)
     ov = core.overview(prof)
     eff = compute_efficiency(prof)
-    matrix_power = compute_matrix_power(prof)
+    matrix_power = compute_matrix_power(prof, eff)
     # smart_timeline joins trace slices to eff["kernel_index"]; drop that heavy
     # index from the public efficiency payload once the timeline has consumed it.
     smart_tl = compute_smart_timeline(prof, eff)
