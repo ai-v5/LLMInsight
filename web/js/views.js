@@ -20,7 +20,7 @@
       ${fused.available ? `<table class="tbl"><thead><tr><th>阶段</th><th>次数</th><th>融合窗口</th><th>MAC 活跃计数</th><th>周期估算工作量</th><th>融合吞吐利用率</th><th>内部通信</th></tr></thead><tbody>${rows}</tbody></table><div class="note">${esc(fused.note)}</div><div class="note">同采集外部 alltoallv：${fmt.int((fused.external_alltoallv || {}).count || 0)} 次，累计 ${fmt.us((fused.external_alltoallv || {}).elapse_us)}；其调用归属需时间线核验，不作为融合内部通信，也不与融合窗口直接相加。</div>` : ""}`, "span-2");
   }
   V.overview = async function (root) {
-    const [ov, theo, ef] = await Promise.all([api("/api/overview"), api("/api/theoretical"), api("/api/efficiency")]);
+    const [ov, theo] = await Promise.all([api("/api/overview"), api("/api/theoretical")]);
     if (!ov.available) { root.innerHTML = `<div class="empty">无 step_trace 数据</div>`; return; }
     const r = ov.ratios, u = ov.us;
     const stepCount = Number(ov.step_count || 1);
@@ -41,7 +41,7 @@
       ? `${mfuEstimated ? "PROXY 周期估算 · " : ""}模型执行 HFU ${fmt.mfu(hfu)}（含重算，不含优化器）${mfuBand}${modelMac}`
       : "有效FLOPs /(峰值×step)";
     const cards = [
-      metric("有效计算占比", fmt.pct(r.effective_compute_pct), { tone: r.effective_compute_pct >= 60 ? "good" : "warn", foot: "Computing / Stage", barPct: r.effective_compute_pct }),
+      metric("设备计算占比", fmt.pct(r.effective_compute_pct), { tone: r.effective_compute_pct >= 60 ? "good" : "warn", foot: "Computing / Stage，含优化器与访存算子", barPct: r.effective_compute_pct }),
       metric("未掩盖通信", fmt.pct(r.comm_not_overlapped_pct), { tone: "bad", foot: fmt.us(u.comm_not_overlapped), barPct: r.comm_not_overlapped_pct }),
       metric("空闲 Free", fmt.pct(r.free_pct), { tone: "warn", foot: fmt.us(u.free), barPct: r.free_pct }),
       metric("通信掩盖率", fmt.pct(r.overlap_rate_pct), { tone: r.overlap_rate_pct < 40 ? "bad" : "good", foot: "Overlapped / Communication", barPct: r.overlap_rate_pct }),
@@ -101,7 +101,7 @@
       ? banner("warn", "♻️", `<strong>重计算观点：已开启，粒度更接近 ${esc(rco.granularity || "selective")}</strong>；估计占执行 FLOPs <strong>${fmt.pct((rco.flops_share || 0) * 100)}</strong>，平均每 step 约 <strong>${fmt.us((rco.overhead_us || 0) / stepCount)}</strong>。候选算子：${rcCandidates.slice(0, 5).map(x => `<strong>${esc(x.type)}</strong>（${esc(x.evidence || x.method)}）`).join("、") || "前向/反向相位组"}。`)
       : "";
     root.innerHTML = `
-      ${opinion}${rcEvidence}${workloadPanel(ef)}
+      ${opinion}${rcEvidence}
       <div class="grid cols-6">${cards.join("")}</div>
       <div class="grid cols-2" style="margin-top:16px">
         ${panel(multiStep ? `${stepCount}-step 窗口时间构成` : "Step 时间构成", "Computing / 未掩盖通信 / Free（单位 us）", `<div id="ov-donut" class="chart"></div>`)}

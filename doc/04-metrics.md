@@ -175,6 +175,11 @@ MegaMoE 以计算/通信融合窗口单列。框架输入 shape 可补充隐藏�
 不代表纯计算 MFU。无 CSV dtype 时可使用明确的 kernel 精度标记；缺少精度、
 校准或 MAC 计数器时 MFU 保持未知，MBU 也保持未知。
 
+Compressor/Grad、LightningIndexerV2 与 SparseLightningIndexerKLLossGrad 作为独立的
+计数器代理族核算，不直接复用旧 Indexer 的 shape 公式。首页 Computing/Stage 是设备
+占用口径，包含优化器和访存算子；矩阵算力页也保留优化器，因此二者不能直接相乘
+得到模型 MFU。融合 MoE 的详细工作量核算放在算子效率页。
+
 未配对 GEMM 不自动认定为重计算。重计算候选时间是累计上界，尚未扣除通信或其它
 算子重叠，不能当作已验证的关键路径收益。通信等待按实际区间跨桶分摊，
 `NOTIFY_RECORD` 不计作等待。P2P 可能来自优化器或权重交换，不能据此推断 PP。

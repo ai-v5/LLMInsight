@@ -22,6 +22,16 @@ def kernel(name="train", typ="MatMulV3", phase="model"):
 
 
 class WorkloadTests(unittest.TestCase):
+    def test_compressor_and_indexer_variants_count_as_model_work(self):
+        for typ in ("Compressor", "CompressorGrad", "LightningIndexerV2", "SparseLightningIndexerKLLossGrad"):
+            with self.subTest(typ=typ):
+                extra = kernel(typ, typ)
+                extra.update({"Input Shapes": "", "Output Shapes": ""})
+                base = compute_efficiency(SimpleNamespace(kernel_details=pd.DataFrame([kernel()])))
+                result = compute_efficiency(SimpleNamespace(kernel_details=pd.DataFrame([kernel(), extra])))
+                self.assertGreater(result["useful_flops_estimated_total"], base["useful_flops_estimated_total"])
+                self.assertFalse(result["flop_model_complete"])
+
     def test_unpaired_gemm_does_not_prove_recompute(self):
         result = compute_efficiency(SimpleNamespace(kernel_details=pd.DataFrame([kernel()])))
         self.assertFalse(result["recompute_estimate"]["available"])
