@@ -15,7 +15,7 @@
 | [03 · 数据与解析](03-data-and-parsing.md) | 8 文件能力映射、ProfileData 模型、CSV 清洗 / trace 流式、维度预留、校验基线 | 输入是什么？怎么解析的？ |
 | [04 · 指标层](04-metrics.md) | 各分析段口径与公式：MFU/MBU/Roofline、FlashAttention FLOP 模型、峰值校准、隐性开销、归因、What-if | 每个数字怎么算出来的？ |
 | [05 · 展示视图](05-views.md) | 前端 10 视图、数据源、现状、前端外壳约定 | 界面上能看到什么？ |
-| [06 · 洞察与 LLM](06-insights-and-llm.md) | 规则引擎 12 卡片、可插拔 LLM 后端、隐私契约、默认关闭、优雅降级 | 诊断怎么来的？LLM 怎么接？ |
+| [06 · 洞察与 LLM](06-insights-and-llm.md) | 规则引擎 13 卡片、可插拔 LLM 后端、隐私契约、默认关闭、优雅降级 | 诊断怎么来的？LLM 怎么接？ |
 | [07 · 路线图与验证](07-roadmap-and-verification.md) | 分阶段 P0–P5（含状态）、单卡 / 多卡、数值 + 渲染双重验证 | 做到哪了？怎么保证不退化？ |
 
 ## 系统全景
@@ -24,7 +24,7 @@
 flowchart LR
   A[ASCEND_PROFILER_OUTPUT<br/>8 文件 · 含 104MB trace] --> B[Parser<br/>ProfileData]
   B --> C[Metrics<br/>overview/efficiency/comm/<br/>hidden/attribution/memory/<br/>theoretical/timeline]
-  C --> D[Rules<br/>12 诊断卡片]
+  C --> D[Rules<br/>13 诊断卡片]
   C --> E[隐私安全摘要]
   D --> E
   E -. 默认关闭 .-> F[可插拔 LLM<br/>中文诊断叙述]
@@ -49,7 +49,7 @@ flowchart LR
 |---|---|
 | 数据解析（P0） | ✅ 8 文件 → ProfileData，trace 流式不入内存 |
 | 核心可视化（P1） | ✅ 10 视图（显存 / 回放为骨架，待采集补全） |
-| 分析引擎（P2） | ✅ 规则引擎 12 卡片 + 归因 + What-if + 采集体检 |
+| 分析引擎（P2） | ✅ 规则引擎 13 卡片 + 归因 + What-if + 采集体检 |
 | LLM 洞察（P3） | ✅ Provider 抽象 + 摘要构造 + 客户端已实现，**默认关闭** |
 | 全程化 / 多卡（P4–P5） | ⏳ 待多 step / 多卡数据 |
 

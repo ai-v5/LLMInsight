@@ -75,7 +75,12 @@ def _looks_like_profile_dir(path: str) -> bool:
             return True
         # also accept the MindStudio msprof-export layout (insight DB / op_summary)
         from ..parser.msprof import is_msprof_dir
-        return is_msprof_dir(path)
+        if is_msprof_dir(path):
+            return True
+        # and multi-rank training roots (one *_ascend_pt/ASCEND_PROFILER_OUTPUT
+        # capture per NPU): the loader analyses a representative rank + cluster
+        from ..parser.multirank import looks_like_multirank_root
+        return looks_like_multirank_root(path)
     except OSError:
         return False
 
@@ -193,7 +198,8 @@ class AppState:
         if not _looks_like_profile_dir(data_dir):
             return {"ok": False, "error": ("该目录下找不到 profiling 文件（需含 "
                     "kernel_details.csv / trace_view.json / step_trace_time.csv，或 "
-                    "msprof 的 mindstudio_insight_data.db / op_summary_*.csv 之一）")}
+                    "msprof 的 mindstudio_insight_data.db / op_summary_*.csv 之一，或 "
+                    "多 rank 采集根目录下含 *_ascend_pt/ASCEND_PROFILER_OUTPUT 子目录）")}
         with self._load_lock:
             if self.status == "loading":
                 return {"ok": False, "error": "正在加载中，请稍候"}
@@ -279,7 +285,7 @@ def _meta() -> Dict[str, Any]:
         "suggested_dir": load_last_dir() or SETTINGS.data_dir,
         "sections": ["overview", "hotspots", "efficiency", "matrix_power", "communication",
                      "hidden_overhead", "attribution", "memory", "theoretical",
-                     "timeline", "smart_timeline", "insights"],
+                     "timeline", "smart_timeline", "cluster", "insights"],
     }
 
 
@@ -313,6 +319,8 @@ ROUTES: Dict[str, Callable[[], Any]] = {
     "/api/theoretical": _section("theoretical"),
     "/api/timeline": _section("timeline"),
     "/api/smart_timeline": _section("smart_timeline"),
+    # cluster-wide per-rank summary (multi-rank capture roots; unavailable -> {})
+    "/api/cluster": _section("cluster"),
     "/api/insights": _insights,
     "/api/llm": _llm_run,
     "/api/all": lambda: STATE.metrics,

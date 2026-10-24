@@ -76,6 +76,37 @@ class ProfileData:
 
 > 这些数字同时是 `scripts/verify.py` 的断言基线（见 [07](07-roadmap-and-verification.md)），用于回归保护。
 
+## 3.6 多 rank 采集根目录（集群 profile）
+
+多节点训练（如 32 节点 × 8 NPU）的 profiler 根目录不是一份
+`ASCEND_PROFILER_OUTPUT`，而是每个 rank 一个目录：
+
+```
+profile_32node_.../
+  133_C01_B11_CPU1_1276060_20261024214905982_ascend_pt/
+      ASCEND_PROFILER_OUTPUT/        # 单 rank 的 8 文件采集
+      profiler_info_254.json
+      PROF_000001_.../host|device_0/...
+  <host>_<pid>_<ts>_ascend_pt/ ...
+```
+
+`parser/multirank.py` 负责识别这种根目录（`*_ascend_pt` 或含
+`ASCEND_PROFILER_OUTPUT` 的子目录），并给出两样东西：
+
+1. **代表 rank**：默认取 `step_trace_time.csv` 里 Stage 最接近集群中位数的
+   rank（可用 `LLMINSIGHT_RANK=<序号|目录名子串>` 覆盖），供现有的单卡
+   `ProfileData` 全量分析使用；
+2. **集群摘要**：只读每个 rank 的 `step_trace_time.csv`（几百字节 × N），
+   产出各 rank 的 Computing / 通信未掩盖 / Overlapped / Free / Stage、
+   分布统计（mean/median/std/CV/MAD/P5/P95）、慢卡离群判定
+   （`Stage > 中位 + max(3×1.4826×MAD, 2%)`）、最慢/最快 rank 与按节点聚合。
+   逐 rank 的 `communication.json` 全量解析是 opt-in
+   （`LLMINSIGHT_CLUSTER_COMM=1`，256 rank 约 130MB JSON），默认不做。
+
+对应输出：metrics 里的 `cluster` 段、`GET /api/cluster`、报告里的「集群概览」；
+`python -m llminsight.report --data-dir <根目录>` 可以直接为这种根目录出报告。
+单卡目录的行为不变（`cluster.available=false`，`resolve_multirank` 返回 `None`）。
+
 ---
 
 上一篇：[02 · 架构与技术取向](02-architecture.md) ｜ 下一篇：[04 · 指标层](04-metrics.md)

@@ -13,7 +13,7 @@ flowchart LR
   end
   subgraph 指标与规则层 Metrics + Rules
     B --> C[派生指标<br/>overview/efficiency/...]
-    C --> D[规则引擎<br/>12 诊断卡片]
+    C --> D[规则引擎<br/>13 诊断卡片]
   end
   subgraph 洞察层 Insight
     C --> E[隐私安全摘要]
@@ -146,6 +146,7 @@ sequenceDiagram
 | GET | `/api/memory` | 显存现状 + 配置驱动的内存-时间权衡 |
 | GET | `/api/theoretical` | 理论上界 + What-if + compute-bound |
 | GET | `/api/timeline` | 泳道占用 + overlap 段 + 频率 |
+| GET | `/api/cluster` | 多 rank 采集根目录的全 rank step 分布、慢卡/离群 rank、按节点聚合（单卡目录返回 `{"available": false}`） |
 | GET | `/api/insights` | 规则卡片 + 隐私安全摘要（`narrative=null`，不触发 LLM） |
 | GET | `/api/all` | 全部 metrics（调试用） |
 | POST | `/api/chip` | `{"chip":"950DT"}` 切换参考芯片，返回重算结果 |
