@@ -48,6 +48,9 @@ python -m llminsight.server --port 8765 --no-browser
 ## 能做什么
 
 - 解析 Ascend profiler 和 MindStudio 导出的 CSV/JSON/DB 数据。
+- 支持多 rank 采集根目录（每 rank 一个 `*_ascend_pt/ASCEND_PROFILER_OUTPUT`）：
+  自动选 step 中位数的代表 rank 做单卡分析，并汇总全部 rank 的 step 分解、
+  慢卡/离群 rank 与按节点聚合的集群概览。
 - 展示 MFU、MBU、Roofline、通信、显存、时间线和隐藏开销。
 - 将算子和通信归因到模型结构，并给出规则诊断与优化建议。
 - 导出自包含 HTML 报告，支持芯片参考值切换和 What-if 分析。

@@ -68,6 +68,9 @@ class ProfileData:
     memory_record: pd.DataFrame = field(default_factory=pd.DataFrame)
     npu_module_mem: pd.DataFrame = field(default_factory=pd.DataFrame)
     operator_memory: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # Populated only when the loaded directory is a multi-rank capture root (see
+    # parser.multirank): per-rank step-trace summary + representative selection.
+    cluster: Dict[str, Any] = field(default_factory=dict)
     meta: Dict[str, Any] = field(default_factory=dict)
 
     # trace is never held in memory; stream on demand

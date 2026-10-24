@@ -33,6 +33,9 @@ def compute_all(prof, capture: Dict[str, Any] = None) -> Dict[str, Any]:
         # secret-free) so the report header and UI show what the DATA says, not a
         # hardcoded ModelConfig.
         "meta": {**prof.meta, "settings": SETTINGS.to_dict(), "config": capture},
+        # Per-rank summary for multi-rank capture roots (empty -> unavailable);
+        # every other section is the representative rank's single-rank analysis.
+        "cluster": getattr(prof, "cluster", None) or {"available": False},
         "overview": ov,
         "hotspots": core.hotspots(prof),
         "efficiency": eff,

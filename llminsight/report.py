@@ -16,11 +16,13 @@ Usage
     html = build_report_html(state.metrics, state.cards)
 
     # headless (no server):
-    python -m llminsight.report --out report.html
+    python -m llminsight.report --out report.html [--data-dir <dir>] [--rank <rank>]
 """
 from __future__ import annotations
 
 import html as _html
+import os
+import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -648,7 +650,19 @@ def _sec_communication(comm: Dict) -> str:
                       f'传输墙钟 {_us_val(wc, "transfer_wall_us")}' if wc else "")
                    + '</div>')
     note = f'<div class="note">{_e(comm.get("note", ""))}</div>'
-    return _panel("通信分析", sub, tbl + bd_note + note)
+    zt = comm.get("zero_transit") or {}
+    zt_note = ""
+    if zt.get("count"):
+        by_type = "、".join(f"{k}×{v.get('count')}"
+                            for k, v in sorted((zt.get("by_type") or {}).items(),
+                                               key=lambda kv: -kv[1].get("elapse_ms", 0))[:4])
+        zt_note = (f'<div class="note"><b>零载荷集合通信</b>：{zt.get("count")} 次 '
+                   f'Transit≈0 的 collective 累计 {zt.get("elapse_ms", 0) / 1000:.2f}s，'
+                   f'占通信 Elapse {_pct(zt.get("pct_of_comm"))}（{_e(by_type)}）；'
+                   f'平均单次 {zt.get("mean_elapse_ms", 0):.1f}ms，时间几乎全是 '
+                   f'wait/synchronization——属于并行组内 barrier / 相位对齐占位，'
+                   f'不是链路带宽问题。</div>')
+    return _panel("通信分析", sub, tbl + bd_note + zt_note + note)
 
 
 def _sec_hidden(ho: Dict) -> str:
@@ -1057,6 +1071,94 @@ def _sec_replay(overview: Dict) -> str:
 
 
 # --------------------------------------------------------------------------- #
+def _sec_cluster(cl: Dict) -> str:
+    """多 rank 采集根目录的集群概览（代表 rank 选择 + 每 rank step 分布）。
+
+    其余章节都是代表 rank 的单卡分析；这一节回答"这份 32 节点采集里各 rank
+    是否均衡、选的代表卡是否典型、最慢的卡是谁"。
+    """
+    if not cl or not cl.get("available"):
+        return ""
+    rep = cl.get("representative", {}) or {}
+    stats = cl.get("stats", {}) or {}
+    stage = stats.get("stage_us", {}) or {}
+    ranks = cl.get("ranks", []) or []
+    by_host = cl.get("by_host", []) or []
+    outliers = cl.get("outliers", {}) or {}
+    flagged = outliers.get("ranks", []) or []
+
+    metrics = "".join([
+        _metric("采集 rank 数", f"{_int(cl.get('n_ranks'))}",
+                f"{len(by_host)} 个节点 · device {cl.get('device_ids')}",
+                "good" if cl.get('n_ranks') else ""),
+        _metric("step 时间中位", _us(stage.get("median")),
+                "min %s / max %s" % (_us(stage.get("min")), _us(stage.get("max")))),
+        _metric("rank 间离散度", _pct(stage.get("cv_pct")),
+                "CV = std / mean（越小越均衡）",
+                "good" if (stage.get("cv_pct") or 0) < 1 else "warn"),
+        _metric("慢卡告警", f"{len(flagged)} rank",
+                "规则：> 中位 + max(3·1.4826·MAD, 2%)",
+                "bad" if flagged else "good"),
+        _metric("代表 rank", str(rep.get("host") or rep.get("rank_dir", "?"))[:18],
+                "rank %s · %s" % (rep.get("rank_dir", "?"), rep.get("selection", "?"))),
+        _metric("采集窗口", f"{len(cl.get('step_ids') or [])} step",
+                "单 step 快照" if cl.get("single_step_capture") else "多 step 窗口"),
+    ])
+    body = f'<div class="grid g4">{metrics}</div>'
+
+    dist_rows = []
+    for key, label in (("stage_us", "Step 总时长"), ("computing_us", "Computing"),
+                       ("comm_not_overlapped_us", "通信未掩盖"),
+                       ("communication_us", "通信总时长"),
+                       ("overlapped_us", "通信被掩盖"),
+                       ("free_us", "Free")):
+        st = stats.get(key) or {}
+        if not st:
+            continue
+        dist_rows.append([
+            label, _us(st.get("median")), _us(st.get("mean")),
+            _us(st.get("min")), _us(st.get("max")), _pct(st.get("cv_pct")),
+        ])
+    if dist_rows:
+        body += ('<div class="p-sub" style="margin-top:16px">每 rank step 分布'
+                 '（来自各 rank 的 step_trace_time.csv）</div>'
+                 + _table(["指标", "中位", "均值", "最小", "最大", "CV"], dist_rows))
+
+    slow_rows = []
+    for r in (cl.get("slowest") or [])[:5]:
+        vs = ""
+        med = stage.get("median")
+        if med:
+            vs = "%+.2f%%" % (100.0 * (r.get("stage_us", 0) / med - 1.0))
+        slow_rows.append([r.get("rank_dir", "")[:42], r.get("host", ""),
+                          str(r.get("device_id", "")), _us(r.get("stage_us")), vs])
+    if slow_rows:
+        body += ('<div class="p-sub" style="margin-top:16px">最慢 5 个 rank</div>'
+                 + _table(["rank 目录", "host", "device", "stage", "vs 中位"], slow_rows,
+                          ["l", "l", "r", "r", "r"]))
+    if flagged:
+        rows = [[r.get("rank_dir", "")[:42], r.get("host", ""), str(r.get("device_id", "")),
+                 _us(r.get("stage_us")), "%+.2f%%" % r.get("vs_median_pct", 0)] for r in flagged[:10]]
+        body += ('<div class="p-sub" style="margin-top:16px">离群 rank（慢卡 / 掉队）</div>'
+                 + _table(["rank 目录", "host", "device", "stage", "vs 中位"], rows,
+                          ["l", "l", "r", "r", "r"]))
+
+    host_rows = []
+    for h in by_host[:12]:
+        host_rows.append([h.get("host", ""), str(h.get("n_ranks", "")),
+                          _us(h.get("stage_mean_us")), _us(h.get("stage_max_us")),
+                          _us(h.get("stage_spread_us"))])
+    if host_rows:
+        body += ('<div class="p-sub" style="margin-top:16px">按节点聚合（stage 均值最高在前）</div>'
+                 + _table(["host", "rank 数", "stage 均值", "stage 最大", "节点内极差"], host_rows,
+                          ["l", "r", "r", "r", "r"]))
+
+    body += (f'<div class="note">{_e(cl.get("note", ""))}'
+             + (f' 代表 rank 的完整单卡分析见其余章节。' if ranks else "")
+             + "</div>")
+    return _panel("集群概览", "多 rank 采集根目录 → 代表 rank + 全 rank step 分布", body)
+
+
 def _panel(title: str, sub: str, body: str) -> str:
     return (f'<section class="panel"><h2>{_e(title)}</h2>'
             + (f'<div class="p-sub">{sub}</div>' if sub else "")
@@ -1184,6 +1286,7 @@ def build_report_html(metrics: Dict[str, Any],
     # (总览 hero); overview composition + What-if are the rest of 总览.
     sections = [
         _sec_header(meta, overview, theo, eff, gen),
+        _sec_cluster(metrics.get("cluster", {})),              # 集群概览（多 rank 根目录）
         _sec_overview(overview),                              # 总览
         _sec_theoretical(theo),                              # 总览 · What-if
         _sec_whatif_floor(theo),                             # 总览 · What-if 现实地板
@@ -1227,10 +1330,34 @@ def _main(argv=None) -> int:
         description="Export a self-contained LLMInsight HTML report (no server).")
     ap.add_argument("--out", "-o", default="llminsight_report.html",
                     help="output HTML path (default: llminsight_report.html)")
+    ap.add_argument("--data-dir", "-d", default=None,
+                    help="profiling directory (defaults to $LLMINSIGHT_DATA_DIR); a "
+                         "multi-rank capture root loads its representative rank + "
+                         "cluster summary")
+    ap.add_argument("--rank", default=None,
+                    help="multi-rank root only: rank directory index or name substring "
+                         "to analyse instead of the median-step representative rank")
     args = ap.parse_args(argv)
+
+    if args.data_dir:
+        SETTINGS.data_dir = os.path.abspath(os.path.expanduser(args.data_dir))
+    if args.rank:
+        os.environ["LLMINSIGHT_RANK"] = str(args.rank)
 
     print(f"[report] loading profile from: {SETTINGS.data_dir}")
     prof = load_profile(SETTINGS.data_dir)
+    counts = (prof.meta or {}).get("counts") or {}
+    if not any(int(v or 0) > 0 for v in counts.values()):
+        warnings = (prof.meta or {}).get("warnings") or []
+        print("[report] ERROR: no profiling data recognised in that directory.", file=sys.stderr)
+        for w in warnings:
+            print("         " + w, file=sys.stderr)
+        return 2
+    cluster = getattr(prof, "cluster", None) or {}
+    if cluster.get("available"):
+        rep = cluster.get("representative") or {}
+        print(f"[report] multi-rank root: {cluster.get('n_ranks')} ranks; "
+              f"representative {rep.get('rank_dir')} ({rep.get('selection')})")
     m = compute_all(prof)
     # compute_all derived the config from the profiling and stashed it on m.meta;
     # reuse it so cards reflect the data (no launch-script dependency).

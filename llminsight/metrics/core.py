@@ -271,6 +271,40 @@ def communication(prof) -> Dict[str, Any]:
         for c in top
     ]
 
+    # Zero-payload collectives: ops that move (almost) no bytes but still take
+    # wall-clock.  They are barriers / phase-alignment placeholders inside a
+    # parallel group (e.g. a 2-rank edp group doing a 0-byte allReduce per layer),
+    # so their time is pure synchronization, not bandwidth.  Surfaced separately
+    # because it is invisible in the bandwidth table (transit≈0 -> bandwidth N/A).
+    zero_transit_ops = [
+        c for c in comms
+        if _op_transit_mb(c) <= 0.01 and (c.get("elapse_ms") or 0.0) >= 0.05
+    ]
+    zero_transit_elapse = round(sum(c["elapse_ms"] for c in zero_transit_ops), 3)
+    zero_by_type: Dict[str, Dict[str, Any]] = {}
+    for c in zero_transit_ops:
+        row = zero_by_type.setdefault(c["type"], {"count": 0, "elapse_ms": 0.0,
+                                                  "sync_ms": 0.0, "wait_ms": 0.0})
+        row["count"] += 1
+        row["elapse_ms"] += c["elapse_ms"]
+        row["sync_ms"] += c.get("sync_ms") or 0.0
+        row["wait_ms"] += c.get("wait_ms") or 0.0
+    for row in zero_by_type.values():
+        for key in ("elapse_ms", "sync_ms", "wait_ms"):
+            row[key] = round(row[key], 3)
+    zero_transit = {
+        "count": len(zero_transit_ops),
+        "elapse_ms": zero_transit_elapse,
+        "pct_of_comm": (round(100.0 * zero_transit_elapse / total_elapse, 2)
+                        if total_elapse else None),
+        "mean_elapse_ms": (round(zero_transit_elapse / len(zero_transit_ops), 3)
+                           if zero_transit_ops else None),
+        "by_type": zero_by_type,
+        "note": ("Transit Size≈0 的集合通信：耗时几乎全是 wait/synchronization，"
+                 "属于并行组内的 barrier / 相位对齐占位，不是链路带宽问题。"
+                 "优先核查并行组划分（谁和谁同步）与能否合并/消除这些 0 字节 collective。"),
+    }
+
     # msprof: device-level effective-transfer vs cross-rank-wait split (None on
     # torch_npu, whose communication.json already carries Transit/Wait per op).
     breakdown = ((getattr(prof, "meta", {}) or {}).get("msprof") or {}).get("comm_breakdown")
@@ -297,6 +331,7 @@ def communication(prof) -> Dict[str, Any]:
         "overall_bandwidth_with_wait_gbps": overall_bandwidth_with_wait_gbps,
         "by_type": type_rows,
         "top": top_out,
+        "zero_transit": zero_transit,
         "note": note,
     }
 
