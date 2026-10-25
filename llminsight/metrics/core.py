@@ -223,8 +223,13 @@ def _op_transit_mb(c: Dict[str, Any]) -> float:
 
 
 def _bw(size_mb: float, transit_ms: float):
-    """Effective bus bandwidth in GB/s (MB/ms); None when nothing was moved."""
-    if not size_mb or not transit_ms or transit_ms <= 0:
+    """Effective bus bandwidth in GB/s (MB/ms); None when nothing was moved.
+
+    Payloads below 0.01 MB are control/heartbeat bytes (the same threshold the
+    zero-payload diagnosis uses), so they must not surface as "0.0 GB/s" — a
+    barrier has no bandwidth at all, it is not an infinitely slow link.
+    """
+    if not size_mb or size_mb <= 0.01 or not transit_ms or transit_ms <= 0:
         return None
     return round(size_mb / transit_ms, 1)
 
