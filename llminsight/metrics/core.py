@@ -198,13 +198,113 @@ def hotspots(prof) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Collective-communication helpers shared by the communication section.
+#   * an HCCL op carries its parallel-group id in the name (see
+#     parser.profile.comm_meta_from_name) so the per-communicator split is a
+#     plain group-by;
+#   * FSDP roles (dense weights vs MoE expert weights) are recovered from the
+#     host-side `FSDP::all_gather (<module>)` / `FSDP::post_backward_reduce
+#     (<module>)` annotations that torch_npu records in operator_details.csv.
+#     Each annotation pairs 1:1 with one HCCL collective, so counting the
+#     annotations per module family and matching them against a communicator's
+#     op counts identifies the group without hard-coding communicator ids.
+_COMM_ROLE_LABELS = {
+    "dense_fsdp": "dense-FSDP",
+    "expert_fsdp": "expert-FSDP",
+    "ep_a2a": "EP / a2a",
+    "activation": "CP / KV 激活",
+    "barrier": "纯 barrier",
+    "unknown": "未知",
+}
+
+
+def _op_transit_mb(c: Dict[str, Any]) -> float:
+    return sum((l or {}).get("transit_mb", 0) or 0 for l in (c.get("links") or {}).values())
+
+
+def _bw(size_mb: float, transit_ms: float):
+    """Effective bus bandwidth in GB/s (MB/ms); None when nothing was moved."""
+    if not size_mb or not transit_ms or transit_ms <= 0:
+        return None
+    return round(size_mb / transit_ms, 1)
+
+
+def _fsdp_unit_counts(prof) -> Dict[str, int]:
+    """Count FSDP2 unit hooks per module family from operator_details.csv.
+
+    Dense units are `FSDP::all_gather (model.layers.N)`; MoE expert units are
+    `... (model.layers.N.mlp.experts)`. `all_gather_copy_out` is the host copy
+    that follows each gather and must not be counted twice.
+    """
+    od = getattr(prof, "operator_details", None)
+    if od is None or getattr(od, "empty", True) or "Name" not in getattr(od, "columns", []):
+        return {}
+    names = od["Name"].astype(str)
+    is_ag = names.str.startswith("FSDP::all_gather") & ~names.str.startswith(
+        "FSDP::all_gather_copy_out")
+    is_rs = names.str.startswith("FSDP::post_backward_reduce")
+    if not (is_ag.any() or is_rs.any()):
+        return {}
+    expert = names.str.contains(".mlp.experts", regex=False)
+    return {
+        "dense_ag_events": int((is_ag & ~expert).sum()),
+        "expert_ag_events": int((is_ag & expert).sum()),
+        "dense_rs_events": int((is_rs & ~expert).sum()),
+        "expert_rs_events": int((is_rs & expert).sum()),
+    }
+
+
+def _classify_group_role(stats: Dict[str, Any], units: Dict[str, int]):
+    """(role, basis) for one HCCL communicator group."""
+    types = stats.get("types") or {}
+    ag = int(types.get("allGather", 0))
+    rs = int(types.get("reduceScatter", 0))
+    if any(t.startswith("alltoall") for t in types):
+        return "ep_a2a", "该通信域含 alltoallv（含 MC2 融合 AllToAllv）算子"
+    expert_ag = units.get("expert_ag_events", 0)
+    expert_rs = units.get("expert_rs_events", 0)
+    dense_ag = units.get("dense_ag_events", 0)
+    dense_rs = units.get("dense_rs_events", 0)
+    expert_match = bool(expert_ag and expert_rs
+                        and abs(ag - expert_ag) <= 2 and abs(rs - expert_rs) <= 2)
+    dense_match = bool(dense_ag and dense_rs
+                       and abs(ag - dense_ag) <= 2 and abs(rs - dense_rs) <= 2)
+    if expert_match and dense_match:
+        # Both unit families have the same AG/RS counts (tiny models / proxies):
+        # the degenerate expert-FSDP case is the one that moves no bytes, so use
+        # payload as the tie-breaker instead of guessing.
+        if (stats.get("size_mb") or 0.0) <= 0.01:
+            return ("expert_fsdp",
+                    f"AG/RS 次数 ({ag}/{rs}) 同时匹配两族单元，但 0 载荷 → 判定 expert-FSDP"
+                    f"（单元数 {expert_ag}/{expert_rs}）")
+        return ("dense_fsdp",
+                f"AG/RS 次数 ({ag}/{rs}) 同时匹配两族单元，但有载荷 → 判定 dense-FSDP"
+                f"（单元数 {dense_ag}/{dense_rs}）")
+    if expert_match:
+        return ("expert_fsdp",
+                f"AG/RS 次数 ({ag}/{rs}) 与 FSDP::all_gather(...mlp.experts) / "
+                f"post_backward_reduce(...mlp.experts) 单元数 ({expert_ag}/{expert_rs}) 匹配")
+    if dense_match:
+        return ("dense_fsdp",
+                f"AG/RS 次数 ({ag}/{rs}) 与 FSDP 非 expert 单元数 ({dense_ag}/{dense_rs}) 匹配")
+    if stats.get("zero_payload_count") and stats["zero_payload_count"] == stats.get("count"):
+        return "barrier", "该通信域全部算子 0 载荷（纯同步）"
+    if ag or rs:
+        return "activation", "有 AG/RS 但次数不匹配 FSDP 单元数（激活/KV 类通信）"
+    return "unknown", "无法从算子名/单元计数判定角色"
+
+
+# --------------------------------------------------------------------------- #
 def communication(prof) -> Dict[str, Any]:
     comms = [c for c in prof.communication if c["type"] != "Total"]
     reported_total = next((c for c in prof.communication if c["type"] == "Total"), None)
     if not comms:
         return {"available": False}
 
+    units = _fsdp_unit_counts(prof)
+
     by_type: Dict[str, Dict[str, Any]] = {}
+    by_group: Dict[str, Dict[str, Any]] = {}
     for c in comms:
         t = by_type.setdefault(
             c["type"],
@@ -216,8 +316,32 @@ def communication(prof) -> Dict[str, Any]:
         t["wait_ms"] += c["wait_ms"]
         t["sync_ms"] += c["sync_ms"]
         t["transit_ms"] += c["transit_ms"]
-        t["transit_mb"] += sum(l.get("transit_mb", 0) for l in c["links"].values())
+        t["transit_mb"] += _op_transit_mb(c)
         t["_wait_ratio_sum"] += min(c.get("wait_ratio", 0) or 0, 1.0)
+
+        gid = c.get("group")
+        if gid:
+            g = by_group.setdefault(
+                gid,
+                {"group": gid, "count": 0, "types": {}, "flavors": {},
+                 "elapse_ms": 0.0, "wait_ms": 0.0, "sync_ms": 0.0, "transit_ms": 0.0,
+                 "size_mb": 0.0, "zero_payload_count": 0, "zero_payload_ms": 0.0,
+                 "_wait_ratio_sum": 0.0},
+            )
+            g["count"] += 1
+            g["types"][c["type"]] = g["types"].get(c["type"], 0) + 1
+            fl = c.get("flavor")
+            if fl and fl != "plain":
+                g["flavors"][fl] = g["flavors"].get(fl, 0) + 1
+            g["elapse_ms"] += c["elapse_ms"]
+            g["wait_ms"] += c["wait_ms"]
+            g["sync_ms"] += c["sync_ms"]
+            g["transit_ms"] += c["transit_ms"]
+            g["size_mb"] += _op_transit_mb(c)
+            g["_wait_ratio_sum"] += min(c.get("wait_ratio", 0) or 0, 1.0)
+            if _op_transit_mb(c) <= 0.01 and (c.get("elapse_ms") or 0.0) >= 0.05:
+                g["zero_payload_count"] += 1
+                g["zero_payload_ms"] += c["elapse_ms"]
 
     type_rows = sorted(by_type.values(), key=lambda x: x["elapse_ms"], reverse=True)
     for t in type_rows:
@@ -235,6 +359,15 @@ def communication(prof) -> Dict[str, Any]:
         t["bandwidth_with_wait_gbps"] = (round(t["transit_mb"] / t["elapse_ms"], 1)
                                          if t["transit_mb"] > 0 and t["elapse_ms"] > 0
                                          else None)
+        # MC2 fused all-to-all (dispatch/combine) is folded into `alltoallv`; flag
+        # it so the UI can tell "fused a2a" from a plain hcom_alltoallv.
+        t["fused"] = any(c.get("fused") for c in comms if c["type"] == t["type"])
+        flavors: Dict[str, int] = {}
+        for c in comms:
+            if c["type"] == t["type"] and c.get("flavor") not in (None, "plain"):
+                flavors[c["flavor"]] = flavors.get(c["flavor"], 0) + 1
+        if flavors:
+            t["flavors"] = flavors
 
     total_elapse = sum(c["elapse_ms"] for c in comms)
     total_wait = sum(c["wait_ms"] for c in comms)
@@ -248,9 +381,6 @@ def communication(prof) -> Dict[str, Any]:
     overall_bandwidth_with_wait_gbps = (round(total_transit_mb / total_elapse, 1)
                                         if total_transit_mb > 0 and total_elapse > 0
                                         else None)
-
-    def _op_transit_mb(c):
-        return sum(l.get("transit_mb", 0) for l in c["links"].values())
 
     top = sorted(comms, key=lambda c: c["elapse_ms"], reverse=True)[:15]
     top_out = [
@@ -271,6 +401,137 @@ def communication(prof) -> Dict[str, Any]:
         for c in top
     ]
 
+    # ---- per-communicator split (dense-FSDP / expert-FSDP / EP-a2a / CP-KV) ----- #
+    group_rows = []
+    role_by_group: Dict[str, str] = {}
+    for g in by_group.values():
+        for key in ("elapse_ms", "wait_ms", "sync_ms", "transit_ms", "size_mb",
+                    "zero_payload_ms"):
+            g[key] = round(g[key], 3)
+        g["size_gb"] = round(g["size_mb"] / 1000.0, 3)
+        g["bandwidth_gbps"] = _bw(g["size_mb"], g["transit_ms"])
+        g["bandwidth_with_wait_gbps"] = (round(g["size_mb"] / g["elapse_ms"], 1)
+                                         if g["size_mb"] > 0 and g["elapse_ms"] > 0
+                                         else None)
+        g["wait_pct"] = (round(100.0 * g["_wait_ratio_sum"] / g["count"], 1)
+                         if g["count"] else 0.0)
+        g.pop("_wait_ratio_sum", None)
+        g["role"], g["role_basis"] = _classify_group_role(g, units)
+        g["role_label"] = _COMM_ROLE_LABELS.get(g["role"], g["role"])
+        role_by_group[g["group"]] = g["role"]
+        group_rows.append(g)
+    group_rows.sort(key=lambda x: x["elapse_ms"], reverse=True)
+
+    def _split(rows, want_type):
+        sub = [c for c in rows if c["type"] == want_type]
+        size_mb = sum(_op_transit_mb(c) for c in sub)
+        transit_ms = sum(c["transit_ms"] for c in sub)
+        elapse_ms = sum(c["elapse_ms"] for c in sub)
+        per_op = sorted(_op_transit_mb(c) / c["transit_ms"]
+                        for c in sub if c["transit_ms"] > 0)
+        return {
+            "count": len(sub),
+            "size_gb": round(size_mb / 1000.0, 3),
+            "elapse_ms": round(elapse_ms, 3),
+            "wait_ms": round(sum(c["wait_ms"] for c in sub), 3),
+            "transit_ms": round(transit_ms, 3),
+            "bandwidth_gbps": _bw(size_mb, transit_ms),
+            "bandwidth_with_wait_gbps": (round(size_mb / elapse_ms, 1)
+                                         if size_mb > 0 and elapse_ms > 0 else None),
+            "per_op_p50_gbps": (round(per_op[len(per_op) // 2], 1) if per_op else None),
+        }
+
+    # ---- a2a (MC2 fused AllToAllV) ------------------------------------------- #
+    a2a_ops = [c for c in comms if (c.get("type") or "").startswith("alltoallv")]
+    a2a: Dict[str, Any] = {"available": bool(a2a_ops)}
+    if a2a_ops:
+        size_mb = sum(_op_transit_mb(c) for c in a2a_ops)
+        transit_ms = sum(c["transit_ms"] for c in a2a_ops)
+        elapse_ms = sum(c["elapse_ms"] for c in a2a_ops)
+        wait_ms = sum(c["wait_ms"] for c in a2a_ops)
+        per_op = sorted(_op_transit_mb(c) / c["transit_ms"]
+                        for c in a2a_ops if c["transit_ms"] > 0)
+
+        def _flavor_block(sub):
+            smb = sum(_op_transit_mb(c) for c in sub)
+            tms = sum(c["transit_ms"] for c in sub)
+            return {"count": len(sub), "size_gb": round(smb / 1000.0, 3),
+                    "bandwidth_gbps": _bw(smb, tms),
+                    "wait_ms": round(sum(c["wait_ms"] for c in sub), 3)}
+
+        a2a.update({
+            "count": len(a2a_ops),
+            "fused": any(c.get("fused") for c in a2a_ops),
+            "size_gb": round(size_mb / 1000.0, 3),
+            "per_op_mb": round(size_mb / len(a2a_ops), 3),
+            "elapse_ms": round(elapse_ms, 3),
+            "wait_ms": round(wait_ms, 3),
+            "transit_ms": round(transit_ms, 3),
+            "bandwidth_gbps": _bw(size_mb, transit_ms),
+            "bandwidth_with_wait_gbps": (round(size_mb / elapse_ms, 1)
+                                         if elapse_ms > 0 else None),
+            "per_op_bw_p50": round(per_op[len(per_op) // 2], 1) if per_op else None,
+            "per_op_bw_p90": (round(per_op[min(len(per_op) - 1,
+                                              int(0.9 * (len(per_op) - 1)))], 1)
+                              if per_op else None),
+            "per_op_bw_max": round(per_op[-1], 1) if per_op else None,
+            "wait_share_pct": (round(100.0 * wait_ms / total_wait, 1)
+                               if total_wait else None),
+            "dispatch": _flavor_block([c for c in a2a_ops
+                                       if c.get("flavor") == "mc2_dispatch"]),
+            "combine": _flavor_block([c for c in a2a_ops
+                                      if c.get("flavor") == "mc2_combine"]),
+            "groups": sorted({c["group"] for c in a2a_ops if c.get("group")}),
+        })
+
+    # ---- dense-FSDP vs expert-FSDP AG/RS -------------------------------------- #
+    dense_ops = [c for c in comms if role_by_group.get(c.get("group")) == "dense_fsdp"]
+    expert_ops = [c for c in comms if role_by_group.get(c.get("group")) == "expert_fsdp"]
+    fsdp: Dict[str, Any] = {"available": bool(dense_ops or expert_ops), "units": units}
+    if fsdp["available"]:
+        fsdp["dense"] = {
+            "groups": sorted({c["group"] for c in dense_ops if c.get("group")}),
+            "ag": _split(dense_ops, "allGather"),
+            "rs": _split(dense_ops, "reduceScatter"),
+        }
+        fsdp["expert"] = {
+            "groups": sorted({c["group"] for c in expert_ops if c.get("group")}),
+            "ag": _split(expert_ops, "allGather"),
+            "rs": _split(expert_ops, "reduceScatter"),
+        }
+        fsdp["note"] = (
+            "角色由 operator_details 的 FSDP::all_gather / post_backward_reduce 模块名"
+            "（model.layers.N 为 dense 单元，model.layers.N.mlp.experts 为 expert 单元）"
+            "与各通信域 AG/RS 次数匹配得出；expert 侧 0 字节说明 efsdp 没有真正 unshard 参数，"
+            "其耗时全部是同步等待。")
+
+    # ---- wait attribution (等最慢 rank) --------------------------------------- #
+    role_wait: Dict[str, float] = {}
+    for c in comms:
+        role = role_by_group.get(c.get("group"), "unknown")
+        role_wait[role] = role_wait.get(role, 0.0) + c["wait_ms"]
+    wait_attribution = {
+        "total_wait_ms": round(total_wait, 2),
+        "top": [
+            {
+                "name": c["name"].split("@")[0],
+                "type": c["type"],
+                "group": c.get("group"),
+                "wait_ms": round(c["wait_ms"], 3),
+                "share_pct": (round(100.0 * c["wait_ms"] / total_wait, 2)
+                              if total_wait else None),
+            }
+            for c in sorted(comms, key=lambda x: x["wait_ms"], reverse=True)[:10]
+        ],
+        "by_role": [
+            {"role": role, "role_label": _COMM_ROLE_LABELS.get(role, role),
+             "wait_ms": round(v, 2),
+             "share_pct": (round(100.0 * v / total_wait, 2) if total_wait else None)}
+            for role, v in sorted(role_wait.items(), key=lambda kv: -kv[1])
+            if v > 0
+        ],
+    }
+
     # Zero-payload collectives: ops that move (almost) no bytes but still take
     # wall-clock.  They are barriers / phase-alignment placeholders inside a
     # parallel group (e.g. a 2-rank edp group doing a 0-byte allReduce per layer),
@@ -282,6 +543,7 @@ def communication(prof) -> Dict[str, Any]:
     ]
     zero_transit_elapse = round(sum(c["elapse_ms"] for c in zero_transit_ops), 3)
     zero_by_type: Dict[str, Dict[str, Any]] = {}
+    zero_by_group: Dict[str, Dict[str, Any]] = {}
     for c in zero_transit_ops:
         row = zero_by_type.setdefault(c["type"], {"count": 0, "elapse_ms": 0.0,
                                                   "sync_ms": 0.0, "wait_ms": 0.0})
@@ -289,9 +551,22 @@ def communication(prof) -> Dict[str, Any]:
         row["elapse_ms"] += c["elapse_ms"]
         row["sync_ms"] += c.get("sync_ms") or 0.0
         row["wait_ms"] += c.get("wait_ms") or 0.0
+        if c.get("group"):
+            gr = zero_by_group.setdefault(c["group"], {"group": c["group"], "count": 0,
+                                                       "elapse_ms": 0.0, "wait_ms": 0.0})
+            gr["count"] += 1
+            gr["elapse_ms"] += c["elapse_ms"]
+            gr["wait_ms"] += c.get("wait_ms") or 0.0
     for row in zero_by_type.values():
         for key in ("elapse_ms", "sync_ms", "wait_ms"):
             row[key] = round(row[key], 3)
+    zero_group_rows = []
+    for gr in zero_by_group.values():
+        gr["elapse_ms"] = round(gr["elapse_ms"], 3)
+        gr["wait_ms"] = round(gr["wait_ms"], 3)
+        gr["role"] = role_by_group.get(gr["group"], "unknown")
+        gr["role_label"] = _COMM_ROLE_LABELS.get(gr["role"], gr["role"])
+        zero_group_rows.append(gr)
     zero_transit = {
         "count": len(zero_transit_ops),
         "elapse_ms": zero_transit_elapse,
@@ -300,6 +575,8 @@ def communication(prof) -> Dict[str, Any]:
         "mean_elapse_ms": (round(zero_transit_elapse / len(zero_transit_ops), 3)
                            if zero_transit_ops else None),
         "by_type": zero_by_type,
+        "groups": sorted(zero_by_group.keys()),
+        "by_group": sorted(zero_group_rows, key=lambda x: -x["elapse_ms"]),
         "note": ("Transit Size≈0 的集合通信：耗时几乎全是 wait/synchronization，"
                  "属于并行组内的 barrier / 相位对齐占位，不是链路带宽问题。"
                  "优先核查并行组划分（谁和谁同步）与能否合并/消除这些 0 字节 collective。"),
@@ -330,6 +607,10 @@ def communication(prof) -> Dict[str, Any]:
         "overall_bandwidth_gbps": overall_bandwidth_gbps,
         "overall_bandwidth_with_wait_gbps": overall_bandwidth_with_wait_gbps,
         "by_type": type_rows,
+        "by_group": group_rows,
+        "a2a": a2a,
+        "fsdp": fsdp,
+        "wait_attribution": wait_attribution,
         "top": top_out,
         "zero_transit": zero_transit,
         "note": note,

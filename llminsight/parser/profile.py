@@ -18,6 +18,50 @@ import pandas as pd
 from .trace import iter_events
 
 _COMM_TYPE_RE = re.compile(r"hcom_([A-Za-z0-9]+?)_", re.IGNORECASE)
+# Every HCCL op name carries "<group_id>_<op_index>_1" (optionally prefixed by a
+# second underscore and followed by @<group-hash>):
+#   hcom_allGather__612_1_1@5862...                     (FSDP style)
+#   hcom_allGather_AicpuKernel_109_47_1@...             (AICPU-launched collective)
+#   AlltoAllvGroupedMatMulMc2AicpuKernel_823_65_1@...   (MC2 fused dispatch)
+_COMM_GROUP_RE = re.compile(r"(?:__|_)(\d+)_\d+_1(?:@|$)")
+# MC2 fused MoE kernels: one kernel does a collective all-to-all AND a grouped
+# GEMM, so they never match the `hcom_<type>_` pattern and used to fall into
+# `unknown` (dropping their whole a2a traffic from the a2a view):
+#   AllToAllv -> GroupedMatMul : token dispatch (a2a first, then expert GEMM)
+#   GroupedMatMul -> AllToAllv : token combine  (expert GEMM first, then a2a)
+_MC2_FUSED = (
+    ("alltoallvgroupedmatmul", "alltoallv", "mc2_dispatch"),
+    ("groupedmatmulalltoallv", "alltoallv", "mc2_combine"),
+)
+
+
+# --------------------------------------------------------------------------- #
+def comm_meta_from_name(name: str) -> Dict[str, Any]:
+    """Classify one HCCL op name into (type, group, flavor, fused).
+
+    `type` keeps the historical hcom_<type> token (allGather / reduceScatter /
+    allReduce / alltoallv ...) so every existing consumer keeps working; MC2
+    fused kernels are folded into `alltoallv` with an explicit `flavor`.
+    """
+    raw = name or ""
+    low = raw.lower()
+    gm = _COMM_GROUP_RE.search(raw)
+    group = gm.group(1) if gm else None
+    m = _COMM_TYPE_RE.search(raw)
+    if m:
+        return {"type": m.group(1), "group": group, "flavor": "plain", "fused": False}
+    for needle, typ, flavor in _MC2_FUSED:
+        if needle in low:
+            return {"type": typ, "group": group, "flavor": flavor, "fused": True}
+    if "alltoall" in low:
+        return {"type": "alltoallv", "group": group, "flavor": "plain", "fused": False}
+    if low.startswith("total"):
+        return {"type": "Total", "group": None, "flavor": "plain", "fused": False}
+    return {"type": "unknown", "group": group, "flavor": "plain", "fused": False}
+
+
+def comm_type_from_name(name: str) -> str:
+    return comm_meta_from_name(name)["type"]
 
 
 # --------------------------------------------------------------------------- #
@@ -43,12 +87,7 @@ def num(series: pd.Series) -> pd.Series:
 
 
 def comm_type_from_name(name: str) -> str:
-    m = _COMM_TYPE_RE.search(name or "")
-    if m:
-        return m.group(1)
-    if name and name.lower().startswith("total"):
-        return "Total"
-    return "unknown"
+    return comm_meta_from_name(name)["type"]
 
 
 # --------------------------------------------------------------------------- #
@@ -88,6 +127,7 @@ def _normalize_communication(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
         for group_kind in ("collective", "p2p"):
             entries = groups.get(group_kind, {}) or {}
             for op_name, info in entries.items():
+                comm_meta = comm_meta_from_name(op_name)
                 tinfo = info.get("Communication Time Info", {}) or {}
                 binfo = info.get("Communication Bandwidth Info", {}) or {}
                 links = {}
@@ -103,7 +143,10 @@ def _normalize_communication(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "step": step_name,
                         "kind": group_kind,
                         "name": op_name,
-                        "type": comm_type_from_name(op_name),
+                        "type": comm_meta["type"],
+                        "group": comm_meta["group"],
+                        "flavor": comm_meta["flavor"],
+                        "fused": comm_meta["fused"],
                         "elapse_ms": tinfo.get("Elapse Time(ms)", 0) or 0,
                         "transit_ms": tinfo.get("Transit Time(ms)", 0) or 0,
                         "wait_ms": tinfo.get("Wait Time(ms)", 0) or 0,
