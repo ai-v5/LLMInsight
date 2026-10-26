@@ -71,6 +71,12 @@ CUSTOM_MODEL_COMPUTE_MARKERS = KDA_MODEL_COMPUTE_MARKERS + (
 COUNTER_MODEL_COMPUTE_TYPES = {
     "Compressor", "CompressorGrad", "LightningIndexerV2", "SparseLightningIndexerKLLossGrad",
 }
+# MC2 fused MoE dispatch/combine + GroupedMatMul tasks.  Unlike the other custom
+# families these DO record their GEMM operands, so their useful Cube FLOPs are
+# formula-derived (2·M·N·K, see _estimate_grouped_gemm_flops) instead of only
+# counter-calibrated.  The paired AI_CPU launch wrapper is a different Type and
+# is excluded from the compute rows entirely.
+MC2_GROUPED_GEMM_TYPES = {"AlltoAllvGroupedMatMul", "GroupedMatMulAlltoAllv"}
 # These fused kernels perform repeated sparse gather/scatter work that cannot be
 # reconstructed from the one-time input/output tensor footprint in profiler CSV.
 SPARSE_DISCRETE_TRAFFIC_TYPES = (SPARSE_ATTENTION_TYPES | DSA_INDEXER_TYPES | COUNTER_MODEL_COMPUTE_TYPES
@@ -100,6 +106,23 @@ def _is_custom_model_compute_type(op_type: str) -> bool:
 def _is_kda_model_compute_type(op_type: str) -> bool:
     value = (op_type or "").lower()
     return any(marker in value for marker in KDA_MODEL_COMPUTE_MARKERS)
+
+
+def _is_aicpu_dispatch_type(op_type: str) -> bool:
+    """True for AI_CPU scheduling wrappers (`*AicpuKernel`), which run no compute.
+
+    An MC2 fused expert kernel is recorded twice per call: the MIX_AIC task that
+    really performs the AllToAllv + GroupedMatMul, and an AI_CPU wrapper
+    (`AlltoAllvGroupedMatMulMc2AicpuKernel`) that only enqueues the collective.
+    The wrapper has no shapes at all, and the capture logs its Accelerator Core
+    as AI_CPU *or* COMMUNICATION depending on the export, so a core=="AI_CPU"
+    test alone lets half of them through.  Because the wrapper name also carries
+    the MC2 compute markers, those rows would land in the whole-model FLOP
+    coverage denominator where they can never be modelled.  Match the naming
+    convention instead: dispatch belongs to the communication / hidden-overhead
+    views, never to the compute-efficiency denominator.
+    """
+    return (op_type or "").lower().endswith("aicpukernel")
 
 
 def _fused_moe_summary(prof, rows, counter_scale, proxy_available):
@@ -215,6 +238,54 @@ def _estimate_matmul_flops(
     return 2.0 * M * N * K * batch
 
 
+def _estimate_grouped_gemm_flops(
+    shapes_in: List[List[int]], shapes_out: List[List[int]],
+) -> Optional[float]:
+    """Useful Cube FLOPs of an MC2 fused MoE grouped GEMM = 2·M·N·K.
+
+    kernel_details.csv records the two MC2 fused tasks as
+
+        AlltoAllvGroupedMatMul : in [M,K] ; [G,X,Y]   out [M,N] (+ [M,K] copy)
+        GroupedMatMulAlltoAllv : in [M,K] ; [G,X,Y]   out [M,N]
+
+    where M is the post-AllToAllv/pass-through token count, G the number of LOCAL
+    experts, and the per-expert weights are the 3-D tensor.  The export does not
+    say whether that tensor is [G,N,K] or [G,K,N] (both orders occur in one
+    capture), so K is pinned to the activation's trailing dimension — the
+    contraction length — and N is the remaining one, validated against the
+    recorded 2-D output [M,N].  Anything ambiguous fails closed.
+
+    G is a leading group axis only: every token row is multiplied by exactly one
+    expert's weight, so G partitions M instead of extending the contraction and
+    must NOT multiply 2·M·N·K.
+
+    Recorded examples (rank-133 capture, bf16):
+      in [32768,6144] ; [2,4096,6144] -> out [32768,4096]  (down_proj)
+      in [32768,6144] ; [2,6144,2048] -> out [32768,2048]  (up_proj)
+      in [32768,2048] ; [2,6144,2048] -> out [32768,6144]  (gate/up, combine)
+    """
+    mats = [s for s in shapes_in if len(s) >= 2]
+    if len(mats) < 2:
+        return None
+    act = mats[0]
+    weight = next((s for s in mats[1:] if len(s) == 3), None)
+    if weight is None or len(act) != 2:
+        return None
+    M, k_in = act
+    dim_a, dim_b = weight[-2], weight[-1]
+    if min(M, k_in, dim_a, dim_b) <= 0:
+        return None
+    if k_in == dim_a and dim_b != k_in:
+        N = dim_b
+    elif k_in == dim_b and dim_a != k_in:
+        N = dim_a
+    else:
+        return None                       # ambiguous weight layout -> fail closed
+    if not any(len(s) == 2 and s[0] == M and s[1] == N for s in shapes_out):
+        return None                       # output does not confirm N
+    return 2.0 * M * N * k_in
+
+
 def _right_down_causal_pairs(sq: int, sk: int, limit: Optional[int] = None) -> int:
     """Valid token pairs for right-down causal attention, optionally capped per row."""
     total = 0
@@ -224,75 +295,142 @@ def _right_down_causal_pairs(sq: int, sk: int, limit: Optional[int] = None) -> i
     return total
 
 
+def _sparse_attention_geometry(shapes_in, shapes_out, is_grad: bool):
+    """(B, Sq, Hq, Sk, Hkv, Dq, Dv, rope_dim, topk) of a token-wise sparse
+    attention kernel, or None when the recorded layout does not prove it.
+
+    Two export layouts carry the same contract:
+
+      q               [B, Sq, Hq, Dq]            query (MLA absorbed: Dq=512)
+      k, v            [B, Sk, Hkv, Dk/Dv]        latent KV (MLA absorbed: Hkv=1)
+      sparse_indices  [B, Sq, Hkv, topk]         topk selected keys per query
+      softmax stats   [B, Hkv, Sq, Hq/Hkv]  x2   (fwd outputs / grad inputs)
+      q_rope, k_rope  the two trailing operands, [..., rope_dim]
+
+    The forward records `q; k; v; indices; ...; q_rope; k_rope`, while the
+    backward inserts its gradient operands before the value tensor, so k/v are
+    located by shape instead of by position: k is operand #2 in both layouts and
+    v is pinned by the recorded value head dim (the forward's result tensor
+    [B,Sq,Hq,Dv], or the backward's v-gradient output [B,Sk,Hkv,Dv]).  That
+    output-based disambiguation is what keeps equal-length training (Sk == Sq,
+    where the indices tensor has the same [B,Sq,Hkv,*] prefix) provable.  The
+    RoPE pair, the group-shaped indices tensor and the two [B,Hkv,Sq,G] softmax
+    tensors are what make the "topk selected tokens per query" pattern provable
+    from shapes alone.
+    """
+    if len(shapes_in) < 3 or len(shapes_in[0]) != 4:
+        return None
+    q = shapes_in[0]
+    B, Sq, Hq, Dq = q
+    if min(B, Sq, Hq, Dq) <= 0:
+        return None
+    q_rope, k_rope = shapes_in[-2], shapes_in[-1]
+    if len(q_rope) != 4 or len(k_rope) != 4:
+        return None
+    if q_rope[:3] != [B, Sq, Hq] or q_rope[3] <= 0 or q_rope[3] != k_rope[3]:
+        return None
+    k = shapes_in[1]
+    if len(k) != 4:
+        return None
+    k_b, Sk, Hkv, Dk = k
+    if min(Sk, Hkv, Dk) <= 0 or k_b != B or Dk != Dq or Hq % Hkv != 0:
+        return None
+    if k_rope[:3] != [B, Sk, Hkv]:
+        return None
+    # Dv is read from the recorded output contract, not guessed from operand order.
+    if is_grad:
+        if (len(shapes_out) < 3 or shapes_out[0] != q or shapes_out[1] != k
+                or len(shapes_out[2]) != 4):
+            return None
+        v_shape = shapes_out[2]           # v-gradient: [B, Sk, Hkv, Dv]
+    else:
+        if not shapes_out or len(shapes_out[0]) != 4:
+            return None
+        v_shape = shapes_out[0]           # attention result: [B, Sq, Hq, Dv]
+    if v_shape[:3] != ([B, Sk, Hkv] if is_grad else [B, Sq, Hq]):
+        return None
+    Dv = v_shape[3]
+    if Dv <= 0:
+        return None
+    # v is the last [B,Sk,Hkv,Dv] operand that is not the RoPE key (excluded above).
+    kv_idx = [i for i in range(1, len(shapes_in) - 1)
+              if len(shapes_in[i]) == 4 and shapes_in[i][:3] == [B, Sk, Hkv]
+              and shapes_in[i][3] == Dv]
+    if len(kv_idx) != 2:
+        return None
+    v = shapes_in[kv_idx[-1]]
+    if is_grad and v != v_shape:
+        return None
+    # The selected-key tensor is the only [B,Sq,Hkv,*] operand besides q/q_rope/v
+    # (k_rope joins that prefix when Sk == Sq, so both trailing RoPE operands are
+    # excluded by position).
+    idx_cand = [i for i in range(len(shapes_in))
+                if i not in (0, len(shapes_in) - 2, len(shapes_in) - 1)
+                and i not in kv_idx
+                and len(shapes_in[i]) == 4 and shapes_in[i][:3] == [B, Sq, Hkv]
+                and shapes_in[i][3] > 0]
+    if len(idx_cand) != 1:
+        return None
+    topk = shapes_in[idx_cand[0]][3]
+    if topk > Sk:
+        return None
+    group = Hq // Hkv
+    all_shapes = list(shapes_in) + list(shapes_out)
+    if sum(1 for s in all_shapes if s == [B, Hkv, Sq, group]) < 2:
+        return None
+    return B, Sq, Hq, Sk, Hkv, Dq, Dv, q_rope[3], topk
+
+
 def _estimate_sparse_flash_attention_flops(
     shapes_in: List[List[int]], shapes_out: List[List[int]], is_grad: bool,
     sparse_mode: Optional[int] = None, sparse_block_size: Optional[int] = None,
 ) -> Optional[float]:
-    """Useful BF16 cube FLOPs for token-wise causal SparseFlashAttention.
+    """Useful BF16 cube FLOPs for token-wise sparse SparseFlashAttention.
 
-    CANN SparseFlashAttention uses sparse_indices[B,Sq,Nkv,K] and, on 950DT,
-    sparse_block_size=1 (one selected token per index).  MindSpeed training uses
-    right-down causal mode.  For query row q, the number of valid selected tokens
-    is min(K, max(0, Sk-Sq+q+1)); -1 padding is therefore excluded.
+    CANN SparseFlashAttention selects `topk` keys per query
+    (sparse_indices[B,Sq,Nkv,topk]) and, on 950DT, treats every index as one
+    token (sparse_block_size=1, one selected token per index).  The returned
+    numerator counts only the matmul-dominated useful work:
 
-    The returned numerator counts only the matmul-dominated useful work:
-      fwd = 2 * G * C * (Dqk + Dv)
-      bwd = 2 * G * C * (3*Dqk + 2*Dv)
-    where Dqk includes the separate RoPE dimension and G=Hq/Hkv.  Softmax,
-    gather/scatter, invalid tiling lanes and other vector/memory work are not cube
-    FLOPs.  The CSV cannot reconstruct their repeated/discrete memory traffic, so
-    this op is deliberately excluded from MBU, roofline and reclaim estimates.
+      fwd = 2 * P * (Dqk + Dv)
+      bwd = 2 * P * (3*Dqk + 2*Dv)      (recompute QK^T, dQ, dK, dV, dP)
+      P   = B * Hkv * (Hq/Hkv) * (valid selected tokens per query)
+
+    where Dqk = Dq + rope_dim (absorbed MLA: 512 nope + 64 RoPE, matching the
+    recorded q [B,S,64,512] / q_rope [B,S,64,64] pair) and Dv is the value
+    head dim.  `-1` padding indices are excluded by the causal cap below.
+
+    kernel_details.csv records shapes but NOT sparse_mode, so the valid-pair
+    count is only accepted when it is provable:
+      * sparse_mode == 3 (right-down causal, the MindSpeed training semantic):
+        the exact causal prefix min(topk, max(0, Sk-Sq+q+1)) per query row.
+      * mode not recorded: the causal cap CANNOT bind when even the first query
+        already sees >= topk keys (Sk-Sq+1 >= topk).  Every query then selects
+        exactly topk tokens under ANY causal mask, so Sq*topk is exact.
+      * any other explicitly declared mode, or a binding cap, fails closed
+        instead of reinterpreting a mask the caller did specify.
+
+    Softmax, gather/scatter, invalid tiling lanes and other vector/memory work
+    are not cube FLOPs.  The CSV cannot reconstruct their repeated/discrete
+    memory traffic, so this op is deliberately excluded from MBU, roofline and
+    reclaim estimates.
     """
-    # Neither attribute is present in kernel_details.csv.  Only compute the
-    # causal token count after the caller supplies verified semantics.
-    if sparse_mode != 3 or sparse_block_size != 1:
+    # Only the block size (one selected token per index) is a chip semantic we
+    # can pin down; the mask is either supplied or proven non-binding below.
+    if sparse_block_size != 1:
         return None
-    if len(shapes_in) < 6 or len(shapes_out) < (3 if is_grad else 1):
+    geo = _sparse_attention_geometry(shapes_in, shapes_out, is_grad)
+    if geo is None:
         return None
-    q, k, v, sparse_indices = shapes_in[:4]
-    if any(len(s) != 4 for s in (q, k, v, sparse_indices)):
-        return None
-    B, Sq, Hq, Dq = q
-    Bk, Sk, Hkv, Dk = k
-    Bv, Sv, Hv, Dv = v
-    Bi, Si, Hi, topk = sparse_indices
-    if (
-        min(B, Sq, Hq, Dq, Sk, Hkv, Dk, Dv, topk) <= 0
-        or (Bk, Bv, Bi) != (B, B, B)
-        or (Sv, Si) != (Sk, Sq)
-        or (Hv, Hi) != (Hkv, Hkv)
-        or Dq != Dk
-        or Hq % Hkv != 0
-        or topk > Sk
-    ):
-        return None
-
-    q_rope, k_rope = shapes_in[-2:]
-    if (
-        len(q_rope) != 4 or len(k_rope) != 4
-        or q_rope[:3] != [B, Sq, Hq]
-        or k_rope[:3] != [B, Sk, Hkv]
-        or q_rope[3] <= 0 or q_rope[3] != k_rope[3]
-    ):
-        return None
-    group = Hq // Hkv
-    if not is_grad:
-        if shapes_out[0] != [B, Sq, Hq, Dv]:
-            return None
-        # Softmax stats [B,Nkv,Sq,G] prove the sparse pattern is shared by the G
-        # query heads associated with each KV head.
-        stats = shapes_out[1:3]
-        if len(stats) < 2 or any(s != [B, Hkv, Sq, group] for s in stats):
-            return None
+    B, Sq, Hq, Sk, Hkv, Dq, Dv, rope_dim, topk = geo
+    if sparse_mode == 3:
+        valid_per_pattern = _right_down_causal_pairs(Sq, Sk, topk)
+    elif sparse_mode is None and Sk - Sq + 1 >= topk:
+        valid_per_pattern = Sq * topk
     else:
-        if shapes_out[:3] != [q, k, v]:
-            return None
-
-    # right-down causal: the first query can see Sk-Sq+1 keys; equal-length
-    # training reduces to min(topk, q+1).  Multiply by B and KV-head patterns.
-    valid_per_pattern = _right_down_causal_pairs(Sq, Sk, topk)
-    selected_head_pairs = B * Hkv * group * valid_per_pattern
-    d_qk = Dq + q_rope[3]
+        return None
+    selected_head_pairs = B * Hkv * (Hq // Hkv) * valid_per_pattern
+    d_qk = Dq + rope_dim
     if is_grad:
         return 2.0 * selected_head_pairs * (3 * d_qk + 2 * Dv)
     return 2.0 * selected_head_pairs * (d_qk + Dv)
@@ -304,11 +442,24 @@ def _estimate_lightning_indexer_flops(
 ) -> Optional[float]:
     """Useful Cube FLOPs for fused LightningIndexer.
 
-    The fused op first evaluates every causally valid index-query/index-key dot
-    product, then performs ReLU, head weighting and TopK on the vector side.  Only
-    the QK matmul belongs in the BF16 Cube numerator.
+    The fused op first evaluates an index-query/index-key dot product for every
+    causally visible key, then performs ReLU, head weighting and TopK on the
+    vector side.  Only the QK matmul belongs in the BF16 Cube numerator:
+
+      2 * B * Hq * P * Dq,   P = causally visible (query, key) pairs
+
+    kernel_details.csv records q [B,Sq,Hq,Dq], k [B,Sk,Hkv,Dq], the per-query
+    head weights [B,Sq,Hq] and the selected indices [B,Sq,Hkv,topk] — but not the
+    mask attribute.  sparse_mode == 3 (right-down causal) gives the exact count;
+    without it the same right-down-causal prefix is used as a LOWER bound,
+    because the only alternative (scoring all Sk keys) is larger by at most
+    Sq/(2*Sk) (1.2% on the rank-133 capture).  Under-counting keeps the reported
+    MFU conservative instead of guess-inflated.
     """
-    if sparse_mode != 3 or len(shapes_in) < 3 or not shapes_out:
+    # `sparse_mode` is kept for call-site compatibility (metrics/matrix_power.py
+    # passes it); the right-down-causal pair count below IS the sparse_mode=3
+    # exact figure and a lower bound for any other mask.
+    if len(shapes_in) < 3 or not shapes_out:
         return None
     q, k, weights = shapes_in[:3]
     indices = shapes_out[0]
@@ -913,10 +1064,13 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         d_us = float(dur[i])
         if d_us <= 0:
             continue
-        # Communication-dispatch "kernels" (AI_CPU / HCCL) have no compute or
-        # memory footprint we can model — they belong to the communication and
-        # hidden-overhead views, not the compute-efficiency ranking.
-        if str(core[i]).upper() == "AI_CPU" or str(types[i]).lower().startswith(("hccl", "hcom")):
+        # Communication-dispatch "kernels" (AI_CPU / HCCL / *AicpuKernel) have no
+        # compute or memory footprint we can model — they belong to the
+        # communication and hidden-overhead views, not the compute-efficiency
+        # ranking (nor to the whole-model FLOP-coverage denominator).
+        if (str(core[i]).upper() == "AI_CPU"
+                or str(types[i]).lower().startswith(("hccl", "hcom"))
+                or _is_aicpu_dispatch_type(types[i])):
             skipped_comm += 1
             continue
         d_s = d_us * 1e-6
@@ -996,9 +1150,16 @@ def compute_efficiency(prof) -> Dict[str, Any]:
             # toward whole-model FLOP coverage.  Falls back to the counter proxy
             # when shapes are missing (formula returns None).
             flops = _estimate_kda_flops(types[i], shapes_in, shapes_out)
+        elif types[i] in MC2_GROUPED_GEMM_TYPES:
+            # MC2 fused AllToAllv + GroupedMatMul: the recorded activation and
+            # per-expert weight give the exact 2·M·N·K Cube work, so the model
+            # compute is formula-backed instead of counter-only.  The paired
+            # `*AicpuKernel` launch wrapper is a separate Type and never reaches
+            # this branch (dispatch rows are filtered out above).
+            flops = _estimate_grouped_gemm_flops(shapes_in, shapes_out)
         elif is_custom_model:
-            # Other recognized model-compute families (currently MC2 fused MoE)
-            # have no shape-safe semantic FLOP formula.  Keep them in the model
+            # Other recognized model-compute families (KDA is handled above) have
+            # no shape-safe semantic FLOP formula yet.  Keep them in the model
             # coverage denominator and use only the same-capture counter estimate.
             flops = None
         elif is_vector:
@@ -1583,20 +1744,27 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     flop_model_notes = []
     if sparse_flops_modeled:
         flop_model_notes.append(
-            "SparseFlashAttention 按 950DT token-wise（sparse_block_size=1）、"
-            "right-down causal（sparse_mode=3）计算有效稀疏 Cube FLOPs；"
+            "SparseFlashAttention 按 token-wise 稀疏注意力（sparse_indices 给出每个 query "
+            "选中的 topk 个 key，950DT sparse_block_size=1）计算有效稀疏 Cube FLOPs："
+            "有效 query/head-key 对 = min(topk, 因果可见 key 数)。profiler CSV 未记录 "
+            "sparse_mode：显式给出 LLMINSIGHT_SPARSE_MODE=3 时按 right-down causal 精确计数；"
+            "未给出时仅在形状可证因果上限不生效（Sk-Sq+1 ≥ topk，首个 query 已可看到 topk 个 key，"
+            "任何 causal 掩码下都恰好选 topk 个）时接受 Sq·topk，否则 fail-closed。"
             "不含 Softmax/Gather/Scatter 与 tiling padding。因 CSV 无法重建离散访存，"
             "该算子不参与 MBU、roofline 与可回收时延估算。"
         )
     elif sparse_present:
         flop_model_notes.append(
-            "profiler CSV 未记录 SparseFlashAttention 的 sparse_mode；默认不猜测。"
-            "确认本次运行后可显式设置 LLMINSIGHT_SPARSE_MODE=3；仅在 950DT "
-            "token-wise（sparse_block_size=1）语义下启用有效 FLOPs。"
+            "检测到 SparseFlashAttention，但 shape 未闭合 token-wise 稀疏契约"
+            "（q/k/v + topk indices + RoPE 对 + 双 softmax stats），或因果上限会生效"
+            "而 sparse_mode 未知 → 不猜测；确认本次运行后可显式设置 "
+            "LLMINSIGHT_SPARSE_MODE=3，仅在 950DT token-wise（sparse_block_size=1）语义下"
+            "启用有效 FLOPs。"
         )
     if dsa_indexer_modeled:
         flop_model_notes.append(
-            "LightningIndexer 计入 causal dense Index-QK；"
+            "LightningIndexer 计入 Index-QK：2·B·Hq·P·Dq（P 为因果可见 query/key 对）；"
+            "sparse_mode 未记录时取 right-down causal 下界，与不限上限的 Sq·Sk 相差 ≤ Sq/(2·Sk)。"
             "SparseLightningIndexerGradKLLoss 计入主 Attention QK、Index-QK、dQ、dK。"
             "KL/Softmax/ReLU/dW 与离散 Gather/Scatter 不计入 Cube FLOPs，且因物理访存"
             "不可由 CSV 重建，这两类算子的 MBU、roofline 与可回收时延保持 unavailable。"
@@ -1605,6 +1773,13 @@ def compute_efficiency(prof) -> Dict[str, Any]:
         flop_model_notes.append(
             "检测到 LightningIndexer/GradKLLoss，但 shape 或 sparse_mode 不足以闭合"
             " useful Cube FLOPs；相关 MFU 按 fail-closed 保持 unavailable。"
+        )
+    if any(r["type"] in MC2_GROUPED_GEMM_TYPES and r.get("flops") for r in model_rows):
+        flop_model_notes.append(
+            "AlltoAllvGroupedMatMul / GroupedMatMulAlltoAllv 按 2·M·N·K 计入 Cube FLOPs："
+            "M = 通信后 token 数，N/K = expert 权重末两维（K 锚定在激活末维），group 维只切分 M、"
+            "不乘进 K；输出 [M,N] 与权重末两维须自洽，否则 fail-closed。"
+            "其配对的 AI_CPU 下发包装算子（*AicpuKernel）不计入计算覆盖。"
         )
     if estimate_available and not flop_model_complete:
         flop_model_notes.append(

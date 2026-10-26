@@ -477,10 +477,139 @@
   }
 
   // ============================ 通信 Communication ============================ //
+  // 通信域角色 → 中文标签（契约 v1：by_group[].role / wait_attribution.by_role[].role）
+  const COMM_ROLE_LABEL = {
+    dense_fsdp: "dense-FSDP",
+    expert_fsdp: "expert-FSDP",
+    ep_a2a: "EP/a2a",
+    activation: "CP/KV 激活",
+    barrier: "纯 barrier",
+    unknown: "未知",
+  };
+  const roleLabel = (r) => esc(COMM_ROLE_LABEL[r] || r || "未知");
+
   V.communication = async function (root) {
     const cm = await api("/api/communication");
     if (!cm.available) { root.innerHTML = `<div class="empty">无 communication.json 数据</div>`; return; }
     const bw = v => (v == null ? '<span style="color:var(--text-dim)">—</span>' : v.toFixed(1) + " GB/s");
+    // ---- 契约 v1 新增字段（a2a / fsdp / by_group / wait_attribution）----
+    // 旧 profiling 没有这些字段：逐个做存在性判断，缺失时对应卡片/面板整体不渲染，
+    // 页面完整回落为原有内容（向后兼容）。
+    const a2a = (cm.a2a && cm.a2a.available) ? cm.a2a : null;
+    const fsdp = (cm.fsdp && cm.fsdp.available) ? cm.fsdp : null;
+    const byGroup = Array.isArray(cm.by_group) ? cm.by_group : [];
+    const waitAttr = cm.wait_attribution || {};
+    const waTop = Array.isArray(waitAttr.top) ? waitAttr.top : [];
+    const waByRole = Array.isArray(waitAttr.by_role) ? waitAttr.by_role : [];
+    const bwNum = v => (v == null ? "—" : (+v).toFixed(1));
+    const gbText = v => (v == null ? "—" : (+v).toFixed(2) + " GB");
+    // 0 字节集合通信：显式标注"仅 barrier"，不显示成 0.0 GB/s 的伪带宽
+    const payload = v => (v == null ? "—"
+      : (+v) <= 0.001 ? '<span style="color:var(--warn)">0 字节（仅 barrier）</span>'
+      : (+v).toFixed(2) + " GB");
+    const groupsText = xs => (Array.isArray(xs) ? xs : []).join("、") || "—";
+    const fAg = x => ((x || {}).ag || {});
+    const fRs = x => ((x || {}).rs || {});
+    const dense = (fsdp && fsdp.dense) || null;
+    const expert = (fsdp && fsdp.expert) || null;
+
+    const contractCards = [];
+    if (a2a) {
+      contractCards.push(metric("a2a 有效带宽",
+        a2a.bandwidth_gbps != null ? bwNum(a2a.bandwidth_gbps) + " GB/s" : "—",
+        { tone: "good",
+          foot: `${fmt.int(a2a.count)} 次 · ${gbText(a2a.size_gb)} 流量 · 单算子 p50 ${bwNum(a2a.per_op_bw_p50)} GB/s` }));
+      contractCards.push(metric("a2a 等待", fmt.ms(a2a.wait_ms),
+        { tone: "warn",
+          barPct: a2a.wait_share_pct == null ? undefined : a2a.wait_share_pct,
+          foot: `占通信等待 ${fmt.pct(a2a.wait_share_pct)} · 含等待带宽 ${bwNum(a2a.bandwidth_with_wait_gbps)} GB/s` }));
+    }
+    if (fsdp) {
+      contractCards.push(metric("dense-FSDP AG/RS 有效带宽",
+        dense ? `${bwNum(fAg(dense).bandwidth_gbps)} / ${bwNum(fRs(dense).bandwidth_gbps)} GB/s` : "—",
+        { tone: dense ? "good" : undefined,
+          foot: dense
+            ? `AG / RS · 通信域 ${groupsText(dense.groups)} · 单算子 p50 ${bwNum(fAg(dense).per_op_p50_gbps)} / ${bwNum(fRs(dense).per_op_p50_gbps)} GB/s`
+            : "无 dense-FSDP 通信域" }));
+      const eAg = fAg(expert), eRs = fRs(expert);
+      const ePayload = (eAg.size_gb == null && eRs.size_gb == null)
+        ? null : (eAg.size_gb || 0) + (eRs.size_gb || 0);
+      const eZero = ePayload != null && ePayload <= 0.001;
+      contractCards.push(metric("expert-FSDP 载荷",
+        eZero ? "0 载荷 / 仅 barrier" : gbText(ePayload),
+        { tone: eZero ? "warn" : (ePayload != null ? "good" : undefined),
+          foot: eZero
+            ? `通信域 ${groupsText(expert && expert.groups)}：AG/RS 全 0 字节，耗时纯同步，无链路带宽`
+            : `AG ${gbText(eAg.size_gb)} · RS ${gbText(eRs.size_gb)} · 有效带宽 ${bwNum(eAg.bandwidth_gbps)} / ${bwNum(eRs.bandwidth_gbps)} GB/s` }));
+    }
+    const contractCardsHtml = contractCards.length
+      ? `<div class="grid cols-${contractCards.length >= 4 ? 4 : (contractCards.length === 3 ? 3 : 2)}">${contractCards.join("")}</div>`
+      : "";
+
+    const a2aStageRow = (label, s) => {
+      s = s || {};
+      return `<tr><td>${esc(label)}</td><td>${fmt.int(s.count)}</td><td>${gbText(s.size_gb)}</td><td>${bw(s.bandwidth_gbps)}</td><td>${fmt.ms(s.wait_ms)}</td></tr>`;
+    };
+    const a2aPanel = a2a ? panel("a2a 明细",
+      `MC2 融合 AllToAllv${Array.isArray(a2a.groups) && a2a.groups.length ? " · 通信域 " + a2a.groups.join("、") : ""}`,
+      `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>阶段</th><th>次数</th><th>流量</th><th>有效带宽</th><th>等待</th></tr></thead><tbody>${a2aStageRow("dispatch", a2a.dispatch)}${a2aStageRow("combine", a2a.combine)}</tbody></table></div>
+      <div class="tbl-wrap" style="margin-top:10px"><table class="tbl"><thead><tr><th>单算子有效带宽</th><th>p50</th><th>p90</th><th>max</th><th>平均流量/算子</th></tr></thead><tbody><tr><td>alltoallv</td><td>${bw(a2a.per_op_bw_p50)}</td><td>${bw(a2a.per_op_bw_p90)}</td><td>${bw(a2a.per_op_bw_max)}</td><td>${a2a.per_op_mb == null ? "—" : (+a2a.per_op_mb).toFixed(1) + " MB"}</td></tr></tbody></table></div>
+      <div class="note">有效带宽 = 流量 ÷ Transit Time；p50/p90/max 为单算子带宽分布（不被个别慢 op 拉偏）。含等待带宽 ${bw(a2a.bandwidth_with_wait_gbps)}，可看出 a2a 时间里同步占多少。</div>`) : "";
+
+    const fsdpRow = (role, op, x, groups) => {
+      x = x || {};
+      return `<tr><td>${esc(role)}</td><td>${op}</td><td class="mono">${esc(groupsText(groups))}</td><td>${fmt.int(x.count)}</td><td>${payload(x.size_gb)}</td><td>${fmt.ms(x.elapse_ms)}</td><td>${fmt.ms(x.wait_ms)}</td><td>${bw(x.bandwidth_gbps)}</td><td>${bw(x.bandwidth_with_wait_gbps)}</td><td>${bw(x.per_op_p50_gbps)}</td></tr>`;
+    };
+    const fsdpRows = [
+      dense ? fsdpRow("dense-FSDP", "AG", fAg(dense), dense.groups) : "",
+      dense ? fsdpRow("dense-FSDP", "RS", fRs(dense), dense.groups) : "",
+      expert ? fsdpRow("expert-FSDP", "AG", fAg(expert), expert.groups) : "",
+      expert ? fsdpRow("expert-FSDP", "RS", fRs(expert), expert.groups) : "",
+    ].join("");
+    const fsdpPanel = fsdp ? panel("dense-FSDP vs expert-FSDP（AG / RS 有效带宽）",
+      "role 由 operator_details 的 FSDP::all_gather / post_backward_reduce 模块名与各通信域算子计数匹配得出",
+      `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>角色</th><th>算子</th><th>通信域</th><th>次数</th><th>流量</th><th>Elapse</th><th>等待</th><th>有效带宽</th><th>含等待带宽</th><th>单算子 p50</th></tr></thead><tbody>${fsdpRows}</tbody></table></div>
+      <div class="note">${esc(fsdp.note || "有效带宽 = Σ流量 ÷ Σ Transit Time（去等待）；expert-FSDP 载荷为 0 时只统计 barrier 同步时间，带宽列显示 —。")}</div>`) : "";
+
+    const groupRows = byGroup.map(raw => {
+      const g = raw || {};
+      const types = Object.keys(g.types || {})
+        .sort((x, y) => (g.types[y] || 0) - (g.types[x] || 0))
+        .map(k => `${esc(k)}×${fmt.int(g.types[k])}`).join("、");
+      const zero = (g.zero_payload_count || 0) > 0;
+      return `<tr><td class="mono">${esc(g.group)}</td><td${g.role_basis ? ` title="${esc(g.role_basis)}"` : ""}>${roleLabel(g.role)}</td><td>${fmt.int(g.count)}</td><td>${types || "—"}</td><td>${fmt.ms(g.elapse_ms)}</td><td>${gbText(g.size_gb)}</td><td>${fmt.ms(g.wait_ms)}</td><td>${bw(g.bandwidth_gbps)}</td><td>${bw(g.bandwidth_with_wait_gbps)}</td><td>${zero ? `<span style="color:var(--warn)">${fmt.int(g.zero_payload_count)} 次 / ${fmt.ms(g.zero_payload_ms)}</span>` : fmt.int(g.zero_payload_count)}</td></tr>`;
+    }).join("");
+    const zt = cm.zero_transit || {};
+    const ztGroups = Array.isArray(zt.groups) ? zt.groups : [];
+    const ztByGroup = Array.isArray(zt.by_group) ? zt.by_group : [];
+    const ztLine = ztByGroup.length
+      ? ztByGroup.map(z => `通信域 ${esc(z.group)}：${fmt.int(z.count)} 次 / ${fmt.ms(z.elapse_ms)}`).join("；")
+      : ztGroups.map(g => `通信域 ${esc(g)}`).join("；");
+    const groupPanel = byGroup.length ? panel("按通信域（HCCL communicator）",
+      "有效带宽 = Σ流量 ÷ Σ Transit Time；零载荷 = 不搬字节的 barrier 型 collective",
+      `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>通信域</th><th>角色</th><th>算子数</th><th>主要算子</th><th>Elapse</th><th>流量</th><th>等待</th><th>有效带宽</th><th>含等待带宽</th><th>零载荷</th></tr></thead><tbody>${groupRows}</tbody></table></div>
+      ${ztLine ? `<div class="note">零载荷（barrier-only）集合通信：${ztLine} —— 不搬字节，优化方向是减少同步次数 / 合并并行组，而不是链路带宽。</div>` : ""}`) : "";
+
+    const waTopRows = waTop.slice(0, 10).map(raw => {
+      const t = raw || {};
+      return `<tr><td class="mono">${esc(t.name)}</td><td>${esc(t.type)}</td><td class="mono">${esc(t.group == null ? "—" : t.group)}</td><td>${fmt.ms(t.wait_ms)}</td><td>${fmt.pct(t.share_pct)}</td></tr>`;
+    }).join("");
+    const waRoleRows = waByRole.map(raw => {
+      const r = raw || {};
+      return `<tr><td>${roleLabel(r.role)}</td><td>${fmt.ms(r.wait_ms)}</td><td>${fmt.pct(r.share_pct)}</td></tr>`;
+    }).join("");
+    const waitPanel = waTop.length ? panel("等待归属（等最慢 rank）",
+      `总等待 ${fmt.ms(waitAttr.total_wait_ms)} · 按单算子等待降序 Top ${Math.min(10, waTop.length)}`,
+      `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>算子</th><th>类型</th><th>通信域</th><th>等待</th><th>占比</th></tr></thead><tbody>${waTopRows}</tbody></table></div>
+      ${waRoleRows ? `<div style="font-size:11.5px;font-weight:600;color:var(--text-mut);margin:12px 0 4px">按角色汇总</div>
+      <div class="tbl-wrap"><table class="tbl"><thead><tr><th>角色</th><th>等待</th><th>占比</th></tr></thead><tbody>${waRoleRows}</tbody></table></div>` : ""}
+      <div class="note">等待 = 该集合通信等最慢 rank 的墙钟时间（卡间同步 skew）。先看占比最高的角色 / 通信域，再定位具体算子。</div>`) : "";
+
+    const cmpGrid = a2aPanel && fsdpPanel
+      ? `<div class="grid cols-2">${a2aPanel}${fsdpPanel}</div>`
+      : (a2aPanel || fsdpPanel);
+    const contractHtml = `${contractCardsHtml}${cmpGrid || ""}${groupPanel}${waitPanel}`;
+
     const rows = cm.by_type.map(t =>
       `<tr><td>${esc(t.type)}</td><td>${fmt.int(t.count)}</td><td>${fmt.ms(t.elapse_ms)}</td><td>${fmt.ms(t.wait_ms)}</td><td>${fmt.pct(t.wait_pct)}</td><td>${fmt.ms(t.transit_ms)}</td><td>${t.transit_mb.toFixed(1)} MB</td><td>${bw(t.bandwidth_with_wait_gbps)}</td><td>${bw(t.bandwidth_gbps)}</td></tr>`).join("");
     const topRows = cm.top.slice(0, 12).map(t =>
@@ -503,6 +632,7 @@
         ${metric("平均带宽(含等待)", cm.overall_bandwidth_with_wait_gbps != null ? cm.overall_bandwidth_with_wait_gbps + " GB/s" : "—", { foot: cm.overall_bandwidth_with_wait_gbps != null ? "Σ Transit ÷ Σ Elapse" : "采集未记录链路带宽（Transit≈0）" })}
         ${metric("有效带宽(去等待)", cm.overall_bandwidth_gbps != null ? cm.overall_bandwidth_gbps + " GB/s" : "—", { foot: cm.overall_bandwidth_gbps != null ? "Σ Transit ÷ Σ Transit Time" : "采集未记录链路带宽（Transit≈0）", tone: cm.overall_bandwidth_gbps != null ? "good" : undefined })}
       </div>
+      ${contractHtml}
       ${bdHtml}
       ${banner("info", "ℹ️", esc(cm.note))}
       <div class="grid cols-2">
