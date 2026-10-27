@@ -1,0 +1,87 @@
+name: Build verified release draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Reviewed full commit SHA on the default branch
+        required: true
+        type: string
+      release_id:
+        description: Existing draft Release ID to receive the wheel
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-draft-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-upload:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      RELEASE_ID: ${{ inputs.release_id }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate source
+        run: |
+          if ($env:SOURCE_SHA -notmatch '^[0-9a-f]{40}$' -or $env:RELEASE_ID -notmatch '^\d+$') {
+            throw 'Full commit SHA and numeric draft ID are required'
+          }
+          if ((git rev-parse HEAD) -ne $env:SOURCE_SHA) { throw 'Source SHA mismatch' }
+          git merge-base --is-ancestor $env:SOURCE_SHA "origin/$env:DEFAULT_BRANCH"
+          if ($LASTEXITCODE -ne 0) { throw 'Source must belong to the default branch history' }
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: Build and verify wheel
+        run: |
+          python -m pip install setuptools==84.1.0 wheel==0.48.0 build==1.3.0
+          if ($LASTEXITCODE -ne 0) { throw 'Build tools installation failed' }
+          python scripts/build_wheel.py
+          if ($LASTEXITCODE -ne 0) { throw 'Wheel build or verification failed' }
+          python -c "import hashlib,pathlib; wheels=list(pathlib.Path('dist').glob('llminsight-*.whl')); assert len(wheels)==1; p=wheels[0]; pathlib.Path('dist/SHA256SUMS').write_text(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n',encoding='utf-8')"
+          if ($LASTEXITCODE -ne 0) { throw 'Checksum creation failed' }
+      - name: Upload to the matching draft only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $releaseJson = gh api "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read target draft' }
+          $release = $releaseJson | ConvertFrom-Json
+          $wheels = @(Get-ChildItem -LiteralPath dist -Filter 'llminsight-*.whl' -File)
+          if ($wheels.Count -ne 1) { throw 'Expected exactly one wheel' }
+          $wheel = $wheels[0]
+          $version = $wheel.Name -replace '^llminsight-','' -replace '-py3-none-any.whl$',''
+          if (!$release.draft -or $release.tag_name -ne "v$version" -or $release.target_commitish -ne $env:SOURCE_SHA) {
+            throw 'Draft tag/source mismatch or Release already published'
+          }
+          gh release upload $release.tag_name $wheel.FullName 'dist/SHA256SUMS' --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Draft upload failed' }
+          $assetsJson = gh api "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID/assets"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot verify uploaded assets' }
+          $assets = $assetsJson | ConvertFrom-Json
+          foreach ($path in @($wheel.FullName, (Join-Path (Get-Location) 'dist/SHA256SUMS'))) {
+            $name = [IO.Path]::GetFileName($path)
+            $asset = @($assets | Where-Object name -EQ $name)
+            $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($asset.Count -ne 1 -or $asset[0].state -ne 'uploaded' -or $asset[0].digest -ne "sha256:$hash") {
+              throw "Uploaded digest mismatch: $name"
+            }
+            Write-Output "$name SHA256 $hash"
+          }
+          Write-Output 'Draft upload verified. Publish and old-Release cleanup require the release operator verification in AGENTS.md.'
