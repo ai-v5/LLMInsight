@@ -2,13 +2,15 @@
 prompt messages for the LLM.
 
 PRIVACY CONTRACT: only aggregated numbers and the rule cards leave this module.
-We never include raw trace events, tensor data, file paths, usernames, or the
-full captured environment. Capture config is whitelisted to a handful of
-performance-relevant flags. The summary is KB-level and human-auditable (the
-server exposes it so the user can see exactly what would be sent).
+Raw trace events, tensors and the full environment are excluded. Operator
+instances use local aliases; recognizable paths, URLs and identifiers are
+redacted throughout the summary. This is limited redaction, not a guarantee of
+anonymity: model traits and performance metrics can still be confidential.
+Users can inspect the exact payload before explicitly requesting inference.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 # Only these capture keys are ever forwarded — keeps usernames / log paths /
@@ -40,6 +42,35 @@ def _round(x, n=2):
     return round(x, n) if isinstance(x, (int, float)) else x
 
 
+_IDENTIFIERS = re.compile(
+    r"https?://[^\s<>\"']+|file://[^\s<>\"']+"
+    r"|[A-Za-z]:[\\/][^\s<>\"']+|\\\\[^\s<>\"']+"
+    r"|(?<![\w/])/(?:[^\s/<>\"']+/)*[^\s/<>\"']+"
+    r"|\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b|\b[a-zA-Z]\d{8}\b"
+    r"|\b(?:\d{1,3}\.){3}\d{1,3}\b"
+)
+
+
+def _redact(value: Any) -> Any:
+    """Redact recognizable identifiers without altering numeric metrics."""
+    if isinstance(value, str):
+        # Drop the whole field so paths with spaces cannot leave a tail behind.
+        return "[redacted]" if _IDENTIFIERS.search(value) else value
+    if isinstance(value, dict):
+        result = {}
+        for index, (key, item) in enumerate(value.items(), 1):
+            safe_key = f"redacted_field_{index}" if isinstance(key, str) and _IDENTIFIERS.search(key) else key
+            # Preserve every value even if a synthetic input already uses the
+            # replacement key. This view must not silently lose metric rows.
+            while safe_key in result or (safe_key != key and safe_key in value):
+                safe_key = "_" + safe_key
+            result[safe_key] = _redact(item)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_redact(item) for item in value]
+    return value
+
+
 def build_summary(m: Dict[str, Any],
                   cards: List[Dict[str, Any]],
                   capture: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -60,9 +91,8 @@ def build_summary(m: Dict[str, Any],
                  if k in capture.get("flags", {})}
 
     # Model architecture + training/capture state are now reconstructed FROM the
-    # profiling (parser.derive), never a launch script. These are aggregate
-    # numbers (shapes/counts), so they are privacy-safe to forward and give the
-    # LLM the model-aware context (H3) plus the corrected capture story.
+    # profiling (parser.derive), never a launch script. They remain potentially
+    # sensitive even after identifiers are redacted.
     cfg = capture if capture.get("source") == "profiling" else (meta.get("config") or {})
     derived_model = cfg.get("model") or {}
     guesses = cfg.get("guesses") or {}
@@ -113,11 +143,11 @@ def build_summary(m: Dict[str, Any],
             "roofline_ridge_ai": _round(eff.get("roofline_ridge_ai"), 1),
             "kernels_with_flops": eff.get("kernels_with_flops"),
             "top_optimization": [
-                {"name": r["name"][:40], "bound": r["bound"], "wasted_us": r["wasted_us"],
+                {"name": f"operator_{index}", "bound": r["bound"], "wasted_us": r["wasted_us"],
                  "dur_us": r["dur_us"], "mfu": r.get("mfu"), "mbu": r.get("mbu"),
                  "mbu_raw": r.get("mbu_raw"),
                  "mbu_over_physical": r.get("mbu_over_physical")}
-                for r in eff.get("top_optimization", [])[:6]
+                for index, r in enumerate(eff.get("top_optimization", [])[:6], 1)
             ],
         } if eff.get("available") else None,
         "communication": {
@@ -172,7 +202,7 @@ def build_summary(m: Dict[str, Any],
             for c in cards
         ],
     }
-    return summary
+    return _redact(summary)
 
 
 def build_messages(summary: Dict[str, Any]) -> tuple[str, str]:

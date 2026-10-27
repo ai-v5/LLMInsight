@@ -38,10 +38,10 @@ flowchart LR
 ```
 llminsight/
 ├── config.py              # 芯片峰值预置、模型配置、dtype 字节、路径；set_chip 切换
-├── cache.py               # 按文件签名的磁盘 JSON 缓存（重启 ~0.09s）
+├── cache.py               # 按文件签名的磁盘 JSON 缓存
 ├── parser/
 │   ├── profile.py         # load_profile → ProfileData（8 文件）
-│   ├── trace.py           # trace_view.json 流式 iter_events（104MB 不入内存）
+│   ├── trace.py           # trace_view.json 流式 iter_events
 │   ├── shapes.py          # "Input Shapes"/dtypes 字符串解析、numel
 │   └── derive.py          # 从 profiling 反推模型结构 + 训练/采集配置（不依赖启动脚本）
 ├── metrics/
@@ -80,8 +80,8 @@ scripts/
 | **Python 3 stdlib `http.server`（无 FastAPI）** | 零三方依赖，`python -m llminsight.server` 即可跑，**可独立分发**到任何机器 |
 | **无构建前端（vanilla JS + 全局 `LI` 命名空间）** | 无 npm / webpack / 打包步骤，直接静态文件served；改完刷新即生效 |
 | **ECharts 5.5.1 本地 vendored** | 离线可用、无 CDN 依赖；缺失时回落 CDN |
-| **启动时一次算齐 + 磁盘缓存** | 解析在启动时完成并缓存，重启 ~0.09s；每个 `/api/*` 返回预算好的 JSON 段 |
-| **trace 流式、永不入内存** | 104MB / 34 万事件用生成器逐事件处理，内存占用恒定 |
+| **启动时一次算齐 + 磁盘缓存** | 选择采集后在后台解析并缓存；每个 `/api/*` 返回预计算的 JSON 段 |
+| **trace 流式、永不入内存** | 用生成器逐事件处理，避免整体载入原始 trace |
 | **pandas 仅用于 CSV** | CSV 表格处理用 pandas；trace 用 stdlib `json` 流式 |
 
 > 运行依赖仅 `pandas` + `numpy`（见 `requirements.txt`）；服务器 / LLM 客户端 / 报告导出均纯 stdlib。前端零依赖。
@@ -112,7 +112,7 @@ sequenceDiagram
 ```
 
 要点：
-- **socket 在 profile 解析完成后才开放**，所以冷缓存首启（104MB trace）可能耗时；前端轮询 `/api/meta` 直到 `ready:true`。
+- **服务默认先监听并等待选择采集目录**；加载在后台进行，前端轮询 `/api/meta` 直到 `ready:true`，耗时取决于输入和缓存。
 - **LLM 调用从不在启动时发生**。`GET /api/insights` 只返回规则卡片 + 摘要（`narrative=null`）；只有显式 `POST /api/llm` 才触发网络调用，且仅当启用 + 有 key。
 
 ## 2.5 磁盘缓存
@@ -151,6 +151,13 @@ sequenceDiagram
 | GET | `/api/all` | 全部 metrics（调试用） |
 | POST | `/api/chip` | `{"chip":"950DT"}` 切换参考芯片，返回重算结果 |
 | POST | `/api/llm` | **唯一**的 LLM 触发；返回叙述或清晰的「未启用 / 报错」原因 |
+
+服务仅监听 `127.0.0.1`，Host 必须为当前端口的 `127.0.0.1` 或 `localhost`。
+提供 Origin 时必须与请求同源，浏览器跨站 / 跨源同站请求会被拒绝。
+POST 还必须带 `Content-Type: application/json` 和 `X-LLMInsight-Request: 1`，
+正文为空时发送 `{}`。前端和 `verify_web.js` 已发送这两个请求头。
+GET / HEAD `/api/llm` 返回 405，不会触发模型调用。静态文件按解析后的真实路径
+限制在 `web/` 内，不能通过同前缀相邻目录或指向外部的符号链接越界。
 
 非 `/api/*` 路径走静态文件（`web/`，SPA 回落 `index.html`）；含路径穿越防护。
 

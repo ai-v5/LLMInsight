@@ -15,11 +15,11 @@
 | `operator_details.csv` | 框架层算子（aten / aclnn）host+device 耗时、调用栈 | host/device 自耗时对比（预留细化） |
 | `communication.json` | 每个 HCCL 集合通信的 时间 / 等待 / 同步 / 带宽 | 通信瀑布、等待占比、带宽利用率 |
 | `communication_matrix.json` | 跨 rank 通信矩阵（单卡为空 `{}`） | **多卡预留**：通信热力图、链路瓶颈 |
-| `trace_view.json` | Chrome/Perfetto 时间线，34 万事件、多泳道 | 可缩放时间线、泳道占用、重叠分析 |
+| `trace_view.json` | Chrome/Perfetto 事件时间线、多泳道 | 可缩放时间线、泳道占用、重叠分析 |
 
 ## 3.2 统一数据模型 ProfileData
 
-`parser/profile.py` 的 `load_profile(data_dir)` 把 8 文件载入一个 `ProfileData`（概念上按 `(rank, step)` 索引；本样例为 rank 0 / step5，rank 维度预留多卡）：
+`parser/profile.py` 的 `load_profile(data_dir)` 把 8 文件载入一个 `ProfileData`（概念上按 `(rank, step)` 索引；具体 rank / step 来自当前采集）：
 
 ```python
 @dataclass
@@ -49,7 +49,7 @@ class ProfileData:
 `_normalize_communication` 把嵌套结构（step → collective/p2p → op → Time/Bandwidth Info）拍平为统一记录，并从算子名 `hcom_<type>_...` 正则抽出通信类型（allGather / alltoallv / allReduce / reduceScatter…）。每条含 `elapse/transit/wait/sync/idle_ms`、`wait_ratio`、`sync_ratio` 与各 link 的 `transit_mb / bandwidth_gbps`。
 
 ### trace_view.json 流式（关键工程取向）
-104MB / 34 万事件**从不整体读入内存**。`parser/trace.py` 的 `iter_events` 逐事件产出（生成器），`timeline.py` 用两遍流式扫描完成泳道占用聚合，结果（~100KB）落盘缓存。内存占用与文件大小**解耦**。
+大体积 trace **按事件处理，不整体读入内存**。`parser/trace.py` 的 `iter_events` 逐事件产出（生成器），`timeline.py` 用两遍流式扫描完成泳道占用聚合，结果（~100KB）落盘缓存。内存占用与文件大小**解耦**。
 
 ### shape / dtype 解析
 `parser/shapes.py` 把 `"Input Shapes"` / `"Input Data Types"` 字符串解析为 `List[List[int]]` / `List[str]`，并提供 `numel`。这是 MFU/MBU 估算的输入（见 [04](04-metrics.md)）。
@@ -61,20 +61,22 @@ class ProfileData:
 - 同一设备包含多个完整 step 时，overview 汇总整个 step 窗口，并同时返回 `steps`、`step_count`、窗口总量 `us` 与单步平均 `avg_us`；MFU/HFU 分子和分母必须使用同一窗口。
 - 多卡数据接入后，rank 维度填充即解锁 M1–M5（见 [07](07-roadmap-and-verification.md)）。
 
-## 3.5 校验基线（来自本数据，可作单测断言）
+## 3.5 公开合成校验示例
 
-| 指标 | 值 | 来源 |
+以下数值由 `scripts/verify.py` 人工生成，仅验证解析、公式、规则与 HTML 报告链路，
+不代表任何模型、芯片或真实训练采集。公开仓库不携带真实采集基线。
+
+| 指标 | 合成输入或推导 | 来源 |
 |---|---|---|
-| step 总时长 Stage | **3,126,771.5 us ≈ 3.13 s** | step_trace |
-| Computing | 1,728,916.559 us | step_trace |
-| Communication (Not Overlapped) | 817,426.625 us | step_trace |
-| Free（空闲） | ≈ 18.56 % | 派生 |
-| 有效计算占比 | ≈ 55.29 % | 派生 |
-| 计算-通信重叠率 | ≈ 12.62 %（118,079 / 935,506） | 派生 |
-| `HcclLaunchAicpuKernel` 占 device | **28.091 %** | op_statistic |
-| `aclnnMaskedSelect` 单次 max | 166,285.31 us | api_statistic |
+| Stage | 1,000 us | 合成 step CSV |
+| Computing | 600 us | 合成 step CSV |
+| 未重叠通信 | 250 us | 合成 step CSV |
+| Free | 150 us / 15% | 合成输入及比例计算 |
+| 有效计算占比 | 60% | 600 / 1,000 |
+| 计算-通信重叠率 | 28.57% | 100 / 350，按指标接口保留两位小数 |
 
-> 这些数字同时是 `scripts/verify.py` 的断言基线（见 [07](07-roadmap-and-verification.md)），用于回归保护。
+真实工作负载的回归基线由使用者在获准处理的数据上独立建立，不应直接公开原始数据、
+内部实测结果或采集环境。修改私有基线也不能替代公开合成回归。
 
 ## 3.6 多 rank 采集根目录（集群 profile）
 

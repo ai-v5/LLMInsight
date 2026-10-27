@@ -938,7 +938,7 @@
     const llm = ins.llm || {};
     const cardsHtml = (ins.cards || []).map(insightCard).join("");
     const llmBanner = llm.available
-      ? banner("info", "🤖", `LLM 已启用：<strong>${esc(llm.provider)}/${esc(llm.model)}</strong>。点击下方按钮生成自然语言诊断。`)
+      ? banner("info", "🤖", `LLM 已启用：<strong>${esc(llm.provider)}/${esc(llm.model)}</strong>。将发送模型特征和性能摘要；有限脱敏不等于可以公开，请先检查下方摘要，再运行分析。`)
       : banner("warn", "🤖", `LLM 自动分析<strong>默认关闭</strong>（仅传 KB 级指标摘要，绝不上传原始 trace）。${esc(llm.reason || "")}<br/>开启方式：设环境变量 <span class="mono">LLMINSIGHT_LLM_ENABLED=1</span>，并在 <span class="mono">secret/api_key.txt</span> 放置 key（默认 ${esc(llm.provider)}/${esc(llm.model)}）。规则引擎洞察始终可用 ↓`);
     root.innerHTML = `
       ${llmBanner}
@@ -949,7 +949,7 @@
       <div id="llm-narrative"></div>
       <div class="section-title">规则引擎诊断卡片（${(ins.cards||[]).length}） · 现象 / 根因 / 建议 / 预计收益 / 置信度</div>
       <div id="cards">${cardsHtml || `<div class="empty">无命中</div>`}</div>
-      <details class="raw"><summary>查看将发送给 LLM 的结构化摘要（隐私可审计 · 不含原始 trace）</summary>
+      <details class="raw"><summary>发送前检查结构化摘要（有限脱敏，仍可能含敏感指标；不含原始 trace）</summary>
         <pre>${esc(JSON.stringify(ins.summary, null, 1))}</pre></details>`;
     const btn = document.getElementById("llm-run");
     if (btn) btn.addEventListener("click", async () => {

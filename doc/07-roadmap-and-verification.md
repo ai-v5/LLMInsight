@@ -23,29 +23,22 @@
 
 ## 7.3 验证
 
-端到端目标：用现有这份数据跑通「解析 8 文件 → 派生指标 → 各视图渲染 → 洞察命中」。两套脚本守护：
+公开端到端目标：用合成数据跑通「解析 → 派生指标 → 规则 → 脱敏摘要 → 报告」。使用者另可在获准的本地采集上检查前端渲染：
 
 ### 7.3.1 后端数值基线（`scripts/verify.py`）
 
-断言关键派生数字与回归基线一致：
+公开 smoke 会临时生成小型 CSV，经 parser → metrics → rules → summary → HTML report
+验证链路；step 拆解与预期比例见 [03 §3.5](03-data-and-parsing.md)。
+所有输入和预期都是合成测试数据，不是设备性能验收。
 
-| 断言 | 期望值 |
-|---|---|
-| Computing | 1,728,916.559 us |
-| Communication (Not Overlapped) | 817,426.625 us |
-| Stage（step 总时长） | 3,126,771.5 us |
-| 计算-通信重叠率 | ≈ 12.62 % |
-| 有效计算占比 | ≈ 55.29 % |
-| 空闲 Free 占比 | ≈ 18.56 % |
-| `HcclLaunchAicpuKernel` 占比 | 28.091 % |
-| `aclnnMaskedSelect` 单次 max | 166,285.31 us |
-| `matmul_mfu` | ≤ 100 %（样例 ≈ 0.9313） |
-| **每个 per-type MFU** | **≤ 100 %**（守护 FlashAttention causal 因子） |
-| 峰值校准 | observed > assumed → calibrated=true |
-| 理论 What-if 场景数 | == 3 |
-| 诊断卡片数 | 12 |
+算子公式、覆盖率、通信分组、多 rank、HTTP 来源与路径边界、摘要脱敏等回归使用：
 
-> per-type MFU ≤100% 这条专门守护融合注意力的 causal 0.5 因子：若有人误删它，FA 的 MFU 会冲破 100%，断言立即失败。
+```bash
+python -m pytest -q tests
+```
+
+其中 HTTP 测试使用隔离的本机随机端口和合成目录，不访问现有应用实例，不发起 LLM 调用。
+Windows 主机不能创建符号链接时，对应测试会明确跳过；相邻目录越界测试仍会运行。
 
 ### 7.3.2 前端渲染校验（`scripts/verify_web.js`）
 
@@ -53,7 +46,7 @@
 
 ### 7.3.3 洞察校验
 
-方案应自动命中 [06](06-insights-and-llm.md) 的 12 条洞察，尤其：通信未掩盖 / AI_CPU 下发 / 同步阻塞 / 隐性开销总账 / 理论上界差距。
+洞察按输入条件命中，不承诺固定卡片数量。合成回归检查规则返回结构；具体诊断需结合使用者的采集内容核验。
 
 ### 7.3.4 多卡预留校验
 
@@ -66,7 +59,7 @@
 python -m llminsight.server --no-browser --port 8765
 #    或用 ./restart_insight.sh（自动停旧起新 + 轮询就绪）
 
-# 2) 后端数值基线
+# 2) 公开合成 smoke（不依赖服务器或真实采集）
 python scripts/verify.py
 
 # 3) 前端渲染校验（需服务器在 :8765 运行）

@@ -15,11 +15,9 @@ const LI = (function () {
     return j;
   }
   function apiPost(path, body) {
-    const opts = { method: "POST" };
-    if (body !== undefined) {
-      opts.headers = { "Content-Type": "application/json" };
-      opts.body = JSON.stringify(body);
-    }
+    const opts = { method: "POST",
+      headers: { "Content-Type": "application/json", "X-LLMInsight-Request": "1" },
+      body: JSON.stringify(body === undefined ? {} : body) };
     return fetch(path, opts).then(r => r.json());
   }
   function clearCache(path) { if (path) delete cache[path]; else Object.keys(cache).forEach(k => delete cache[k]); }

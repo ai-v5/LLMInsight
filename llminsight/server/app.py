@@ -18,8 +18,9 @@ import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 from ..config import SETTINGS, set_chip, save_last_dir, load_last_dir
 from ..parser import load_profile
@@ -151,7 +152,7 @@ class AppState:
         self.capture: Dict[str, Any] = {}
         self.load_seconds = 0.0
         self.loaded_dir: Optional[str] = None  # dir whose data is currently held
-        # The parsed profile is retained (the 104MB trace is streamed, never held,
+        # The parsed profile is retained (the large trace is streamed, never held,
         # so this is cheap) to allow chip-switch recomputation without a reload.
         self.prof: Any = None
         self.lock = threading.Lock()
@@ -246,7 +247,7 @@ class AppState:
             matrix_power = compute_matrix_power(self.prof, eff)
             # MFU/MBU/算力/带宽 on the smart-timeline scale with the chip; recompute
             # its cheap overlay (the geometry layer hits the trace-signature cache,
-            # so no 104MB re-scan) before dropping the heavy index from eff.
+            # so no full trace re-scan) before dropping the heavy index from eff.
             self.metrics["smart_timeline"] = compute_smart_timeline(self.prof, eff)
             eff.pop("kernel_index", None)
             self.metrics["efficiency"] = eff
@@ -355,10 +356,46 @@ class Handler(BaseHTTPRequestHandler):
         self._send(body, "application/json; charset=utf-8", status)
 
     # -- routing ------------------------------------------------------------
+    def _allow_request(self, *, mutation: bool = False) -> bool:
+        """Keep browser requests on this loopback origin, including POSTs.
+
+        The custom header makes mutations non-simple requests, so a foreign
+        page cannot send them through a form or no-cors fetch. CLI clients can
+        use the same documented header without an Origin header.
+        """
+        port = self.server.server_port
+        hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if port == 80:
+            hosts.update({"127.0.0.1", "localhost"})
+        host_headers = self.headers.get_all("Host", [])
+        host = host_headers[0].lower() if len(host_headers) == 1 else ""
+        origins = self.headers.get_all("Origin", [])
+        same_origin = not origins or (len(origins) == 1 and origins[0] == f"http://{host}")
+        fetch_site = self.headers.get("Sec-Fetch-Site", "")
+        if host not in hosts or not same_origin or fetch_site in {"cross-site", "same-site"}:
+            self.close_connection = True
+            self._send_json({"error": "request origin is not allowed"}, 403)
+            return False
+        if mutation:
+            if self.headers.get_all("X-LLMInsight-Request", []) != ["1"]:
+                self.close_connection = True
+                self._send_json({"error": "X-LLMInsight-Request: 1 is required"}, 403)
+                return False
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                self.close_connection = True
+                self._send_json({"error": "application/json is required"}, 415)
+                return False
+        return True
+
     def do_GET(self):
+        if not self._allow_request():
+            return
         parsed = urlparse(self.path)
         path = parsed.path
-        if path == "/api/browse":          # works pre-load (no ready guard)
+        if path == "/api/llm":
+            self._send_json({"error": "use POST /api/llm"}, 405)
+        elif path == "/api/browse":          # works pre-load (no ready guard)
             self._handle_browse(parsed.query)
         elif path.startswith("/api/"):
             self._handle_api(path)
@@ -370,13 +407,18 @@ class Handler(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
     def do_POST(self):
+        if not self._allow_request(mutation=True):
+            return
+        body = self._read_json_body()
+        if body is None:
+            return
         path = urlparse(self.path).path
         if path == "/api/llm":
             self._handle_api(path)
         elif path == "/api/chip":
-            self._handle_chip()
+            self._handle_chip(body)
         elif path == "/api/load":
-            self._handle_load()
+            self._handle_load(body)
         elif path == "/api/reset":
             self._send_json(STATE.reset())
         else:
@@ -389,37 +431,46 @@ class Handler(BaseHTTPRequestHandler):
         res = _browse_dir(raw)
         self._send_json(res, 200 if res.get("ok") else 400)
 
-    def _handle_load(self):
+    def _read_json_body(self) -> Optional[Dict[str, Any]]:
+        """Consume every POST body, including empty-action endpoints.
+
+        Leaving the frontend's '{}' in rfile would corrupt the next request
+        when the browser reuses an HTTP/1.1 connection.
+        """
+        try:
+            lengths = self.headers.get_all("Content-Length", [])
+            if len(lengths) > 1 or self.headers.get("Transfer-Encoding"):
+                raise ValueError("unsupported request framing")
+            size = int(lengths[0]) if lengths else 0
+            if size < 0 or size > 65536:
+                raise ValueError("invalid JSON body length")
+            raw = self.rfile.read(size) if size else b""
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+            if not isinstance(body, dict):
+                raise ValueError("JSON body must be an object")
+            return body
+        except (ValueError, UnicodeError):
+            self.close_connection = True
+            self._send_json({"error": "invalid JSON object or request framing"}, 400)
+            return None
+
+    def _handle_load(self, body: Dict[str, Any]):
         """POST /api/load {"dir": "<abs>"} — validate + start a background
         (re)load of a profiling directory. The frontend then polls /api/meta."""
-        try:
-            n = int(self.headers.get("Content-Length", 0) or 0)
-            raw = self.rfile.read(n) if n > 0 else b""
-            body = json.loads(raw.decode("utf-8")) if raw else {}
-            data_dir = str(body.get("dir", "")).strip()
-        except Exception as exc:
-            self._send_json({"ok": False, "error": f"bad request: {exc}"}, 400)
-            return
+        data_dir = str(body.get("dir", "")).strip()
         if not data_dir:
             self._send_json({"ok": False, "error": "missing 'dir'"}, 400)
             return
         res = STATE.start_load(data_dir)
         self._send_json(res, 200 if res.get("ok") else 400)
 
-    def _handle_chip(self):
+    def _handle_chip(self, body: Dict[str, Any]):
         """POST /api/chip {"chip": "950DT"} — switch the reference chip and
         return the freshly recomputed efficiency/theoretical sections."""
         if not STATE.ready:
             self._send_json({"ok": False, "error": STATE.error or "loading"}, 503)
             return
-        try:
-            n = int(self.headers.get("Content-Length", 0) or 0)
-            raw = self.rfile.read(n) if n > 0 else b""
-            body = json.loads(raw.decode("utf-8")) if raw else {}
-            key = str(body.get("chip", "")).strip()
-        except Exception as exc:
-            self._send_json({"ok": False, "error": f"bad request: {exc}"}, 400)
-            return
+        key = str(body.get("chip", "")).strip()
         try:
             res = STATE.switch_chip(key)
         except Exception as exc:
@@ -456,17 +507,24 @@ class Handler(BaseHTTPRequestHandler):
         self._send(html.encode("utf-8"), "text/html; charset=utf-8")
 
     def _serve_static(self, path: str):
-        rel = path.lstrip("/") or "index.html"
-        full = os.path.normpath(os.path.join(WEB_DIR, rel))
-        if not full.startswith(os.path.normpath(WEB_DIR)):
+        root = Path(WEB_DIR).resolve()
+        try:
+            full = (root / (unquote(path).lstrip("/") or "index.html")).resolve()
+        except (OSError, ValueError):
+            self._send_json({"error": "invalid path"}, 400)
+            return
+        if not full.is_relative_to(root):
             self._send_json({"error": "forbidden"}, 403)
             return
-        if not os.path.isfile(full):
-            full = os.path.join(WEB_DIR, "index.html")  # SPA fallback
-            if not os.path.isfile(full):
+        if not full.is_file():
+            full = (root / "index.html").resolve()  # SPA fallback
+            if not full.is_relative_to(root):
+                self._send_json({"error": "forbidden"}, 403)
+                return
+            if not full.is_file():
                 self._send_json({"error": "web/ not built"}, 404)
                 return
-        ext = os.path.splitext(full)[1].lower()
+        ext = full.suffix.lower()
         ctype = _CONTENT_TYPES.get(ext, "application/octet-stream")
         with open(full, "rb") as fh:
             self._send(fh.read(), ctype)

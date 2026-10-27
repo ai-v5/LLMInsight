@@ -4,7 +4,7 @@
 >
 > 把一份 `ASCEND_PROFILER_OUTPUT` 目录，零配置地解析为统一数据模型、派生指标、运行规则引擎，并通过无构建 Web 仪表盘呈现「现象 → 根因 → 建议 → 预计收益 → 置信度」式的可执行洞察。
 
-本文档按设计层次拆为多篇，本页是**入口与导航**。当前实现对象为 **DeepSeek-V3 结构 MoE 模型（MLA + 128 专家、EP64）单卡单 step** 采集。
+本文档按设计层次拆为多篇，本页是**入口与导航**。支持 Ascend profiler 和 MindStudio 导出格式，具体可用指标由采集内容决定。公开验证使用合成输入，不绑定某个内部模型或训练配置。
 
 ## 文档导航
 
@@ -22,7 +22,7 @@
 
 ```mermaid
 flowchart LR
-  A[ASCEND_PROFILER_OUTPUT<br/>8 文件 · 含 104MB trace] --> B[Parser<br/>ProfileData]
+  A[ASCEND_PROFILER_OUTPUT<br/>CSV / JSON / DB] --> B[Parser<br/>ProfileData]
   B --> C[Metrics<br/>overview/efficiency/comm/<br/>hidden/attribution/memory/<br/>theoretical/timeline]
   C --> D[Rules<br/>13 诊断卡片]
   C --> E[隐私安全摘要]
@@ -58,13 +58,13 @@ flowchart LR
 ```bash
 pip install -r requirements.txt          # 运行依赖仅 pandas + numpy（前端零依赖）
 
-# 默认数据目录指向仓库内置样例（可用 LLMINSIGHT_DATA_DIR 覆盖）
+# 用 LLMINSIGHT_DATA_DIR 指定获准分析的本地采集，或在网页中选择目录
 python -m llminsight.server              # 默认 127.0.0.1:8000，自动开浏览器
 python -m llminsight.server --port 8765 --no-browser
 # 本地开发可用 ./restart_insight.sh（自动停旧起新 + 轮询就绪）
 ```
 
-首次启动会解析 104MB trace（socket 在解析完成后才开放）；之后磁盘缓存使重启 ~0.09s。
+服务默认空闲启动，由使用者选择自己的采集目录。公开仓库不附带真实采集数据；合成验证见 `scripts/verify.py`。
 
 ## 关键约束
 

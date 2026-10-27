@@ -24,7 +24,7 @@ def _default_data_dir() -> str:
     env = os.environ.get("LLMINSIGHT_DATA_DIR")
     if env:
         return env
-    # repo-root default: the bundled DeepSeek-V3 single-card sample
+    # Legacy local-only sample location; no capture is bundled or published.
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.dirname(here)
     return os.path.join(

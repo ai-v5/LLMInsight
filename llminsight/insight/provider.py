@@ -5,7 +5,7 @@ Design constraints (from the project plan):
 - DISTRIBUTABLE: pure stdlib (urllib) — no third-party SDK — so LLMInsight runs
   anywhere it's shipped, not only inside Claude Code.
 - PRIVACY-FIRST: only the structured metric *summary* (KB-level JSON, see
-  summarizer.py) is ever sent. The raw 104MB trace never leaves the machine.
+  summarizer.py) is ever sent. The raw large trace never leaves the machine.
 - DISABLED BY DEFAULT: the network call is a no-op unless explicitly enabled
   (LLMINSIGHT_LLM_ENABLED=1). With it off, the insight panel renders the
   rule-engine cards verbatim — full graceful degradation.

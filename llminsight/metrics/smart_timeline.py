@@ -11,7 +11,7 @@ placeholders (need memory_record.csv).
 Two layers, mirroring the chip-switch design elsewhere:
   * chip-independent **geometry** — one streaming pass over trace_view.json,
     cached on disk by the trace signature (so chip switches never re-scan the
-    104MB trace). Stores per-bin Σflops / Σbytes / comm-coverage and the
+    large trace). Stores per-bin Σflops / Σbytes / comm-coverage and the
     down-sampled slice list (full kernel name + stream + start/dur).
   * cheap chip-dependent **overlay** — turns Σflops/Σbytes into utilization %
     against the (calibrated) peak / HBM bandwidth, and attaches a representative
