@@ -1,4 +1,4 @@
-"""Tiny on-disk JSON cache so we don't reparse the 104MB trace every restart.
+"""Tiny on-disk JSON cache so we don't reparse the large trace every restart.
 
 Keyed by (logical key + source file size/mtime). Lives in .llminsight_cache/.
 """

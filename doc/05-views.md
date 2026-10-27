@@ -44,7 +44,7 @@ device / host / config 三域分桶堆叠 + 每桶占 step 比例、Top 来源�
 HBM 容量卡片（读 `/api/meta` 的 `chip.hbm_capacity_gb`）+ 内存-时间权衡顾问（recompute / swap）。峰值时间线 + 构成分解待 memory-level 采集；当前明确给出「待采集」原因。属 `CHIP_VIEWS`，切芯片刷新容量。
 
 ## 5.8 时间线（Timeline / Trace）
-多泳道占用热力（Device / Communication / Host Runtime / Framework）+ Overlap 段 + AI Core 频率曲线 + Top 切片。104MB / 34 万事件经**后端流式切片**，前端只收 ~100KB。
+多泳道占用热力（Device / Communication / Host Runtime / Framework）+ Overlap 段 + AI Core 频率曲线 + Top 切片。原始事件经**后端流式切片**，前端接收聚合与选定切片，大小由当前数据决定。
 
 ## 5.9 LLM 洞察（Insight · H1）
 - **诊断卡片**（规则引擎，始终渲染）：现象 / 根因 / 建议 / 预计收益 / 置信度，按严重度排序。

@@ -46,6 +46,10 @@ pip install -r requirements.txt
 脚本会停止旧进程并启动服务。服务固定绑定 `127.0.0.1`，不支持远程监听。打开
 <http://127.0.0.1:8765/>，选择要分析的 Profiling 目录。
 
+浏览器请求只接受当前本机来源。自行调用 POST API 时，需发送
+`Content-Type: application/json` 和 `X-LLMInsight-Request: 1`；
+`/api/llm` 仅接受 POST。不要将服务通过反向代理或端口转发暴露给远端。
+
 ### Linux/macOS
 
 ```bash
@@ -92,3 +96,6 @@ node scripts/verify_web.js
 
 项目使用 AGPL-3.0-only，见 [`LICENSE`](LICENSE)。第三方组件和依赖见
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+
+从 0.6.2 起的源码版本采用 AGPL-3.0-only。历史发布的 0.6.0 / 0.6.1 安装包仍按
+其随包附带的 GPL-3.0-only 许可分发；修改当前仓库许可不会追溯改变既有副本的许可。

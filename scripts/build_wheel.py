@@ -19,6 +19,8 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+import zipfile
+from email.parser import BytesParser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +28,26 @@ PKG = ROOT / "llminsight"
 DIST = ROOT / "dist"
 # (source at repo root, staged copy inside the package)
 STAGED = [(ROOT / "web", PKG / "web"), (ROOT / "configs", PKG / "configs")]
+
+
+def _verify_wheel(wheel: Path) -> None:
+    """Check the distributed artifact, not just the source manifest."""
+    legal_files = ["LICENSE", "THIRD_PARTY_NOTICES.md",
+                   "licenses/echarts-5.5.1/LICENSE", "licenses/echarts-5.5.1/NOTICE",
+                   "licenses/echarts-5.5.1/LICENSE-d3"]
+    with zipfile.ZipFile(wheel) as archive:
+        metadata_path = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+        info = metadata_path.rsplit("/", 1)[0]
+        metadata = BytesParser().parsebytes(archive.read(metadata_path))
+        if metadata["License-Expression"] != "AGPL-3.0-only":
+            raise RuntimeError("wheel license metadata does not match AGPL-3.0-only")
+        for relative in legal_files:
+            if archive.read(f"{info}/licenses/{relative}") != (ROOT / relative).read_bytes():
+                raise RuntimeError(f"wheel legal file differs from source: {relative}")
+        for relative in ("web/index.html", "web/vendor/echarts.min.js", "configs/chips/Ascend_950DT.yaml"):
+            if archive.read(f"llminsight/{relative}") != (ROOT / relative).read_bytes():
+                raise RuntimeError(f"wheel runtime asset differs from source: {relative}")
+    print("  verified AGPL metadata, five legal files and bundled runtime assets")
 
 
 def _stage() -> None:
@@ -72,6 +94,7 @@ def main() -> int:
     if not wheels:
         print("ERROR: no wheel produced", file=sys.stderr)
         return 1
+    _verify_wheel(wheels[-1])
     print(f"\nbuilt: {wheels[-1].relative_to(ROOT)}")
     return 0
 

@@ -48,7 +48,7 @@ FLOPs_grad = FLOPs_fwd · 2.5
 
 ### 4.3.2 峰值校准（避免非物理的 MFU > 100%）
 
-`config.ChipSpec` 的峰值是**假设值**（910B 保守取 376 TFLOPS）。但本样例干净 GEMM 实测可达 ~432 TFLOPS。真实 kernel 不可能超过硅片峰值 → 报 MFU>100% 是荒谬的。于是：
+`config.ChipSpec` 的峰值是**假设值**（910B 保守取 376 TFLOPS）。配置值不等于采集设备身份；若同一采集中由完整 shape/dtype 支持的算子结果明显超过所选假设峰值，应先检查参考配置、时钟、数据口径及模型公式。
 
 ```
 observed_peak = max over clean matmul of (FLOPs / duration)
@@ -56,7 +56,7 @@ calibrated    = observed_peak > configured_peak
 effective_peak = min(observed_peak · 1.02, configured_peak · 2.0)   # 仅当 calibrated
 ```
 - 把有效峰值抬到实测上界（+2% 余量，使顶点 kernel 读到 ~98% 而非可疑的平 100%）；上限 2× 防止 shape 误解析伪装成巨大峰值。
-- **assumed / observed / effective 三个峰值都在 UI 暴露**；在 `ChipSpec` 填真实 SKU 峰值即可用精确值替代校准。本样例：assumed 376 → effective ≈ **440.6 TFLOPS**。
+- **assumed / observed / effective 三个峰值都在 UI 暴露**；在 `ChipSpec` 填真实 SKU 峰值即可用精确值替代校准。此过程是采集内估算，不是厂商规格校准。
 
 ### 4.3.3 bound 判定、浪费时间与优化排行
 
@@ -77,7 +77,7 @@ bound = "compute" if t_compute >= t_mem else "memory"
 
 `matmul_mfu` 这个**头条数字仅统计纯 GEMM**（MATMUL_TYPES），是峰值校准的锚点；融合注意力有自己的 per-type MFU 行，不并入头条以保持其含义。`kernels_with_flops` 与 Roofline 散点则包含注意力。
 
-> 实测样例：`matmul_mfu ≈ 0.9313`；FlashAttentionScore ≈ 0.7362、FlashAttentionScoreGrad ≈ 0.6397（FA 反向被排为头号优化候选）。
+> 示例数值由合成测试覆盖；不在公开文档中保留未经外部来源核验的真实采集 MFU。
 
 ## 4.4 communication · 通信分析
 
@@ -102,7 +102,7 @@ bound = "compute" if t_compute >= t_mem else "memory"
 
 > **口径警示**：host 与 device 时间**不可直接相加**（部分并发 / 被 blocking 放大）。device 桶与 step 同口径可比；host 桶反映下发 / 同步压力。用于「相对量级与归因」。
 >
-> **避免重复计入**：`HcclLaunchAicpuKernel` 是 AICPU 展开模式下**驱动集合通信的 AI_CPU 算子**，其 device 时长 = AICPU 占用在 collective 中的时间（本数据几乎 100% Wait、Transit≈0）—— 它**就是通信本身**（≈ Communication 的 72%），并非内核启动 / 下发延迟（单次 max 280ms 远超任何下发量级）。因此它与「通信未掩盖」是**同一段时间的两种视角**，标记为 `additive:false`、**不并入 Device 合计**，仅作算子视角展示。
+> **避免重复计入**：`HcclLaunchAicpuKernel` 是 AICPU 展开模式下驱动集合通信的 AI_CPU 算子。其设备时长可能覆盖 collective 执行或等待，不应直接当作内核启动延迟。它与通信分解可能是同一时段的两种视角，标记为 `additive:false`，不并入 Device 合计；具体等待与传输比例由当前采集核对。
 
 ## 4.6 attribution · 模型结构归因（H3）
 
@@ -124,7 +124,7 @@ bound = "compute" if t_compute >= t_mem else "memory"
 
 ## 4.7 memory · 显存与内存-时间权衡（H8）
 
-**现状**：本次采集仅含 AI Core Freq counter，**无 memory-level 采集**（缺 `memory_record.csv` / `npu_module_mem.csv`）→ 无法绘制真实 HBM 峰值时间线（`available:false` + 明确原因）。
+未记录 memory-level 文件（如 `memory_record.csv` / `npu_module_mem.csv`）时，HBM 峰值时间线会返回 `available:false` 和原因；不由频率计数器推断内存占用。
 
 当前提供**配置驱动的内存-时间权衡顾问**：
 - `--recompute-granularity full`：省激活显存，代价是反向重跑前向。

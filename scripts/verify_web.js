@@ -55,7 +55,7 @@ async function ensureLoaded() {
 
   const dir = meta.suggested_dir || meta.data_dir;
   const res = await (await _realFetch(BASE + "/api/load", {
-    method: "POST", headers: { "Content-Type": "application/json" },
+    method: "POST", headers: { "Content-Type": "application/json", "X-LLMInsight-Request": "1" },
     body: JSON.stringify({ dir }),
   })).json();
   if (!res.ok) throw new Error("load failed: " + (res.error || JSON.stringify(res)));

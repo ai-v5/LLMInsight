@@ -1,452 +1,69 @@
-"""End-to-end regression check for LLMInsight.
+"""Public end-to-end smoke using generated data only.
 
-Runs the full pipeline (parser -> metrics -> rules -> insight) on the bundled
-DeepSeek-V3 single-card sample and asserts the numeric baselines from the design
-doc. Doubles as a CI regression gate (exit 1 on any mismatch).
-
-    python scripts/verify.py        # from repo root
+Run ``python scripts/verify.py`` from the repository root. All numbers below
+are synthetic test inputs; they are not model, device or training benchmarks.
 """
-import os
-import sys
+from __future__ import annotations
+
 import json
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
-# On Windows the default stdout encoding is GBK (cp936), which can't encode the
-# non-ASCII glyphs this script prints (e.g. « U+00AB) or its Chinese labels, so a
-# bare `python scripts/verify.py` dies mid-run with UnicodeEncodeError. Force
-# utf-8 so the report renders identically on every platform — no PYTHONIOENCODING.
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8")
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from llminsight.config import SETTINGS, set_chip
-from llminsight.parser import load_profile
-from llminsight.parser.profile import num
-from llminsight.parser.derive import derive_config
+from llminsight import cache
+from llminsight.config import SETTINGS
+from llminsight.insight.summarizer import build_summary
 from llminsight.metrics import compute_all
+from llminsight.parser import load_profile
+from llminsight.report import build_report_html
 from llminsight.rules import run_rules
-from llminsight.insight import generate_insights
-
-FAILS = []
-MFU_MEASUREMENT_TOL = 1.02
 
 
-def chk(label, got, want, tol=1.0):
-    ok = got is not None and abs(float(got) - float(want)) <= tol
-    print(("  OK   " if ok else "  FAIL ") + f"{label}: got={got} want={want} (±{tol})")
-    if not ok:
-        FAILS.append(label)
+def _write_synthetic_profile(root: Path) -> None:
+    (root / "step_trace_time.csv").write_text(
+        "Device_id,Step,Computing,Communication(Not Overlapped),Overlapped,"
+        "Communication,Free,Stage,Bubble,Preparing\n"
+        "0,1,600,250,100,350,150,1000,0,0\n", encoding="utf-8")
+    (root / "kernel_details.csv").write_text(
+        "Name,Type,Accelerator Core,Duration(us),Input Shapes,Input Data Types,"
+        "Output Shapes,Output Data Types\n"
+        'synthetic_matmul,MatMulV3,AI_CORE,600,"2,3;3,5",BF16;BF16,"2,5",BF16\n',
+        encoding="utf-8")
+    (root / "op_statistic.csv").write_text(
+        "Device_id,OP Type,Core Type,Count,Total Time(us),Min Time(us),Avg Time(us),Max Time(us),Ratio(%)\n"
+        "0,MatMulV3,AI_CORE,1,600,600,600,600,100\n", encoding="utf-8")
 
 
-def chk_true(label, cond, detail=""):
-    print(("  OK   " if cond else "  FAIL ") + f"{label} {detail}")
-    if not cond:
-        FAILS.append(label)
-
-
-def main():
-    print("Loading profile:", SETTINGS.data_dir)
-    prof = load_profile(SETTINGS.data_dir)
-    # Config is reconstructed FROM the profiling (parser.derive), never a launch
-    # script — pointing at the dir is enough (H4). compute_all derives the same
-    # capture internally when none is passed; we derive it here too for the rule
-    # engine + insight checks below.
-    cap = derive_config(prof)
-    m = compute_all(prof, cap)
-    cards = run_rules(m, cap)
-
-    print("\n== metrics baselines ==")
-    u = m["overview"]["us"]
-    chk("computing us", u["computing"], 1728916.559, 1)
-    chk("comm_not_overlapped us", u["comm_not_overlapped"], 817426.625, 1)
-    chk("stage us", u["stage"], 3126771.5, 1)
-    chk("overlap_rate %", m["overview"]["ratios"]["overlap_rate_pct"], 12.62, 0.05)
-    chk("effective_compute %", m["overview"]["ratios"]["effective_compute_pct"], 55.29, 0.1)
-    chk("free %", m["overview"]["ratios"]["free_pct"], 18.56, 0.1)
-
-    aicpu = next((o for o in m["hotspots"]["ops"] if o["type"] == "HcclLaunchAicpuKernel"), None)
-    chk_true("HcclLaunchAicpuKernel present", aicpu is not None)
-    if aicpu:
-        chk("HcclLaunchAicpuKernel ratio %", aicpu["ratio"], 28.091, 0.05)
-
-    # parser fidelity: aclnnMaskedSelect host max (dynamic-shape jitter baseline)
-    api = prof.api_statistic
-    mx = 0.0
-    if not api.empty and "API Name" in api.columns:
-        mask = api["API Name"].astype(str).str.contains("MaskedSelect", case=False, na=False)
-        if mask.any() and "Max(us)" in api.columns:
-            mx = float(num(api[mask]["Max(us)"]).max())
-    chk("aclnnMaskedSelect max us", mx, 166285.31, 1.0)
-
-    print("\n== efficiency / theoretical ==")
-    eff = m["efficiency"]
-    chk_true("efficiency available", eff.get("available"))
-    chk_true("roofline scatter non-empty", len(eff.get("scatter", [])) > 0,
-             f"({len(eff.get('scatter', []))} pts)")
-    chk_true("matmul_mfu present", eff.get("matmul_mfu") is not None,
-             f"(MFU={eff.get('matmul_mfu')})")
-    # The confirmed 432T denominator remains fixed. Profiler duration/counter
-    # granularity may put a kernel slightly above 100%, so accept <=102% as
-    # measurement noise while still failing on a material peak contradiction.
-    # Under the default 950DT (the device this sample was captured on), the configured cube
-    # peak already equals the observed GEMM ceiling, so no calibration is needed; the
-    # 910B what-if below exercises the calibrate-up path.
-    chk_true("matmul MFU <= 102% (measurement tolerance)",
-             eff.get("matmul_mfu") is not None and eff["matmul_mfu"] <= MFU_MEASUREMENT_TOL,
-             f"(MFU={eff.get('matmul_mfu')}, vs_assumed={eff.get('matmul_mfu_assumed')})")
-    chk_true("no per-type MFU > 102%",
-             all((t.get("mfu") is None or t["mfu"] <= MFU_MEASUREMENT_TOL)
-                 for t in eff.get("by_type", [])),
-             f"(max={max([t.get('mfu') or 0 for t in eff.get('by_type', [])] or [0]):.3f})")
-    # Vector-core ops now carry a VECTOR-peak MFU: elementwise/norm/optimizer kernels
-    # get a flop model so their headroom floor is max(vector-compute, memory), not
-    # memory alone. Mul (FLOAT, AI_VECTOR_CORE) gets a small but physical MFU routed
-    # to the vector peak (≈2.5%; an 8x-higher cube peak would read ~0.3%).
-    bt = {t["type"]: t for t in eff.get("by_type", [])}
-    _mul_mfu = bt.get("Mul", {}).get("mfu")
-    chk_true("vector op (Mul) has physical vector-peak MFU",
-             _mul_mfu is not None and 0.0 < _mul_mfu <= MFU_MEASUREMENT_TOL,
-             f"(Mul mfu={_mul_mfu})")
-    # Pure data-movement ops (factor 0: ZerosLike/Cast) do ~0 arithmetic, so they stay
-    # MFU-less and honestly memory-bound — no fabricated compute.
-    chk_true("zero-arith vector op (ZerosLike) stays MFU-less",
-             "ZerosLike" not in bt or bt["ZerosLike"].get("mfu") is None,
-             f"(mfu={bt.get('ZerosLike', {}).get('mfu')})")
-    ch = eff.get("chip", {})
-    # 950DT datasheet cube peak (432 TF) matches the observed silicon ceiling, so the
-    # MFU is the real utilization and calibration stays off (no >100% to correct).
-    chk_true("950DT cube peak matches observed ceiling (no calibration)",
-             ch.get("calibrated") is False
-             and abs((ch.get("observed_peak_tflops") or 0) - ch.get("peak_bf16_tflops", 0)) <= 1.0,
-             f"(peak={ch.get('peak_bf16_tflops')} observed={ch.get('observed_peak_tflops')} calibrated={ch.get('calibrated')})")
-    # cube vs vector peaks are surfaced separately (950DT: cube 432 TF, vector 54 TF).
-    chk("950DT cube bf16 TFLOPS", ch.get("cube_bf16_tflops"), 432.0, 1.0)
-    chk("950DT vector bf16 TFLOPS", ch.get("vector_bf16_tflops"), 54.0, 1.0)
-    # 算子极致优化: per-op-class MFU ceilings (matmul 95 / FA 85 / FAG 70 on 950DT)
-    # drive a reclaim-to-ceiling aggregate. matmul mostly saturates the cube, so many
-    # of its kernels are already at/above the ceiling (n_capped>0) and the honest gain
-    # comes from FA/FAG headroom — not a naive "everything to 100%".
-    oco = eff.get("op_ceiling_opt") or {}
-    ceils = oco.get("ceilings") or {}
-    chk("op-ceiling matmul ceiling", ceils.get("matmul"), 0.95, 1e-9)
-    chk("op-ceiling FA ceiling", ceils.get("attention"), 0.85, 1e-9)
-    chk("op-ceiling FAG ceiling", ceils.get("attention_grad"), 0.70, 1e-9)
-    chk_true("op-ceiling reclaim > 0 (FA/FAG headroom)",
-             (oco.get("total_reclaim_us") or 0) > 0, f"(reclaim={oco.get('total_reclaim_us')})")
-    chk_true("op-ceiling: some matmul kernels already at ceiling (excluded)",
-             oco.get("n_capped", 0) > 0, f"(n_capped={oco.get('n_capped')}/{oco.get('n_modeled')})")
-    chk_true("optimization candidates all have reclaimable time (>0)",
-             all(r.get("reclaim_us", 0) > 0 for r in eff.get("top_optimization", [])),
-             f"(min={min([r.get('reclaim_us', 0) for r in eff.get('top_optimization', [])] or [0])})")
-    theo_m = m["theoretical"]
-    levers = theo_m.get("whatif", [])
-    lever_ids = {w.get("id") for w in levers}
-    # recompute is now a first-class lever (this sample is full recompute), and 算子余量
-    # is carved by (1−r_re) so the two stay disjoint in the combined.
-    _rre = (theo_m.get("recompute") or {}).get("flops_share") or 0.0
-    chk_true("theoretical what-if levers (comm/free/op + recompute)",
-             {"comm_overlap", "free_zero", "op_ceiling", "recompute_off"} <= lever_ids,
-             f"(ids={lever_ids})")
-    chk_true("each what-if lever carries new_mfu",
-             all(w.get("new_mfu") is not None for w in levers))
-    op_lever = next((w for w in levers if w.get("id") == "op_ceiling"), None)
-    chk_true("op_ceiling lever = efficiency reclaim × (1−r_re) (disjoint from 重计算)",
-             op_lever is not None
-             and abs((op_lever.get("save_us") or 0)
-                     - (oco.get("total_reclaim_us") or 0) * (1 - _rre)) <= 1.0,
-             f"(lever={op_lever.get('save_us') if op_lever else None} "
-             f"reclaim={oco.get('total_reclaim_us')} r_re={_rre})")
-    rc_lever = next((w for w in levers if w.get("id") == "recompute_off"), None)
-    chk_true("recompute lever in combined (save==theo.recompute.save_us)",
-             rc_lever is not None
-             and abs((rc_lever.get("save_us") or 0) - ((theo_m.get("recompute") or {}).get("save_us") or 0)) <= 1.0,
-             f"(lever={rc_lever.get('save_us') if rc_lever else None})")
-    comb = theo_m.get("whatif_combined") or {}
-    chk_true("combined what-if present (with MFU)", comb.get("new_mfu") is not None,
-             f"(combined={comb})")
-    # Disjoint levers => combined save == sum of per-lever saves (additivity invariant).
-    chk_true("combined save == Σ lever saves (disjoint slices add)",
-             abs((comb.get("save_us") or 0) - sum(w.get("save_us") or 0 for w in levers)) <= 1.0,
-             f"(combined={comb.get('save_us')} sum={sum(w.get('save_us') or 0 for w in levers)})")
-    chk_true("end-to-end step MFU present", theo_m.get("step_mfu") is not None,
-             f"(step_mfu={theo_m.get('step_mfu')})")
-
-    # MFU (model, recompute-stripped) vs HFU (executed FLOPs) + recompute what-if.
-    # This OLD sample is full recompute, so the split must be present and consistent.
-    _hfu = theo_m.get("step_hfu")
-    _mfu = theo_m.get("step_mfu")
-    _computing = m["overview"]["us"]["computing"]
-    chk_true("step_hfu present (hardware FLOPs util, incl. recompute)", _hfu is not None,
-             f"(step_hfu={_hfu})")
-    chk_true("HFU >= MFU (recompute inflates executed FLOPs)",
-             _hfu is not None and _mfu is not None and _hfu >= _mfu - 1e-9,
-             f"(hfu={_hfu} mfu={_mfu})")
-    rc_w = theo_m.get("recompute") or {}
-    chk_true("recompute what-if present (full-recompute sample)", bool(rc_w.get("overhead_us")),
-             f"(recompute={rc_w})")
-    chk("recompute flops_share ≈ 1/4 (full, R=2 textbook 1:2:1)", rc_w.get("flops_share"), 0.25, tol=0.03)
-    chk_true("MFU == HFU × (1 − recompute_share) (self-consistent)",
-             bool(_hfu) and _mfu is not None
-             and abs(_mfu - _hfu * (1.0 - (rc_w.get("flops_share") or 0))) <= 1e-3,
-             f"(mfu={_mfu} hfu={_hfu} share={rc_w.get('flops_share')})")
-    chk_true("turning recompute off raises MFU (new_mfu > mfu)",
-             (rc_w.get("new_mfu") or 0) > (rc_w.get("mfu") or 0),
-             f"(new_mfu={rc_w.get('new_mfu')} mfu={rc_w.get('mfu')})")
-    chk_true("recompute save within compute slice (save_us <= computing)",
-             (rc_w.get("save_us") or 0) <= _computing + 1.0,
-             f"(save_us={rc_w.get('save_us')} computing={_computing})")
-    chk_true("recompute overhead band ordered (lo <= headline <= hi)",
-             (rc_w.get("overhead_us_lo") or 0) <= (rc_w.get("overhead_us") or 0) + 1e-6
-             <= (rc_w.get("overhead_us_hi") or 0) + 1.0,
-             f"(lo={rc_w.get('overhead_us_lo')} us={rc_w.get('overhead_us')} hi={rc_w.get('overhead_us_hi')})")
-
-    print("\n== what-if 现实地板 (realistic floor, derived from LOADED profile) ==")
-    # The 严谨性分析 ("can it reach 0? if not, how far?") must be computed from the
-    # loaded profile's measured slices, NOT a static sample. Floors are formulas over
-    # the measured values; 失真 caveats are conditioned on THIS capture's blocking /
-    # single-card state. Web panel + shareable report both render this same payload.
-    rz = theo_m.get("realistic") or {}
-    rlevers = rz.get("levers") or []
-    rl_by = {l.get("id"): l for l in rlevers}
-    chk_true("realistic block present", bool(rz), f"(keys={list(rz.keys())})")
-    chk_true("realistic has comm+free(+op) levers",
-             "comm_overlap" in rl_by and "free_zero" in rl_by,
-             f"(ids={set(rl_by)})")
-    chk_true("only 重计算 can reach 0 (comm/free/op keep an irreducible floor)",
-             rlevers and all(l.get("can_reach_zero") is False
-                             for l in rlevers if l.get("id") != "recompute_off"))
-    # comm/free floors are formulas over the LOADED measured slices: 0 < floor < measured,
-    # so the recoverable is a strict positive fraction, never the whole slice → 0.
-    for lid in ("comm_overlap", "free_zero"):
-        lv = rl_by.get(lid) or {}
-        chk_true(f"{lid}: 0 < floor < measured (cannot zero out)",
-                 lv.get("floor_us") is not None and lv.get("measured_us") is not None
-                 and 0 < lv["floor_us"] < lv["measured_us"],
-                 f"(floor={lv.get('floor_us')} measured={lv.get('measured_us')})")
-        chk_true(f"{lid}: recoverable > 0 with lo<=mid<=hi band",
-                 (lv.get("recoverable_us") or 0) > 0
-                 and lv.get("recoverable_lo_us") <= lv.get("recoverable_us") <= lv.get("recoverable_hi_us"),
-                 f"(lo={lv.get('recoverable_lo_us')} mid={lv.get('recoverable_us')} hi={lv.get('recoverable_hi_us')})")
-    # op-余量 lever mirrors the efficiency ceiling reclaim (compute is useful work, not →0)
-    op_rl = rl_by.get("op_ceiling")
-    chk_true("op_ceiling realistic lever = efficiency reclaim × (1−r_re)",
-             op_rl is not None
-             and abs((op_rl.get("recoverable_us") or 0)
-                     - (oco.get("total_reclaim_us") or 0) * (1 - _rre)) <= 1.0,
-             f"(lever={op_rl.get('recoverable_us') if op_rl else None} "
-             f"reclaim={oco.get('total_reclaim_us')} r_re={_rre})")
-    # scenario labels carry the realistic floor UP into the upper What-if table (web +
-    # report): comm/free read 实测%→地板% (e.g. "未掩盖通信 26.1%→4.5%"), op is descriptive.
-    # This is what the user asked for: replace the unachievable "→0" labels with the floor.
-    chk_true("every realistic lever has a non-empty scenario label",
-             bool(rlevers) and all((l.get("scenario") or "").strip() for l in rlevers),
-             f"(scenarios={[l.get('scenario') for l in rlevers]})")
-    for lid in ("comm_overlap", "free_zero"):
-        lv = rl_by.get(lid) or {}
-        sc = lv.get("scenario") or ""
-        chk_true(f"{lid}: scenario is 实测%→地板% (measured→floor, not →0)",
-                 "%→" in sc
-                 and f"{lv.get('measured_pct'):.1f}" in sc
-                 and f"{lv.get('floor_pct'):.1f}" in sc,
-                 f"(scenario={sc!r} measured_pct={lv.get('measured_pct')} floor_pct={lv.get('floor_pct')})")
-    # 失真 caveats are CONDITIONED on this capture. Config is profiling-derived, so
-    # blocking is NOT asserted (env empty → False): the data shows async dispatch
-    # (Synchronize/launch « 1) and the real host bottleneck is dynamic-shape D2H
-    # sync, not ASCEND_LAUNCH_BLOCKING. single-card still holds (empty comm matrix).
-    chk_true("realistic flags track derived capture (single_card on, blocking NOT detected)",
-             rz.get("single_card") is True and rz.get("blocking") is False,
-             f"(single_card={rz.get('single_card')} blocking={rz.get('blocking')})")
-    comm_cav = " ".join((rl_by.get("comm_overlap") or {}).get("caveats") or [])
-    free_cav = " ".join((rl_by.get("free_zero") or {}).get("caveats") or [])
-    chk_true("comm lever caveat notes single-card (no false blocking distortion)",
-             "communication_matrix" in comm_cav and "ASCEND_LAUNCH_BLOCKING" not in comm_cav,
-             f"(caveats={(rl_by.get('comm_overlap') or {}).get('caveats')})")
-    chk_true("free lever caveat reflects blocking-off capture (no false 失真)",
-             "采集未开 blocking" in free_cav and "采集失真" not in free_cav,
-             f"(caveats={(rl_by.get('free_zero') or {}).get('caveats')})")
-    # The free_zero lever's METHODS + floor_basis must also follow derived blocking:
-    # when blocking is not detected, neither may propose/blame closing
-    # ASCEND_LAUNCH_BLOCKING (that was an unconditional fabrication pre-fix).
-    free_methods = " ".join((rl_by.get("free_zero") or {}).get("methods") or [])
-    free_floor = (rl_by.get("free_zero") or {}).get("floor_basis") or ""
-    chk_true("free lever methods exclude ASCEND_LAUNCH_BLOCKING (derived blocking=False)",
-             "ASCEND_LAUNCH_BLOCKING" not in free_methods,
-             f"(methods={(rl_by.get('free_zero') or {}).get('methods')})")
-    chk_true("free lever floor_basis drops '关 blocking' prefix (derived blocking=False)",
-             "关 blocking" not in free_floor,
-             f"(floor_basis={free_floor})")
-    # combined realistic floor: a genuine floor ABOVE the physical "→0" upper bound, and
-    # strictly BELOW the base step (it does recover real time). Bands ordered.
-    rcomb = rz.get("combined") or {}
-    chk_true("realistic combined present (step+MFU+band)",
-             rcomb.get("new_step_us") is not None and rcomb.get("new_mfu") is not None
-             and rcomb.get("new_step_lo_us") is not None and rcomb.get("new_step_hi_us") is not None,
-             f"(combined={rcomb})")
-    chk_true("realistic floor sits between →0 upper bound and base step",
-             comb.get("new_step_us") is not None
-             and comb["new_step_us"] < (rcomb.get("new_step_us") or 0) < u["stage"],
-             f"(upper={comb.get('new_step_us')} realistic={rcomb.get('new_step_us')} base={u['stage']})")
-    chk_true("realistic band ordered (hi=fastest <= mid <= lo=slowest)",
-             rcomb.get("new_step_hi_us") <= rcomb.get("new_step_us") <= rcomb.get("new_step_lo_us"),
-             f"(hi={rcomb.get('new_step_hi_us')} mid={rcomb.get('new_step_us')} lo={rcomb.get('new_step_lo_us')})")
-    chk_true("realistic combined recoverable == Σ lever recoverables (disjoint slices add)",
-             abs((rcomb.get("recoverable_us") or 0) - sum(l.get("recoverable_us") or 0 for l in rlevers)) <= 1.0,
-             f"(combined={rcomb.get('recoverable_us')} sum={sum(l.get('recoverable_us') or 0 for l in rlevers)})")
-    # combined now includes the 重计算 lever (full-recompute sample) → deeper floor.
-    chk("realistic combined new_step us (incl. 重计算 lever)", rcomb.get("new_step_us"), 1483672.0, 6000.0)
-    chk("realistic combined recoverable %", rcomb.get("recoverable_pct"), 52.55, 0.6)
-
-    print("\n== rule engine (insight cards) ==")
-    # 11 under the default 950DT on this OLD sample (recompute=full). Composition vs the
-    # old script-based config CHANGED: capture_blocking is GONE (blocking is not
-    # detectable from data — Synchronize/launch « 1) and host_sync_stall is NEW (the
-    # real host bottleneck = dynamic-shape D2H sync via aclrtSynchronizeStream).
-    # peak_underestimated does not fire (peak == observed; it does under the 910B
-    # what-if below). recompute_full + free_bubble fire for this full-recompute run.
-    chk_true("card count == 11", len(cards) == 11, f"(got {len(cards)})")
-    ids = {c["id"] for c in cards}
-    for need in ("comm_not_overlapped", "aicpu_dispatch", "host_sync_stall",
-                 "hidden_overhead_ledger", "theoretical_whatif", "dynamic_shape",
-                 "parallelism_advisor", "memory_capture", "recompute_full", "free_bubble"):
-        chk_true(f"card hit: {need}", need in ids)
-    chk_true("capture_blocking NOT fired (blocking undetectable from data)",
-             "capture_blocking" not in ids)
-    # the hidden_overhead_ledger card fires on every dataset; its host-side advice must
-    # follow derived blocking (=False here) — never tell the user to 关 blocking when it
-    # was not detected (same config-derivation-sweep fix as the core.py free_zero lever).
-    _ledger = next((c for c in cards if c["id"] == "hidden_overhead_ledger"), None)
-    chk_true("ledger card advice excludes '关 blocking' (derived blocking=False)",
-             _ledger is not None and "关 blocking" not in (_ledger.get("suggestion") or ""),
-             f"(suggestion={_ledger.get('suggestion') if _ledger else None})")
-
-    print("\n== config reconstructed FROM profiling (no launch script) ==")
-    # model architecture is reconstructed from kernel shapes (H3 model-aware), not a script
-    dm = cap.get("model", {})
-    chk("derived hidden_size", dm.get("hidden_size"), 7168, 0)
-    chk("derived num_attention_heads", dm.get("num_attention_heads"), 128, 0)
-    chk("derived seq_length", dm.get("seq_length"), 8192, 0)
-    chk("derived moe_router_topk", dm.get("moe_router_topk"), 8, 0)
-    chk_true("derived dtype == BF16", dm.get("dtype") == "BF16", f"(got {dm.get('dtype')})")
-    chk_true("config source is profiling (path withheld)",
-             cap.get("source") == "profiling" and cap.get("path") is None)
-    # EP world size is UNDERIVABLE from a single rank → remains unknown,
-    # never a model-family numeric guess or a fabricated definite flag.
-    ep = cap.get("guesses", {}).get("ep_world_size", {})
-    chk_true("EP world size remains unknown, not a numeric family prior",
-             ep.get("label") == "未知" and ep.get("guess") is None
-             and "expert-model-parallel-size" not in cap.get("flags", {}),
-             f"(label={ep.get('label')} flags_has_ep={'expert-model-parallel-size' in cap.get('flags', {})})")
-    # blocking / recompute / host-sync are DERIVED capture facts (not from env/script)
-    capst = cap.get("capture", {})
-    chk_true("derived blocking == False (async dispatch, Synchronize/launch « 1)",
-             (capst.get("blocking") or {}).get("value") is False)
-    chk_true("derived recompute == full (FA fwd/grad ≈ 2.0 on this sample)",
-             (capst.get("recompute") or {}).get("value") == "full")
-    chk_true("derived host_sync_stall == True (aclrtSynchronizeStream / dynamic-shape D2H)",
-             (capst.get("host_sync_stall") or {}).get("value") is True)
-    chk_true("derived env stays empty (nothing asserted from environment)",
-             cap.get("env") == {})
-
-    # hidden_overhead buckets must FOLLOW the derived config, not hardcode it:
-    # host_sync is attributed to dynamic-shape D2H (derived blocking=False here),
-    # and the recompute bucket cites profiling — never ASCEND_LAUNCH_BLOCKING / a
-    # launch script. (Regression guard for the config-derivation sweep.)
-    ho_buckets = (m.get("hidden_overhead", {}) or {}).get("buckets", [])
-    hs_b = next((b for b in ho_buckets if b.get("key") == "host_sync"), None)
-    chk_true("host_sync bucket present", hs_b is not None)
-    chk_true("host_sync suggestion NOT blamed on ASCEND_LAUNCH_BLOCKING (derived blocking=False)",
-             hs_b is not None and "ASCEND_LAUNCH_BLOCKING" not in (hs_b.get("suggestion") or ""),
-             f"(got: {hs_b.get('suggestion') if hs_b else None})")
-    rc_b = next((b for b in ho_buckets if b.get("key") == "recompute"), None)
-    chk_true("recompute bucket present on OLD (derived recompute=full)", rc_b is not None)
-    chk_true("recompute bucket source is profiling-derived, not 训练脚本配置",
-             rc_b is not None and rc_b.get("source") != "训练脚本配置"
-             and "profiling" in (rc_b.get("source") or ""),
-             f"(got: {rc_b.get('source') if rc_b else None})")
-    chk_true("recompute bucket now QUANTIFIED (us > 0, was None)",
-             rc_b is not None and isinstance(rc_b.get("us"), (int, float)) and rc_b.get("us") > 0,
-             f"(us={rc_b.get('us') if rc_b else None})")
-
-    print("\n== insight layer (LLM disabled by default) ==")
-    res = generate_insights(m, cards, cap)
-    chk_true("LLM disabled by default", res["llm"]["enabled"] is False)
-    chk_true("LLM not available (no-op)", res["llm"]["available"] is False)
-    chk_true("narrative is None (no call)", res["narrative"] is None)
-    chk_true("cards passed through", len(res["cards"]) == 11)
-    # the LLM summary must carry the profiling-derived model (H3 model-aware) and the
-    # corrected capture story (blocking=False) — guards against losing model context.
-    smodel = res["summary"].get("model") or {}
-    chk_true("LLM summary carries derived model (hidden_size 7168)",
-             (smodel.get("derived") or {}).get("hidden_size") == 7168,
-             f"(model={list((smodel.get('derived') or {}).keys())[:3]}...)")
-    chk_true("LLM summary carries unknown EP field without a numeric guess",
-             (smodel.get("unknown_fields") or {}).get("ep_world_size") == "未知")
-    chk_true("LLM summary capture.state.blocking == False (no false blocking)",
-             ((res["summary"].get("capture") or {}).get("state") or {})
-             .get("blocking", {}).get("value") is False)
-    blob = json.dumps(res["summary"], ensure_ascii=False)
-    leaks = [t for t in ("d00568668", "plog", "CPU_AFFINITY", "/home/", "ASCEND_PROCESS_LOG", "api_key")
-             if t in blob]
-    chk_true("no PII/secret leak in LLM summary", not leaks, f"(leaks={leaks})")
-    chk_true("summary is KB-level", len(blob) < 40000, f"({len(blob)//1024} KB)")
-
-    print("\n== 910B what-if: calibration guard ==")
-    # Switching to the assumed 910B ceiling (cube 376 TF < observed 432 TF) must
-    # auto-calibrate the peak upward so MFU stays physical (<=100%) and surface the
-    # peak_underestimated advisory. Exercises the calibrate-up path the default
-    # 950DT (peak == observed) intentionally does not.
-    set_chip("Ascend_910B")
-    m910 = compute_all(prof)
-    cards910 = run_rules(m910, cap)
-    ch910 = m910["efficiency"].get("chip", {})
-    chk_true("910B peak auto-calibrated from observed ceiling",
-             ch910.get("calibrated") is True
-             and (ch910.get("observed_peak_tflops") or 0) > ch910.get("peak_bf16_tflops", 0),
-             f"(assumed={ch910.get('peak_bf16_tflops')} observed={ch910.get('observed_peak_tflops')} eff={round(ch910.get('effective_peak_tflops',0),1)})")
-    chk_true("910B matmul MFU still <= 102% (calibrated)",
-             m910["efficiency"].get("matmul_mfu") is not None
-             and m910["efficiency"]["matmul_mfu"] <= MFU_MEASUREMENT_TOL,
-             f"(MFU={m910['efficiency'].get('matmul_mfu')})")
-    chk_true("910B surfaces peak_underestimated card",
-             "peak_underestimated" in {c["id"] for c in cards910},
-             f"(cards={len(cards910)})")
-    set_chip("Ascend_950DT")  # restore the default reference
-
-    print("\n== shareable report (H4) ==")
-    from llminsight.report import build_report_html
-    rhtml = build_report_html(m, cards)
-    chk_true("report is a self-contained HTML doc",
-             rhtml.lstrip().lower().startswith("<!doctype html"),
-             f"({len(rhtml)//1024} KB)")
-    # self-contained: no external assets / network → emailable, offline, printable
-    externals = [t for t in ("<script src", "<link", "@import", 'src="http',
-                             "src='http", 'href="http', "url(http")
-                 if t in rhtml.lower()]
-    chk_true("report has no external assets", not externals, f"(found={externals})")
-    # carries the same section views the UI shows (diagnostics-first ordering)
-    for marker in ("诊断", "时间构成", "What-if", "算子热点", "通信", "隐性开销", "结构归因"):
-        chk_true(f"report section: {marker}", marker in rhtml)
-    # embeds every rule-engine card (titles rendered verbatim)
-    chk_true("report embeds all card titles",
-             all(c.get("title", "") in rhtml for c in cards if c.get("title")))
-    # privacy: same whitelist as the LLM summary — no raw trace path / PII / key
-    rleaks = [t for t in ("d00568668", "plog", "CPU_AFFINITY", "/home/",
-                          "ASCEND_PROCESS_LOG", "api_key") if t in rhtml]
-    chk_true("no PII/secret leak in report", not rleaks, f"(leaks={rleaks})")
-
-    print("\n== serialization ==")
-    full = json.dumps(m, default=str)
-    chk_true("compute_all JSON-serializable", len(full) > 0, f"({len(full)//1024} KB)")
-
-    print("\n" + ("=" * 48))
-    if FAILS:
-        print(f"FAILED ({len(FAILS)}): " + ", ".join(FAILS))
-        sys.exit(1)
-    print("ALL BASELINE CHECKS PASSED")
-    sys.exit(0)
+def main() -> int:
+    with tempfile.TemporaryDirectory(prefix="_verify_", dir=ROOT / "scripts") as directory:
+        root = Path(directory)
+        _write_synthetic_profile(root)
+        with patch.object(cache, "_CACHE_DIR", str(root / "cache")), patch.object(SETTINGS, "data_dir", str(root)):
+            profile = load_profile(str(root))
+            metrics = compute_all(profile)
+            cards = run_rules(metrics)
+            summary = build_summary(metrics, cards)
+            report = build_report_html(metrics, cards)
+        measured = metrics["overview"]
+        expected = {"computing": 600.0, "comm_not_overlapped": 250.0, "stage": 1000.0}
+        for key, value in expected.items():
+            assert abs(measured["us"][key] - value) < 1e-6, key
+        assert abs(measured["ratios"]["effective_compute_pct"] - 60.0) < 1e-6
+        assert abs(measured["ratios"]["free_pct"] - 15.0) < 1e-6
+        assert abs(measured["ratios"]["overlap_rate_pct"] - round(100 / 350 * 100, 2)) < 1e-6
+        assert metrics["efficiency"]["available"]
+        assert "<html" in report and "MatMulV3" in report
+        assert "synthetic_matmul" not in json.dumps(summary)
+        assert isinstance(cards, list)
+        print("PASS: synthetic CSV -> parser -> metrics -> rules -> redacted summary -> HTML report")
+        print("Synthetic step: 1000 us; compute 600 us; exposed communication 250 us; free 150 us.")
+        print("No private capture, network inference or hardware benchmark was used.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
