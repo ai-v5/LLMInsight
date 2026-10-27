@@ -1,6 +1,6 @@
 # Third-party notices
 
-LLMInsight is distributed under the GPL-3.0-only license in `LICENSE`. The
+LLMInsight is distributed under the AGPL-3.0-only license in `LICENSE`. The
 project also includes or depends on the third-party components below. Their
 licenses apply to those components and are not replaced by the project license.
 

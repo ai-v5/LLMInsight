@@ -74,5 +74,5 @@ node scripts/verify_web.js
 
 ## 许可证
 
-项目使用 GPL-3.0-only，见 [`LICENSE`](LICENSE)。第三方组件和依赖见
+项目使用 AGPL-3.0-only，见 [`LICENSE`](LICENSE)。第三方组件和依赖见
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
