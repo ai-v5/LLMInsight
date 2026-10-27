@@ -25,7 +25,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ai-v5/LLMInsight"
+Homepage = "https://ai-v5.github.io/LLMInsight/"
 Repository = "https://github.com/ai-v5/LLMInsight"
 
 # After `pip install`, run the web app with either `llminsight` or

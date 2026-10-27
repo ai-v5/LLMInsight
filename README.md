@@ -1,5 +1,7 @@
 # LLMInsight
 
+[项目网站](https://ai-v5.github.io/LLMInsight/) · [设计与数据契约](doc/README.md)
+
 昇腾（Ascend）NPU 大模型训练 Profiling 分析工具。它读取
 `ASCEND_PROFILER_OUTPUT` 或 MindStudio `msprof-export` 目录，生成统一指标、
 时间线、规则诊断和可分享报告。
