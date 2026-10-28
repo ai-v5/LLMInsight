@@ -210,7 +210,7 @@ def build_messages(summary: Dict[str, Any]) -> tuple[str, str]:
     import json
     payload = json.dumps(summary, ensure_ascii=False, indent=1)
     user = (
-        "以下是本次单卡单 step 训练 profiling 的结构化指标摘要与规则引擎诊断（JSON）。"
+        "以下是本次训练 profiling 的结构化指标摘要与规则引擎诊断（JSON）。"
         "请据此生成中文诊断报告。\n\n```json\n" + payload + "\n```"
     )
     return SYSTEM_PROMPT, user

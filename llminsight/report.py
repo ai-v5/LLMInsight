@@ -1304,7 +1304,7 @@ def build_report_html(metrics: Dict[str, Any],
     foot = (
         '<div class="rep-foot">本报告由 LLMInsight 规则引擎生成（LLM 叙述为可选增强，未内联）。'
         'MFU / MBU / Roofline / What-if 基于参考芯片峰值，为上界估算用于优化排序，非精确预测。'
-        '数据为单卡单 step 演示。</div>'
+        '数据来自当前加载的 profiling；多 rank 采集的代表 rank 分析与集群概览按采集范围展示。</div>'
     )
     body = "".join(s for s in sections if s)
     return (

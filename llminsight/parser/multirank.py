@@ -96,7 +96,8 @@ def discover_rank_dirs(root: str) -> List[str]:
     if has_profile_files(root):
         return []                      # already a leaf capture
     try:
-        entries = sorted(os.scandir(root), key=lambda e: e.name)
+        with os.scandir(root) as it:
+            entries = sorted(it, key=lambda e: e.name)
     except OSError:
         return []
     found: List[str] = []
@@ -125,15 +126,16 @@ def looks_like_multirank_root(path: str) -> bool:
     if has_profile_files(path):
         return False
     try:
-        for i, entry in enumerate(os.scandir(path)):
-            if i >= 512:
-                break
-            try:
-                if entry.is_dir() and (_is_rank_dir_name(entry.name)
-                                       or os.path.isdir(os.path.join(entry.path, _OUTPUT_SUBDIR))):
-                    return True
-            except OSError:
-                continue
+        with os.scandir(path) as entries:
+            for i, entry in enumerate(entries):
+                if i >= 512:
+                    break
+                try:
+                    if entry.is_dir() and (_is_rank_dir_name(entry.name)
+                                           or os.path.isdir(os.path.join(entry.path, _OUTPUT_SUBDIR))):
+                        return True
+                except OSError:
+                    continue
     except OSError:
         return False
     return False
