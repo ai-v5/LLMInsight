@@ -16,6 +16,7 @@ from .efficiency import (
     LIGHTNING_INDEXER_KL_GRAD_TYPES,
     MATMUL_TYPES,
     SPARSE_ATTENTION_TYPES,
+    _PEAK_MEASUREMENT_TOL,
     _estimate_attention_flops,
     _estimate_kda_flops,
     _estimate_lightning_indexer_flops,
@@ -48,35 +49,58 @@ _FUSED_MC2_MARKERS = MC2_FUSED_MARKERS
 
 
 def _has_fused_mc2(kd) -> bool:
-    if kd is None or kd.empty or "Name" not in kd.columns:
+    """True when the capture contains MC2 fused kernels (Type or Name)."""
+    if kd is None or kd.empty:
         return False
-    names = kd["Name"].astype(str).str.lower()
-    return any(names.str.contains(marker, regex=False).any() for marker in _FUSED_MC2_MARKERS)
+    for column in ("Type", "Name"):
+        if column not in kd.columns:
+            continue
+        values = kd[column].astype(str).map(is_mc2_fused_type)
+        if bool(values.any()):
+            return True
+    return False
 
 
 def _expert_gemm_anchors(kd) -> Dict[str, Any]:
-    """Anchor the fused MC2 GEMM contract from sibling expert grouped GEMMs.
+    """Anchor the fused MC2 GEMM contract from grouped GEMMs in the same capture.
 
-    Returns ``{"rows", "contracts", "dtype", "source_ops"}`` or ``{}`` when the
-    capture has no usable anchor.  ``contracts`` are per-expert weight matrices
-    ``(K, N)``; a fused MC2 window does one of them per call.
+    Prefers the *plain* expert grouped GEMM (its operand contract is not fused with
+    a communication window).  If the capture records no plain grouped GEMM, the MC2
+    fused rows' own recorded shapes are used as a fallback — that is still the
+    capture's own data, and it keeps the dtype/`[K,N]` honest for shape-bearing
+    captures instead of importing them from an unrelated op.
+
+    Returns ``{"rows", "contracts", "dtype", "source_ops", "from_fused_rows"}`` or
+    ``{}`` when the capture has no usable anchor.
     """
     if kd is None or kd.empty or "Type" not in kd.columns:
         return {}
-    mask = kd["Type"].astype(str).str.lower().str.contains("groupedmatmul")
-    if not bool(mask.any()):
+    types = kd["Type"].astype(str)
+    grouped = types.str.lower().str.contains("groupedmatmul")
+    if not bool(grouped.any()):
         return {}
-    # The fused MC2 kernels also carry "groupedmatmul" in their symbol/type but are
-    # NOT an anchor: they are the thing being estimated (no shapes, window unmixed).
-    mask &= ~kd["Type"].astype(str).map(is_mc2_fused_type)
-    if not bool(mask.any()):
+    fused = types.map(is_mc2_fused_type)
+    for candidates, from_fused in ((grouped & ~fused, False), (grouped & fused, True)):
+        if not bool(candidates.any()):
+            continue
+        anchor = _anchor_from_rows(kd.loc[candidates], source_is_fused=from_fused)
+        if anchor:
+            return anchor
+    return {}
+
+
+def _anchor_from_rows(rows, source_is_fused: bool = False) -> Dict[str, Any]:
+    if rows is None or rows.empty:
         return {}
-    columns = [c for c in ("Type", "Input Shapes", "Output Shapes", "Input Data Types") if c in kd.columns]
+    columns = [c for c in ("Type", "Input Shapes", "Output Shapes", "Input Data Types")
+               if c in rows.columns]
+    if not {"Input Shapes", "Output Shapes"}.issubset(set(columns)):
+        return {}
     contracts = set()
     activation_rows: List[int] = []
     dtype: Optional[str] = None
     source_ops = set()
-    for record in kd.loc[mask, columns].to_dict(orient="records"):
+    for record in rows[columns].to_dict(orient="records"):
         shapes_in = parse_shapes(record.get("Input Shapes"))
         shapes_out = parse_shapes(record.get("Output Shapes"))
         source_ops.add(str(record.get("Type")))
@@ -94,8 +118,11 @@ def _expert_gemm_anchors(kd) -> Dict[str, Any]:
             _, k, n = weight
             if k and n:
                 contracts.add((int(k), int(n)))
-        if shapes_in and shapes_in[0]:
-            activation_rows.append(int(shapes_in[0][0]))
+        # The routed-row count is the activation's first dim, which is not always
+        # operand 0 (a forward grouped GEMM can put the [G,K,N] weight first).
+        two_d_rows = [int(s[0]) for s in shapes_in if len(s) == 2 and s[0] > 0]
+        if two_d_rows:
+            activation_rows.append(max(two_d_rows))
         if dtype is None:
             for value in parse_dtypes(record.get("Input Data Types")):
                 candidate = _canonical_dtype(value)
@@ -105,7 +132,8 @@ def _expert_gemm_anchors(kd) -> Dict[str, Any]:
     if not contracts or not activation_rows:
         return {}
     return {"rows": max(activation_rows), "contracts": sorted(contracts),
-            "dtype": dtype or "UNKNOWN", "source_ops": sorted(source_ops)}
+            "dtype": dtype or "UNKNOWN", "source_ops": sorted(source_ops),
+            "from_fused_rows": bool(source_is_fused)}
 
 
 def _canonical_dtype(value: str) -> str:
@@ -236,7 +264,15 @@ def _estimate_fused_mc2(mc2_groups: List[Dict[str, Any]], anchor: Dict[str, Any]
     if not contracts:
         return {}
     rows_per_call = int(anchor["rows"])
-    pairs = max(int(item["count"]) for item in mc2_groups)
+    # A pair is one dispatch call + one combine call.  Both projections are only
+    # known to happen when BOTH families are present; taking the max count would
+    # inflate the FLOPs when one family is missing (or when counts differ under
+    # dualpipe / last-microbatch skipping), so require both and pair them up.
+    dispatch_calls = sum(int(item["count"]) for item in mc2_groups
+                         if "alltoallvgroupedmatmul" in str(item["operator"]).lower())
+    combine_calls = sum(int(item["count"]) for item in mc2_groups
+                        if "groupedmatmulalltoallv" in str(item["operator"]).lower())
+    pairs = min(dispatch_calls, combine_calls)
     total_dur_us = sum(float(item["dur_us"]) for item in mc2_groups)
     if pairs <= 0 or total_dur_us <= 0:
         return {}
@@ -247,24 +283,31 @@ def _estimate_fused_mc2(mc2_groups: List[Dict[str, Any]], anchor: Dict[str, Any]
     equivalent_mfu = (total_flops / (peak * total_dur_us * 1e-6)) if peak else None
     if equivalent_mfu is None:
         return {}
+    above_peak = equivalent_mfu > _PEAK_MEASUREMENT_TOL
+    source_note = ("取自融合 kernel 自身记录的 shape" if anchor.get("from_fused_rows")
+                   else "取自同采集专家 Groupedmatmul 的锚点")
     return {
         "rows": rows_per_call,
         "contracts": contracts,
         "pairs": pairs,
+        "dispatch_calls": dispatch_calls,
+        "combine_calls": combine_calls,
         "total_flops": total_flops,
         "total_dur_us": total_dur_us,
         "dtype": dtype,
         "equivalent_mfu": equivalent_mfu,
-        "above_peak": equivalent_mfu > 1.02,
+        "above_peak": above_peak,
         "source_ops": anchor.get("source_ops") or [],
+        "from_fused_rows": bool(anchor.get("from_fused_rows")),
         "basis": (
             "功能约定 + 同采集锚点：MC2 每次调用 = 1 个两投影专家 GEMM 组"
             f"（权重 {', '.join(f'[{k}x{n}]' for k, n in contracts)}）× 激活行数 "
-            f"{rows_per_call:,}；共 {pairs} 次调用。GEMM 工作量按各算子占融合窗口的时长份额"
-            "分摊（窗口内计算/通信不可拆），dtype 取自同层专家 GEMM。分母含内部 a2a，"
+            f"{rows_per_call:,}；配对 {pairs} 次（dispatch {dispatch_calls} / combine "
+            f"{combine_calls}）。{source_note}，GEMM 工作量按各算子占融合窗口的时长份额"
+            "分摊（窗口内计算/通信不可拆）。分母含内部 a2a，"
             "故为「融合窗口等效 MFU」= 纯计算 MFU 的下界。"
             + ("（该锚点推断出的吞吐超过物理峰值 → 锚点不可信，MFU 保持不可用。）"
-               if equivalent_mfu > 1.02 else "")
+               if above_peak else "")
         ),
     }
 
@@ -286,10 +329,21 @@ def _apply_fused_mc2(mc2_groups: List[Dict[str, Any]], rows: List[Dict[str, Any]
         return
     total_flops = estimate["total_flops"]
     total_dur_us = estimate["total_dur_us"]
-    peak = SETTINGS.chip.peak_cube_flops(estimate["dtype"])
+
+    def _peak_for(dtype: str) -> Optional[float]:
+        """Peak for the row's own dtype when the capture recorded one.
+
+        The reconstruction's dtype comes from the anchor; a shape-bearing capture may
+        record a different dtype on the fused rows (fp8 vs bf16), and using the
+        anchor's peak there would be a 2x error in the denominator.
+        """
+        chosen = dtype if dtype in {"BF16", "FP16", "FP32", "FP8", "FP4"} else estimate["dtype"]
+        return SETTINGS.chip.peak_cube_flops(chosen)
+
     for item in mc2_groups:
         if item["dtype"] == "UNKNOWN":
             item["dtype"] = estimate["dtype"]
+        peak = _peak_for(item["dtype"])
         share = float(item["dur_us"]) / total_dur_us
         flops = total_flops * share
         item["fused_estimate"] = {
@@ -297,11 +351,13 @@ def _apply_fused_mc2(mc2_groups: List[Dict[str, Any]], rows: List[Dict[str, Any]
             "mfu": (flops / (peak * item["dur_us"] * 1e-6)) if peak and item["dur_us"] else None,
             "basis": estimate["basis"],
         }
-    fused_rows = [row for row in rows if row.get("fused_window")]
+    fused_rows = [row for row in rows
+                  if row.get("fused_window") and is_mc2_fused_type(row.get("operator"))]
     fused_dur = sum(float(row["dur_us"]) for row in fused_rows) or total_dur_us
     for row in fused_rows:
         if row.get("flops") is not None:
             continue
+        peak = _peak_for(row.get("dtype"))
         share = float(row["dur_us"]) / fused_dur
         flops = total_flops * share
         row["flops"] = round(flops, 1)
@@ -404,8 +460,12 @@ def compute_matrix_power(prof, efficiency=None) -> Dict[str, Any]:
     if not rows:
         return {"available": False, "reason": "no matrix or matrix-heavy fused kernels"}
     total_us = sum(item["dur_us"] for item in rows)
+    # Only MC2 fused windows are reconstructed here: MegaMoE and the attention/KDA
+    # fused families have their own (PROXY/formula) handling and must not borrow the
+    # expert-GEMM anchor — that produced a MegaMoE group with MC2 FLOPs.
     mc2_groups = [item for item in grouped.values()
-                  if item["fused_window"] and not item["modeled_count"]]
+                  if item["fused_window"] and not item["modeled_count"]
+                  and is_mc2_fused_type(item["operator"])]
     mc2_estimate = _estimate_fused_mc2(mc2_groups, mc2_anchor)
     if mc2_estimate:
         # Re-label the fused MC2 groups with their (estimated) dtype, then publish

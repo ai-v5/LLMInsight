@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from ..config import SETTINGS
-from ..parser.names import is_mc2_fused_type
+from ..parser.names import is_mc2_fused_type, op_display_name
 from ..parser.profile import num
 
 
@@ -197,6 +197,9 @@ def hotspots(prof) -> Dict[str, Any]:
     ops = [
         {
             "type": str(row["OP Type"]),
+            # Display label: a Level-1 capture names fused kernels with the raw C++
+            # symbol, and any fixed-width prefix of it is identical across families.
+            "display": op_display_name(str(row["OP Type"])),
             "core": str(row.get("Core Type", "")),
             "count": int(row["Count"]),
             "total_us": round(_f(row["Total Time(us)"]), 1),
@@ -901,12 +904,15 @@ def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None,
     # 数值必须来自 theoretical.recompute（单一真源）：本函数早于 theoretical 计算时曾
     # 自行用 computing × r_re 再算一次，两处对同一个「重计算开销」相差 32 倍。
     _rc_view = recompute_view or None
+    if _rc_view is not None and not (_rc_view or {}).get("overhead_us"):
+        _rc_view = None            # no quantified replay -> no bucket to publish
     _rc_gran = (_rc_view or {}).get("granularity") or recompute
     if _rc_gran in ("full", "selective"):
         _rc_kind = "Full" if _rc_gran == "full" else "Selective"
         _rc_us = (_rc_view or {}).get("overhead_us")
         _fp_us = (_rc_view or {}).get("footprint_us")
-        if _rc_us is not None:
+        _rc_method = (_rc_view or {}).get("method")
+        if _rc_us is not None and _rc_method == "measured_candidates":
             _rc_detail = (
                 "profiling 反推重计算={g}（前向/反向调用数 + 可识别重放算子）→ 反向重跑前向。"
                 "实测可识别重放算子耗时 ≈ {us:,.0f}us（step 的 {pct}%）。"
@@ -918,6 +924,15 @@ def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None,
                     "computing × r_re 投影）。"
                 ).format(fp=_fp_us, fp_pct=_pct(_fp_us, stage))
             _rc_detail += "重放与反向计算并发，可回收收益见「理论上界 / What-if」重计算项。"
+        elif _rc_us is not None:
+            # The shared view exists but carries a MODEL projection only (no
+            # identifiable replay). Calling that "实测" would be false evidence.
+            _rc_detail = (
+                "profiling 反推重计算={g}（FA 前向/反向次数比）→ 反向重跑前向。"
+                "估算重算足迹 ≈ {us:,.0f}us（step 的 {pct}%）= computing × r_re 的模型投影"
+                "（假设前向算子全部重放）；本次采集没有可配对的前向/反向重放计数，"
+                "该值是投影而非实测。"
+            ).format(g=_rc_gran, us=_rc_us, pct=_pct(_rc_us, stage))
         else:
             # 没有共享视图时（独立调用本函数）退回模型投影，并显式标注它是投影。
             _computing = ov["us"]["computing"] if ov.get("available") else 0.0
@@ -938,7 +953,9 @@ def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None,
             "label": f"重计算开销 ({_rc_kind} Recompute)",
             "us": _rc_us,
             "detail": _rc_detail,
-            "source": "profiling 反推 (parser.derive) + 可识别重放算子",
+            "source": ("profiling 反推 (parser.derive) + 可识别重放算子"
+                       if _rc_method == "measured_candidates"
+                       else "profiling 反推 (parser.derive) + computing × r_re 模型投影"),
             "suggestion": "评估「减少/关闭重计算」做显存↔耗时平衡；量化收益见 What-if 重计算项。",
         })
     device_total = sum(b["us"] for b in buckets
@@ -1522,6 +1539,14 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
                                           if exact_attn_flops else None),
             component_flops=component_flops,
         )
+        # Effective granularity: identified replay is evidence that recompute is ON,
+        # so a caller-count "off" (FA fwd/grad ratio ≈ 1 while other families are
+        # replayed) must not win — publishing a "关闭重计算可省 X" lever next to a
+        # granularity of "off" contradicted the ledger and the rule card, which only
+        # report full|selective.
+        _gran = rc_state.get("value")
+        if _gran not in ("full", "selective"):
+            _gran = "selective" if candidates_us > 0 else recompute_est.get("likely_granularity")
         rc_ov = {
             "us": candidates_us,
             "us_lo": 0.0,
@@ -1533,7 +1558,8 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
             "recompute_forward_multiplier": round(multiplier, 4),
             "bwd_fwd_flop_ratio": 2.0,
             "flop_ratio_source": "operator_candidates_plus_counter_calibration",
-            "granularity": rc_state.get("value") or recompute_est.get("likely_granularity"),
+            "granularity": _gran,
+            "method": "measured_candidates",
             # 重算在 Computing 里的全量足迹（与隐性开销桶同口径），仅作对照，不并入收益。
             "footprint_us": footprint.get("us") if footprint else None,
             "footprint_pct": _pct(footprint["us"], stage) if footprint else None,
@@ -1543,6 +1569,8 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
             "candidates": recompute_est.get("candidates") or [],
             "confidence": recompute_est.get("confidence") or "medium",
         }
+        if candidates_us <= 0:
+            rc_ov = None       # nothing identified -> no lever, no bucket, no card
     else:
         rc_ov = _recompute_overhead(
             computing,
@@ -1553,6 +1581,10 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
                                           if exact_attn_flops else None),
             component_flops=component_flops,
         )
+        if rc_ov:
+            # No identifiable replay in this capture: this is the computing × r_re
+            # projection, and the ledger must label it as such (not "实测").
+            rc_ov["method"] = "model_projection"
     r_re = rc_ov["flops_share"] if rc_ov else 0.0
     r_re_lo = rc_ov["flops_share_lo"] if rc_ov else 0.0
     r_re_hi = rc_ov["flops_share_hi"] if rc_ov else 0.0
@@ -1798,6 +1830,9 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         recompute = {
             "id": "recompute_off",
             "granularity": rc_ov["granularity"],
+            # "measured_candidates" (identified replay durations) vs "model_projection"
+            # (computing × r_re): the ledger and the card must say which one they show.
+            "method": rc_ov.get("method", "model_projection"),
             "scenario": "关闭/减少重计算（反向不再重跑前向）",
             "overhead_us": rc_ov["us"],
             "overhead_us_lo": rc_ov["us_lo"],

@@ -647,6 +647,14 @@ def _sec_communication(comm: Dict) -> str:
     bd = comm.get("breakdown") or {}
     wc = (bd.get("wall_clock") or {}).get("within_comm_not_overlapped") or {}
     bd_note = ""
+    a2a = comm.get("a2a") or {}
+    if not a2a.get("available") and a2a.get("fused_window_us"):
+        # No standalone alltoallv does not mean "no expert parallelism": with MC2
+        # fused MoE the a2a runs inside the expert GEMM kernel.
+        bd_note += (
+            f'<div class="banner info">⇄ 本采集没有独立的 alltoallv（communication.json 不'
+            f'记录融合 kernel 内部通信）：all-to-all 位于 MC2 融合 kernel 内部，融合窗口累计 '
+            f'{_us(a2a.get("fused_window_us"))}，不能用本段判断 EP 是否开启。</div>')
     if bd:
         def _us_val(d, key):
             v = d.get(key, "—")

@@ -383,6 +383,56 @@ class FusedMc2EstimateTests(unittest.TestCase):
         # [4,1024,2048] trails the activation shape [1024,2048] -> skipped as weight
         self.assertEqual(anchors["contracts"], [(512, 1024)])
 
+    def test_other_fused_families_never_borrow_the_mc2_anchor(self) -> None:
+        """B4: MegaMoE / attention fused windows are not MC2 and keep their own path."""
+        import pandas as pd
+        from types import SimpleNamespace
+        from llminsight.metrics.matrix_power import compute_matrix_power
+
+        kd = pd.read_csv(self.dir / "kernel_details.csv", low_memory=False)
+        extra = pd.DataFrame([{c: None for c in kd.columns}])
+        extra.loc[0, ["Type", "Name", "Accelerator Core", "Duration(us)"]] = \
+            ["mega_moe_bf16", "mega_moe_bf16_0", "MIX_AIC", 900_000.0]
+        merged = pd.concat([kd, extra], ignore_index=True)
+        result = compute_matrix_power(SimpleNamespace(kernel_details=merged), {})
+        est = result["fused_mc2_estimate"]
+        self.assertIsNotNone(est)
+        # only the two MC2 fused calls are paired; the MegaMoE call is not counted
+        self.assertEqual(est["pairs"], 2)
+        self.assertEqual(est["dispatch_calls"], 2)
+        self.assertEqual(est["combine_calls"], 2)
+        mega = [g for g in result["groups"] if "mega_moe" in g["operator"].lower()]
+        self.assertTrue(mega)
+        for group in mega:
+            self.assertIsNone(group["flops"])
+            self.assertNotEqual(group["evidence_level"], "ESTIMATED")
+
+    def test_own_shapes_anchor_uses_the_fused_dtype(self) -> None:
+        """N4: a shape-bearing MC2 capture anchors on itself, including fp16 dtype."""
+        import pandas as pd
+        from types import SimpleNamespace
+        from llminsight.config import SETTINGS
+        from llminsight.metrics.matrix_power import compute_matrix_power, _expert_gemm_anchors
+
+        header = ["Type", "Name", "Accelerator Core", "Duration(us)", "Input Shapes",
+                  "Input Data Types", "Output Shapes", "Output Data Types"]
+        rows = []
+        for _ in range(2):
+            rows.append(["AlltoAllvGroupedMatMul", "mc2", "MIX_AIC", 100_000.0,
+                         "1024,2048;4,2048,4096", "DT_FLOAT16;DT_FLOAT16", "1024,4096", "DT_FLOAT16"])
+            rows.append(["GroupedMatMulAlltoAllv", "mc2b", "MIX_AIC", 100_000.0,
+                         "1024,4096;4,4096,2048", "DT_FLOAT16;DT_FLOAT16", "1024,2048", "DT_FLOAT16"])
+        frame = pd.DataFrame(rows, columns=header)
+        anchors = _expert_gemm_anchors(frame)
+        self.assertTrue(anchors.get("from_fused_rows"))
+        self.assertEqual(anchors["dtype"], "FP16")
+        result = compute_matrix_power(SimpleNamespace(kernel_details=frame), {})
+        est = result["fused_mc2_estimate"]
+        self.assertEqual(est["dtype"], "FP16")
+        peak = SETTINGS.chip.peak_cube_flops("FP16")
+        self.assertAlmostEqual(est["equivalent_mfu"],
+                               est["total_flops"] / (peak * est["total_dur_us"] * 1e-6), places=9)
+
     def test_anchor_implying_above_peak_fails_closed(self) -> None:
         """A wrong anchor (too many rows / wrong operand) must not publish an MFU."""
         from types import SimpleNamespace
@@ -405,6 +455,51 @@ class FusedMc2EstimateTests(unittest.TestCase):
             self.assertIn("超过物理峰值", group["estimate_basis"])
 
 
+class RecomputeConsistencyTests(unittest.TestCase):
+    """B2: a caller-count "off" must not coexist with a published replay lever."""
+
+    OVERVIEW = {"available": True, "step_count": 1,
+                "us": {"stage": 2_000_000.0, "computing": 1_500_000.0,
+                       "comm_not_overlapped": 100_000.0, "free": 100_000.0,
+                       "overlapped": 300_000.0, "communication": 400_000.0,
+                       "bubble": 0.0, "preparing": 0.0}}
+
+    def _eff(self, candidates, share=0.05):
+        return {
+            "available": True, "efficiency_reliable": False, "peak_inconsistent": False,
+            "recompute_estimate": {
+                "available": True, "likely_granularity": "selective", "confidence": "medium",
+                "flops_share": share, "flops_share_lo": share * 0.8, "flops_share_hi": share * 1.2,
+                "candidates": candidates,
+            },
+            "attention_training_flops": {"available": False},
+            "matmul_training_flops": {"available": False},
+            "chip": {"name": "Ascend 950DT", "cube_bf16_tflops": 432.0},
+        }
+
+    def _capture(self, value):
+        return {"capture": {"recompute": {"value": value, "recompute_forward_multiplier": 0.0}},
+                "model": {}, "flags": {}, "env": {}, "guesses": {}}
+
+    def test_identified_replay_outranks_a_caller_count_off(self) -> None:
+        from llminsight.metrics import core
+        candidates = [{"type": "RmsNorm", "method": "forward_backward_excess", "count": 10,
+                       "forward_count": 20, "backward_count": 10,
+                       "duration_us": 300_000.0, "evidence": "fwd/bwd 20/10"}]
+        res = core.theoretical(None, self.OVERVIEW, self._eff(candidates), self._capture("off"))
+        rc = res["recompute"]
+        self.assertEqual(rc["granularity"], "selective")
+        self.assertEqual(rc["method"], "measured_candidates")
+        self.assertAlmostEqual(rc["overhead_us"], 300_000.0, places=1)
+        self.assertIn("recompute_off", [w["id"] for w in res["whatif"]])
+
+    def test_no_identified_replay_publishes_no_lever(self) -> None:
+        from llminsight.metrics import core
+        res = core.theoretical(None, self.OVERVIEW, self._eff([]), self._capture("off"))
+        self.assertIsNone(res["recompute"])
+        self.assertNotIn("recompute_off", [w["id"] for w in res["whatif"]])
+
+
 class MatrixPowerMc2Tests(_Base):
     def test_mc2_fused_rows_are_marked_fused_and_have_no_mbu(self) -> None:
         result = compute_matrix_power(self.prof, self.metrics["efficiency"])
@@ -413,8 +508,10 @@ class MatrixPowerMc2Tests(_Base):
         self.assertEqual(len(fused), 2)
         for group in fused:
             self.assertTrue(group["fused_window"], group["label"])
+            # MBU needs bytes inside a window that also carries the a2a -> unknown
             self.assertIsNone(group["mbu"], group["label"])
-            self.assertIsNone(group["mfu"], group["label"])
+            # MFU may be estimated from the capture's own shapes, but never FORMULA
+            self.assertNotEqual(group["evidence_level"], "FORMULA", group["label"])
         rows = [r for r in result["rows"] if r["operator"] == "AlltoAllvGroupedMatMul"]
         self.assertTrue(rows and all(r["fused_window"] for r in rows))
 
@@ -430,7 +527,8 @@ class RecomputeSingleSourceTests(_Base):
     def test_hidden_overhead_mirrors_the_shared_recompute_view(self) -> None:
         from llminsight.metrics import core
         view = {"granularity": "selective", "overhead_us": 123_456.0,
-                "footprint_us": 987_654.0, "overhead_pct": 3.09}
+                "footprint_us": 987_654.0, "overhead_pct": 3.09,
+                "method": "measured_candidates"}
         ho = core.hidden_overhead(
             self.prof, core.overview(self.prof), {"capture": {"recompute": {"value": "selective"}}},
             recompute_view=view)
@@ -441,6 +539,30 @@ class RecomputeSingleSourceTests(_Base):
         self.assertIn("足迹上界", bucket["detail"])
         # non-additive: recompute already lives inside Computing
         self.assertFalse(bucket.get("additive", True))
+
+    def test_ledger_labels_a_model_projection_as_projection(self) -> None:
+        """B1: `computing × r_re` is a projection, never "实测可识别重放算子耗时"."""
+        from llminsight.metrics import core
+        view = {"granularity": "full", "overhead_us": 625_000.0, "footprint_us": None,
+                "method": "model_projection"}
+        ho = core.hidden_overhead(
+            self.prof, core.overview(self.prof), {"capture": {"recompute": {"value": "full"}}},
+            recompute_view=view)
+        bucket = next(b for b in ho["buckets"] if b["key"] == "recompute")
+        self.assertAlmostEqual(bucket["us"], 625_000.0, places=1)
+        self.assertIn("模型投影", bucket["detail"])
+        self.assertIn("而非实测", bucket["detail"])
+        self.assertNotIn("实测可识别重放算子耗时", bucket["detail"])
+        self.assertIn("模型投影", bucket["source"])
+
+    def test_no_quantified_replay_means_no_ledger_bucket(self) -> None:
+        """B2: without a number there is no bucket (the card only shows full|selective)."""
+        from llminsight.metrics import core
+        view = {"granularity": "off", "overhead_us": 0.0, "method": "model_projection"}
+        ho = core.hidden_overhead(
+            self.prof, core.overview(self.prof), {"capture": {"recompute": {"value": "off"}}},
+            recompute_view=view)
+        self.assertFalse([b for b in ho["buckets"] if b["key"] == "recompute"])
 
     def test_display_name_keeps_known_families_apart(self) -> None:
         from llminsight.parser.names import op_display_name
@@ -491,7 +613,10 @@ class MangledMc2SymbolTests(_Base):
         self.assertEqual(len(fused), 2)
         for group in fused:
             self.assertTrue(group["fused_window"], group["label"])
-            self.assertIsNone(group["mfu"], group["label"])
+            self.assertIsNone(group["mbu"], group["label"])   # bytes unseparable
+            # this synthetic capture writes shapes for every row, so the fused
+            # windows get the ESTIMATED path (never FORMULA)
+            self.assertNotEqual(group["evidence_level"], "FORMULA", group["label"])
 
     def test_fused_markers_do_not_swallow_plain_expert_gemm(self) -> None:
         from llminsight.metrics.efficiency import _is_mc2_grouped_gemm_type
