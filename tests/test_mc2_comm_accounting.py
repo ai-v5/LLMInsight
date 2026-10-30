@@ -78,8 +78,18 @@ _MANGLED_OP_ROWS = [
 ]
 
 
-def _comm_op(elapse_ms: float, wait_ms: float,
-             transit_mb: float = 0.0, transit_ms: float = 0.0) -> dict:
+def core_overview_stub() -> dict:
+    return {"available": True, "step_count": 1,
+            "us": {"stage": 2_000_000.0, "computing": 1_500_000.0,
+                   "comm_not_overlapped": 100_000.0, "free": 100_000.0,
+                   "overlapped": 300_000.0, "communication": 400_000.0,
+                   "bubble": 0.0, "preparing": 0.0},
+            "ratios": {"effective_compute_pct": 75.0, "comm_not_overlapped_pct": 5.0,
+                       "free_pct": 5.0, "overlap_rate_pct": 75.0,
+                       "step_time_s": 2.0, "window_time_s": 2.0}}
+
+
+def _comm_op(elapse_ms: float, wait_ms: float,             transit_mb: float = 0.0, transit_ms: float = 0.0) -> dict:
     return {
         "Communication Time Info": {
             "Elapse Time(ms)": elapse_ms,
@@ -368,20 +378,59 @@ class FusedMc2EstimateTests(unittest.TestCase):
             self.assertNotEqual(group["evidence_level"], "ESTIMATED")
 
     def test_anchor_prefers_the_expert_weight_over_a_3d_activation(self) -> None:
-        """A 3-D activation repeats a 2-D operand's tail; that must not become K,N."""
+        """A 3-D activation must not become the [K,N] contract."""
         import pandas as pd
         from llminsight.metrics.matrix_power import _expert_gemm_anchors
 
         frame = pd.DataFrame([{
             "Type": "GroupedMatmul",
             "Input Shapes": '"1024,2048;4,2048,4096"',
+            # both a 3-D a2a activation output (K=1024 not a contraction dim) and a
+            # 3-D activation whose tail repeats the 2-D operand
             "Output Shapes": '"4,1024,2048;4,512,1024"',
             "Input Data Types": "DT_BF16;DT_BF16",
         }])
         anchors = _expert_gemm_anchors(frame)
         self.assertEqual(anchors["rows"], 1024)
-        # [4,1024,2048] trails the activation shape [1024,2048] -> skipped as weight
-        self.assertEqual(anchors["contracts"], [(512, 1024)])
+        # the input weight [4,2048,4096] wins: K=2048 is a 2-D operand's last dim
+        self.assertEqual(anchors["contracts"], [(2048, 4096)])
+
+    def test_3d_output_activation_alone_yields_no_anchor(self) -> None:
+        """A shape-bearing MC2 capture with only a 3-D a2a output fails closed."""
+        import pandas as pd
+        from types import SimpleNamespace
+        from llminsight.metrics.matrix_power import compute_matrix_power, _expert_gemm_anchors
+
+        frame = pd.DataFrame([{
+            "Type": "AlltoAllvGroupedMatmul",
+            "Name": "mc2",
+            "Accelerator Core": "MIX_AIC",
+            "Duration(us)": 100000.0,
+            "Input Shapes": '"1024,2048"',
+            "Output Shapes": '"4,256,4096"',     # a2a buffer, not a weight contract
+            "Input Data Types": "DT_BF16;DT_BF16",
+            "Output Data Types": "DT_BF16",
+        }])
+        anchors = _expert_gemm_anchors(frame)
+        self.assertEqual(anchors, {})            # nothing contracts -> no estimate
+        result = compute_matrix_power(SimpleNamespace(kernel_details=frame), {})
+        self.assertIsNone(result.get("fused_mc2_estimate"))
+        for group in (g for g in result["groups"] if g["fused_window"]):
+            self.assertNotEqual(group["evidence_level"], "ESTIMATED")
+
+    def test_2d_weight_does_not_inflate_the_routed_rows(self) -> None:
+        """N2/MED: a 2-D weight's K must not be read as the activation row count."""
+        import pandas as pd
+        from llminsight.metrics.matrix_power import _expert_gemm_anchors
+
+        frame = pd.DataFrame([{
+            "Type": "GroupedMatmul",
+            "Input Shapes": '"1024,7168;7168,14336"',
+            "Output Shapes": '"4,7168,14336"',
+            "Input Data Types": "DT_BF16;DT_BF16",
+        }])
+        anchors = _expert_gemm_anchors(frame)
+        self.assertEqual(anchors["rows"], 1024)
 
     def test_other_fused_families_never_borrow_the_mc2_anchor(self) -> None:
         """B4: MegaMoE / attention fused windows are not MC2 and keep their own path."""
@@ -563,6 +612,63 @@ class RecomputeSingleSourceTests(_Base):
             self.prof, core.overview(self.prof), {"capture": {"recompute": {"value": "off"}}},
             recompute_view=view)
         self.assertFalse([b for b in ho["buckets"] if b["key"] == "recompute"])
+
+    def test_explicit_empty_view_suppresses_the_ledger_bucket(self) -> None:
+        """An empty view means 'quantified, found nothing' — no self-computed fallback.
+
+        The fallback is only for standalone callers that pass no view at all.
+        """
+        from llminsight.metrics import core
+        ov = core.overview(self.prof)
+        capture = {"capture": {"recompute": {"value": "full",
+                                             "recompute_forward_multiplier": 0.5}}}
+        explicit = core.hidden_overhead(self.prof, ov, capture, recompute_view={})
+        self.assertFalse([b for b in explicit["buckets"] if b["key"] == "recompute"])
+        legacy = core.hidden_overhead(self.prof, ov, capture)
+        buckets = [b for b in legacy["buckets"] if b["key"] == "recompute"]
+        self.assertTrue(buckets and buckets[0]["us"])
+        self.assertIn("投影", buckets[0]["detail"])
+
+    def test_rule_card_labels_a_projection_as_projection(self) -> None:
+        """HIGH: the card must not say 可直接识别的重放算子耗时 for computing×r_re."""
+        from llminsight.rules import run_rules
+        metrics = {
+            "overview": core_overview_stub(),
+            "theoretical": {"available": True, "recompute": {
+                "granularity": "full", "method": "model_projection",
+                "overhead_us": 625_000.0, "overhead_pct": 31.25, "save_us": 625_000.0,
+                "footprint_us": None, "candidates": []}},
+            "efficiency": {"available": True, "flop_model_complete": True},
+            "communication": {"available": False}, "hotspots": {"available": False},
+            "hidden_overhead": {"available": False, "buckets": []},
+        }
+        cards = run_rules(metrics, {"capture": {"recompute": {"value": "full"}},
+                                    "flags": {}, "env": {}, "guesses": {}, "model": {}})
+        card = next(c for c in cards if c["id"] == "recompute_full")
+        self.assertNotIn("可直接识别的重放算子", card["root_cause"])
+        self.assertIn("模型投影", card["root_cause"])
+
+    def test_report_keeps_the_fused_a2a_banner_with_a_breakdown(self) -> None:
+        """MED: the msprof subtask note used to overwrite the banner."""
+        from llminsight.report import build_report_html
+        metrics = {
+            "meta": {"data_dir": "/synthetic", "counts": {}},
+            "overview": core_overview_stub(),
+            "communication": {
+                "available": True, "count": 1, "by_type": [],
+                "a2a": {"available": False, "fused_window_us": 4_226_370.9},
+                "breakdown": {"wait_us": 1.0, "wait_pct": 10.0,
+                              "transfer_us": 9.0, "transfer_pct": 90.0}},
+            "hidden_overhead": {"available": False, "buckets": []},
+            "theoretical": {"available": False}, "hotspots": {"available": False},
+            "efficiency": {"available": False}, "memory": {"available": False},
+            "attribution": {"available": False}, "timeline": {"available": False},
+            "smart_timeline": {"available": False}, "cluster": {"available": False},
+            "matrix_power": {"available": False},
+        }
+        html = build_report_html(metrics, [])
+        self.assertIn("没有独立的 alltoallv", html)
+        self.assertIn("device 子任务分解", html)
 
     def test_display_name_keeps_known_families_apart(self) -> None:
         from llminsight.parser.names import op_display_name

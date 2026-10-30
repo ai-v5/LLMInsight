@@ -903,10 +903,15 @@ def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None,
     # 本次配置无此开销，不臆造（与「配置只来自 profiling、不依赖启动脚本」一致）。
     # 数值必须来自 theoretical.recompute（单一真源）：本函数早于 theoretical 计算时曾
     # 自行用 computing × r_re 再算一次，两处对同一个「重计算开销」相差 32 倍。
+    # An explicitly passed empty view means "the caller quantified it and found no
+    # replay" — publishing a self-computed projection there made the ledger, the
+    # What-if lever and the rule card disagree three ways in one report.
+    _explicit_view = recompute_view is not None
     _rc_view = recompute_view or None
     if _rc_view is not None and not (_rc_view or {}).get("overhead_us"):
         _rc_view = None            # no quantified replay -> no bucket to publish
-    _rc_gran = (_rc_view or {}).get("granularity") or recompute
+    _rc_gran = None if (_rc_view is None and _explicit_view) \
+        else ((_rc_view or {}).get("granularity") or recompute)
     if _rc_gran in ("full", "selective"):
         _rc_kind = "Full" if _rc_gran == "full" else "Selective"
         _rc_us = (_rc_view or {}).get("overhead_us")

@@ -195,7 +195,7 @@
       </div>
       ${panel("算子明细 (Top 40)", "", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>OP Type</th><th>Core</th><th>Count</th><th>总耗时</th><th>均值</th><th>最大</th><th>占比</th></tr></thead><tbody>${rows}</tbody></table></div>`, "span-2")}`;
     charts([
-      { id: "hs-bar", option: hbar(top.map(o => o.type), top.map(o => o.ratio), "占比%", { fmt: v => fmt.pct(v, 1), color: top.map(o => o.core === "AI_CPU" ? "#f85149" : "#3fb6e0") }) },
+      { id: "hs-bar", option: hbar(top.map(o => o.display || o.type), top.map(o => o.ratio), "占比%", { fmt: v => fmt.pct(v, 1), color: top.map(o => o.core === "AI_CPU" ? "#f85149" : "#3fb6e0") }) },
       { id: "hs-core", option: donut(hs.by_core.map(c => ({ name: c.core || "UNKNOWN", value: c.total_us, pct: c.pct }))) },
     ]);
   };

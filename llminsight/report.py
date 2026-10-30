@@ -659,12 +659,14 @@ def _sec_communication(comm: Dict) -> str:
         def _us_val(d, key):
             v = d.get(key, "—")
             return _e(f"{v} us")
-        bd_note = (f'<div class="note">device 子任务分解：等待累加 {_us_val(bd, "wait_us")} '
-                   f'({_pct(bd.get("wait_pct"))})，有效传输累加 {_us_val(bd, "transfer_us")} '
-                   f'({_pct(bd.get("transfer_pct"))})'
-                   + (f'；未掩盖通信窗口内等待墙钟 {_us_val(wc, "wait_wall_us")}，'
-                      f'传输墙钟 {_us_val(wc, "transfer_wall_us")}' if wc else "")
-                   + '</div>')
+        # append, do not overwrite: the fused-a2a banner above must survive on
+        # captures that also ship a device-subtask breakdown (msprof exports).
+        bd_note += (f'<div class="note">device 子任务分解：等待累加 {_us_val(bd, "wait_us")} '
+                    f'({_pct(bd.get("wait_pct"))})，有效传输累加 {_us_val(bd, "transfer_us")} '
+                    f'({_pct(bd.get("transfer_pct"))})'
+                    + (f'；未掩盖通信窗口内等待墙钟 {_us_val(wc, "wait_wall_us")}，'
+                       f'传输墙钟 {_us_val(wc, "transfer_wall_us")}' if wc else "")
+                    + '</div>')
     note = f'<div class="note">{_e(comm.get("note", ""))}</div>'
     zt = comm.get("zero_transit") or {}
     zt_note = ""

@@ -47,7 +47,9 @@ def compute_all(prof, capture: Dict[str, Any] = None) -> Dict[str, Any]:
         "matrix_power": matrix_power,
         "communication": core.communication(prof),
         "hidden_overhead": core.hidden_overhead(
-            prof, ov, capture, recompute_view=theoretical.get("recompute")),
+            # `or {}` (not None) is the explicit "quantified, found nothing" signal:
+            # the ledger must not fall back to its own projection there.
+            prof, ov, capture, recompute_view=theoretical.get("recompute") or {}),
         "attribution": core.attribution(prof),
         "memory": compute_memory(prof),
         "theoretical": theoretical,
