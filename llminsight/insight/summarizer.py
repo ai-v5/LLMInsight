@@ -101,6 +101,15 @@ def build_summary(m: Dict[str, Any],
             "evidence": f.get("evidence")}
         for k, f in (cfg.get("capture") or {}).items()
     }
+    # The effective recompute state is decided once in theoretical (identified
+    # replay outranks a caller-count "off"); shipping the raw capture value next to
+    # it made the LLM prompt carry both "off" and "selective" for the same run.
+    _rco = (m.get("theoretical") or {}).get("recompute") or {}
+    if _rco.get("granularity") in ("full", "selective") and "recompute" in cap_state:
+        cap_state["recompute"] = dict(cap_state["recompute"],
+                                      value=_rco["granularity"],
+                                      evidence=("有效粒度：profiling 反推的调用数 + "
+                                                "可识别重放算子（theoretical.recompute）"))
     model_block = {
         "arch": derived_model.get("architecture") or "架构未识别（仅展示 profiling 可验证特征）",
         "derived": derived_model,

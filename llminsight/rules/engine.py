@@ -84,6 +84,9 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
     comm = m.get("communication", {})
     ho = m.get("hidden_overhead", {})
     theo = m.get("theoretical", {})
+    # Effective recompute granularity (theoretical decides it once; the raw capture
+    # fact can be "off" while identified replay proves selective).
+    rco_runtime = (theo.get("recompute") or {}).get("granularity")
     env = capture.get("env", {})
     cap_state = capture.get("capture", {}) or {}     # profiling-derived capture facts
     guesses = capture.get("guesses", {}) or {}
@@ -325,12 +328,22 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
             candidate_names = "、".join(
                 str(c.get("type")) for c in (rco.get("candidates") or [])[:5]
             )
-            root = ("为省激活显存，反向重跑前向：可直接识别的重放算子耗时 ≈ {us:,.0f}us"
-                    "（step 的 {pct}%）。识别候选：{ops}。这是硬件多做的功，"
-                    "拉低 MFU：HFU {hfu} vs MFU {mfu}。").format(
-                        us=rco["overhead_us"], pct=rco.get("overhead_pct"),
-                        ops=candidate_names or "前向/反向相位组",
-                        hfu=_mp(rco.get("hfu")), mfu=_mp(rco.get("mfu")))
+            if rco.get("method") == "measured_candidates":
+                root = ("为省激活显存，反向重跑前向：可直接识别的重放算子耗时 ≈ {us:,.0f}us"
+                        "（step 的 {pct}%）。识别候选：{ops}。这是硬件多做的功，"
+                        "拉低 MFU：HFU {hfu} vs MFU {mfu}。").format(
+                            us=rco["overhead_us"], pct=rco.get("overhead_pct"),
+                            ops=candidate_names or "前向/反向相位组",
+                            hfu=_mp(rco.get("hfu")), mfu=_mp(rco.get("mfu")))
+            else:
+                # Same distinction as the hidden-overhead ledger: this number is
+                # computing × r_re, a projection, not a measured replay duration.
+                root = ("为省激活显存，反向重跑前向：按 computing × r_re 估算重算足迹 ≈ "
+                        "{us:,.0f}us（step 的 {pct}%）。本次采集没有可配对的前向/反向重放"
+                        "计数，该值是模型投影而非实测；这是硬件多做的功，"
+                        "拉低 MFU：HFU {hfu} vs MFU {mfu}。").format(
+                            us=rco["overhead_us"], pct=rco.get("overhead_pct"),
+                            hfu=_mp(rco.get("hfu")), mfu=_mp(rco.get("mfu")))
             if rco.get("footprint_us"):
                 root += ("未识别的重放家族不计入上式；重算在 Computing 中的全量足迹约 "
                          "{fp:,.0f}us（step 的 {fp_pct}%，见隐性开销「重计算」桶）。"
@@ -426,9 +439,11 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
         # 12a. HBM 容量余量 / OOM 风险
         sev = "high" if near else ("medium" if (util or 0) >= 75 else "info")
         # Memory-saving features actually in effect — read from the PROFILING-
-        # derived config (never a launch script). On the NEW sample recompute is
-        # off and swap is absent, so we must NOT claim they are on.
-        rc = _cstate("recompute")
+        # derived config (never a launch script), and aligned with the EFFECTIVE
+        # recompute granularity: the capture may say "off" while identified replay
+        # proves selective (see theoretical.recompute), and the report must not show
+        # both "未开启 recompute" and "选择性重计算开启" for the same run.
+        rc = rco_runtime if rco_runtime in ("full", "selective") else _cstate("recompute")
         swap_on = bool((capture.get("flags", {}) or {}).get("swap-optimizer"))
         savers = ([f"recompute={rc}"] if rc in ("full", "selective") else []) \
             + (["swap-optimizer"] if swap_on else [])

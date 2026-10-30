@@ -104,25 +104,38 @@ def _anchor_from_rows(rows, source_is_fused: bool = False) -> Dict[str, Any]:
         shapes_in = parse_shapes(record.get("Input Shapes"))
         shapes_out = parse_shapes(record.get("Output Shapes"))
         source_ops.add(str(record.get("Type")))
-        # Expert weights appear as a 3-D [G, K, N] operand: either the input of a
-        # forward grouped GEMM or the output of its weight-gradient counterpart.
-        # A grouped op can also carry a 3-D *activation*; its trailing dims repeat
-        # another operand's trailing dims, so those candidates are skipped first
-        # (a wrong, smaller "weight" would publish a too-low MFU without tripping
-        # the above-peak guard).
-        three_d = [s for s in shapes_out if len(s) == 3] + [s for s in shapes_in if len(s) == 3]
-        operand_tails = {tuple(s[-2:]) for s in (shapes_in + shapes_out) if len(s) == 2}
-        weight = next((s for s in three_d if tuple(s[1:]) not in operand_tails), None) \
-            or (three_d[0] if three_d else None)
+        # Expert weights appear as a 3-D [G, K, N] operand: the INPUT of a forward
+        # grouped GEMM, or the OUTPUT of its weight-gradient counterpart.  A grouped
+        # op can also record a 3-D *activation* (e.g. the a2a buffer), which has no
+        # contraction dim in common with the 2-D operands.  Select by contract rather
+        # than by order: prefer inputs, and require the candidate's K to be one of
+        # the 2-D operands' last dims.  A wrong-but-smaller contract would publish a
+        # too-low MFU without tripping the above-peak guard, so ambiguity fails
+        # closed (this row contributes no contract).
+        two_d = [s for s in (shapes_in + shapes_out) if len(s) == 2]
+        two_d_last = {s[-1] for s in two_d}
+        weight = None
+        for candidate in ([s for s in shapes_in if len(s) == 3]
+                          + [s for s in shapes_out if len(s) == 3]):
+            k, n = candidate[1], candidate[2]
+            if k and n and k in two_d_last:
+                weight = candidate
+                break
+        contract_k = None
         if weight:
             _, k, n = weight
             if k and n:
                 contracts.add((int(k), int(n)))
-        # The routed-row count is the activation's first dim, which is not always
-        # operand 0 (a forward grouped GEMM can put the [G,K,N] weight first).
-        two_d_rows = [int(s[0]) for s in shapes_in if len(s) == 2 and s[0] > 0]
-        if two_d_rows:
-            activation_rows.append(max(two_d_rows))
+                contract_k = int(k)
+        # Routed rows = the activation's first dim: the 2-D operand whose last dim is
+        # the contraction K, else operand 0 of the 2-D list.  Taking the max over 2-D
+        # operands let a 2-D weight's K pose as the row count (7x inflation), and a
+        # forward grouped GEMM may put the weight first.
+        activation = next((s for s in shapes_in if len(s) == 2 and contract_k is not None
+                           and s[-1] == contract_k), None) \
+            or next((s for s in shapes_in if len(s) == 2 and s[0] > 0), None)
+        if activation:
+            activation_rows.append(int(activation[0]))
         if dtype is None:
             for value in parse_dtypes(record.get("Input Data Types")):
                 candidate = _canonical_dtype(value)
@@ -280,7 +293,17 @@ def _estimate_fused_mc2(mc2_groups: List[Dict[str, Any]], anchor: Dict[str, Any]
     total_flops = per_pair_flops * pairs
     dtype = anchor.get("dtype") or "BF16"
     peak = SETTINGS.chip.peak_cube_flops(dtype)
-    equivalent_mfu = (total_flops / (peak * total_dur_us * 1e-6)) if peak else None
+
+    def _group_peak(dt: str) -> float:
+        chosen = dt if dt in {"BF16", "FP16", "FP32", "FP8", "FP4"} else dtype
+        return SETTINGS.chip.peak_cube_flops(chosen)
+
+    # Stage-level equivalent MFU must use the same per-group dtype peaks the table
+    # uses, otherwise an fp8 group and a bf16 anchor disagree by 2x.
+    weighted_peak_time = sum(
+        _group_peak(str(item.get("dtype") or "UNKNOWN")) * float(item["dur_us"]) * 1e-6
+        for item in mc2_groups) or (peak * total_dur_us * 1e-6)
+    equivalent_mfu = (total_flops / weighted_peak_time) if weighted_peak_time else None
     if equivalent_mfu is None:
         return {}
     above_peak = equivalent_mfu > _PEAK_MEASUREMENT_TOL
