@@ -446,10 +446,11 @@ def compute_matrix_power(prof, efficiency=None) -> Dict[str, Any]:
     formula_rows = sum(1 for item in rows if item["formula_available"])
     note = ("MFU 分母按每个算子@dtype 对应的 CUBE 峰值。MegaMoE 的 PROXY 仅含同采集校准的 "
             "MAC/CUBE 工作量，不含 Vector；分母为完整计算/通信融合窗口，不是纯计算 MFU。"
-            "MC2 融合算子（AlltoAllvGroupedMatMul / GroupedMatMulAlltoAllv）在 Level-1 采集里"
-            "不记录 shape，改用功能约定的矩阵乘（专家权重 [K,N]）与同采集专家 GroupedMatmul 的"
-            "激活行数 M 重建 GEMM 工作量，按各算子占融合窗口的时长份额分摊，给出 ESTIMATED 的"
-            "「融合窗口等效 MFU」——分母仍含内部 a2a，故是纯计算 MFU 的下界；MBU 仍不可用。"
+            "MC2 融合算子（AlltoAllvGroupedMatMul / GroupedMatMulAlltoAllv）的窗口含内部 a2a，"
+            "MFU 只能按等效口径给出：它不选 shape 时（Level-1 采集）用功能约定 + 同采集专家 "
+            "Groupedmatmul 的权重 [K,N]/激活行数 M 重建 GEMM 工作量；即使该采集记录了 shape，"
+            "分母仍含 a2a，所以同样标注 ESTIMATED，按各算子占融合窗口的时长份额分摊 →"
+            "「融合窗口等效 MFU」= 纯计算 MFU 的下界；MBU 仍不可用。"
             "缺少校准、计数器或 dtype 时保持不可用。其它融合算子统计可由 shape 重建的矩阵工作。")
     if mc2_estimate:
         note += ("（本次 MC2 估算：每 call 行数 {rows:,}，单次权重 {contracts}，配对 {pairs} 次，"
