@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 
 from ..cache import cached_json, file_signature
 from ..config import SETTINGS
+from ..parser.names import op_display_name
 from ..parser.trace import iter_events, event_ts_us
 
 # pid process_name -> our lane label
@@ -104,7 +105,12 @@ def _build(prof) -> Dict[str, Any]:
                     nm = str(ev.get("name"))
                     if not _SYNC_RE.search(nm):
                         top_slices.append(
-                            {"name": nm[:60], "lane": "Device",
+                            # Map the raw symbol to its family BEFORE cutting to 60
+                            # chars: a Level-1 capture names the MC2 fused kernels
+                            # with a 1118-char C++ symbol, and a fixed-width prefix
+                            # keeps only "_ZN7Catccos…Asc" — unrecognisable, and the
+                            # reporter cannot recover the family afterwards.
+                            {"name": op_display_name(nm, limit=60), "lane": "Device",
                              "start_us": round(ts - t0, 1), "dur_us": round(dur, 1)}
                         )
             if pid == overlap_pid:
@@ -172,9 +178,9 @@ def compute_timeline(prof) -> Dict[str, Any]:
     if not prof.trace_path:
         return {"available": False, "reason": "trace_view.json missing"}
     sig = file_signature(prof.trace_path)
-    # v3 schema: overlap_bins + computing/not-overlapped/free pcts (the 3 step-
-    # partitioning tracks), dropped overlap_segments, freq filtered to span, sync
-    # kernels filtered from top_slices. Bump the key on any shape change so a cache
-    # written under an older schema is never served.
-    key = f"timeline:v3:{sig}:{SETTINGS.timeline_bins}"
+    # v4 schema: top_slices names go through parser.names.op_display_name before the
+    # 60-char cut, so Level-1 MC2 symbols show their family instead of "_ZN7Catccos…".
+    # Bump the key on any shape change so a cache written under an older schema is
+    # never served.
+    key = f"timeline:v4:{sig}:{SETTINGS.timeline_bins}"
     return cached_json(key, lambda: _build(prof))

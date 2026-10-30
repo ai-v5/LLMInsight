@@ -10,6 +10,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from ..config import SETTINGS
+from ..parser.names import op_display_name
 
 SEV_ORDER = {"high": 3, "medium": 2, "low": 1, "info": 0}
 
@@ -202,11 +203,14 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
     #     NOT present: cumulative aclrtSynchronizeStream driven by dynamic-shape
     #     D2H syncs (aclnnMaskedSelect / .item()), not a blocking artifact.
     if not blocking and _cstate("host_sync_stall") and sync and sync.get("us"):
+        _sync_root = (cap_state.get("host_sync_stall", {}) or {}).get("root_api")
         cards.append(_card(
             "host_sync_stall", "medium", "等待·同步",
             f"Host 同步阻塞：aclrtSynchronizeStream 累计 {sync['us']/1e6:.2f}s 占据 host 关键路径",
-            "host 频繁等待 device 完成——aclnnMaskedSelect 等动态 shape 触发 D2H 同步（及 .item() 类同步），"
-            "而非 ASCEND_LAUNCH_BLOCKING（本次数据未检出 blocking）。",
+            "host 频繁等待 device 完成——"
+            + (f"最重的 aclnn 调用为 {_sync_root}，其动态 shape 触发 D2H 同步（及 .item() 类同步）"
+               if _sync_root else "动态 shape 触发 D2H 同步（及 .item() 类同步）")
+            + "，而非 ASCEND_LAUNCH_BLOCKING（本次数据未检出 blocking）。",
             "固定 expert capacity / 对路由结果 padding，消除动态 shape 的 D2H 同步；合并或减少同步点，"
             "让下发与 device 计算更充分异步重叠。",
             "削减 host 同步等待可缩短 host 关键路径、降低尾延迟（需与 device 计算重叠确认）。",
@@ -233,7 +237,7 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
     if eff.get("available"):
         if not eff.get("flop_model_complete", True):
             missing = eff.get("unmodeled_flop_types") or {}
-            missing_txt = "、".join(list(missing)[:4]) or "未知主导算子"
+            missing_txt = "、".join(op_display_name(t) for t in list(missing)[:4]) or "未知主导算子"
             estimate = eff.get("mfu_estimate") or {}
             cards.append(_card(
                 "flop_model_incomplete", "high", "采集体检",
@@ -321,13 +325,16 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
             candidate_names = "、".join(
                 str(c.get("type")) for c in (rco.get("candidates") or [])[:5]
             )
-            root = ("为省激活显存，反向重跑前向，额外计算 ≈ {us:,.0f}us（step 的 {pct}%，"
-                    "band {lo:,.0f}–{hi:,.0f}us）。识别候选：{ops}。这是硬件多做的功，"
+            root = ("为省激活显存，反向重跑前向：可直接识别的重放算子耗时 ≈ {us:,.0f}us"
+                    "（step 的 {pct}%）。识别候选：{ops}。这是硬件多做的功，"
                     "拉低 MFU：HFU {hfu} vs MFU {mfu}。").format(
                         us=rco["overhead_us"], pct=rco.get("overhead_pct"),
-                        lo=rco.get("overhead_us_lo"), hi=rco.get("overhead_us_hi"),
                         ops=candidate_names or "前向/反向相位组",
                         hfu=_mp(rco.get("hfu")), mfu=_mp(rco.get("mfu")))
+            if rco.get("footprint_us"):
+                root += ("未识别的重放家族不计入上式；重算在 Computing 中的全量足迹约 "
+                         "{fp:,.0f}us（step 的 {fp_pct}%，见隐性开销「重计算」桶）。"
+                         ).format(fp=rco["footprint_us"], fp_pct=rco.get("footprint_pct"))
             gain = "关闭重计算可省 ≈ {us:,.0f}us → 端到端 MFU {m0}→{m1}（需显存余量）。".format(
                         us=rco["save_us"], m0=_mp(rco.get("mfu")), m1=_mp(rco.get("new_mfu")))
             sev = "medium"

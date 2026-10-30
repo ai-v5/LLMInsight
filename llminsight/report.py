@@ -26,6 +26,8 @@ import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from .parser.names import op_display_name
+
 # --------------------------------------------------------------------------- #
 # Formatting helpers (mirror web/js/util.js fmt.* so numbers read identically).
 # --------------------------------------------------------------------------- #
@@ -543,7 +545,7 @@ def _sec_hotspots(hot: Dict) -> str:
     if not hot or not hot.get("available"):
         return ""
     top = (hot.get("top") or [])[:15]
-    rows = [[_e(o.get("type", "")), _e(o.get("core", "")),
+    rows = [[_e(op_display_name(o.get("type", ""))), _e(o.get("core", "")),
              _int(o.get("count")), _us(o.get("total_us")),
              _pct(o.get("ratio"), 2)] for o in top]
     tbl = _table(["算子类型", "Core", "次数", "总耗时", "占比"], rows)
@@ -610,7 +612,8 @@ def _sec_efficiency(eff: Dict) -> str:
         warnings += (f'<div class="note">同采集外部 alltoallv：{_int(external.get("count"))} 次，'
                      f'累计 {_us(external.get("elapse_us"))}；不作为融合内部通信，不直接相加。</div>')
     if incomplete:
-        missing = "、".join((eff.get("unmodeled_flop_types") or {}).keys()) or "未知算子"
+        missing = "、".join(op_display_name(t)
+                            for t in (eff.get("unmodeled_flop_types") or {}).keys()) or "未知算子"
         warnings += ('<div class="banner warn">主导计算算子 FLOP 模型覆盖不足'
                      f'（覆盖 {_pct(eff.get("flop_coverage_pct"))}；未建模：{_e(missing)}）。'
                      '完整模型 MFU 使用同次采集 MAC/Vector 周期校准估算；'
@@ -1043,7 +1046,7 @@ def _sec_timeline(tl: Dict) -> str:
                      f'（{len(freq)} 采样点）</div>')
 
     top = (tl.get("top_slices") or [])[:15]
-    srows = [[_e(str(s.get("name", ""))[:46]),
+    srows = [[_e(op_display_name(str(s.get("name", "")), limit=46)),
               f'{(s.get("start_us", 0) / 1e6):.2f} s', _us(s.get("dur_us"))]
              for s in top]
     slice_tbl = _table(["最长计算 Kernel (>1.5ms)", "起始", "时长"],

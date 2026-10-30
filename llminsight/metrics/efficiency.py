@@ -76,7 +76,12 @@ COUNTER_MODEL_COMPUTE_TYPES = {
 # formula-derived (2·M·N·K, see _estimate_grouped_gemm_flops) instead of only
 # counter-calibrated.  The paired AI_CPU launch wrapper is a different Type and
 # is excluded from the compute rows entirely.
-MC2_GROUPED_GEMM_TYPES = {"AlltoAllvGroupedMatMul", "GroupedMatMulAlltoAllv"}
+# Matched as case-insensitive SUBSTRINGS (see _is_mc2_grouped_gemm_type): a capture
+# with op attrs publishes "AlltoAllvGroupedMatMul", but a Level-1 capture publishes
+# the raw kernel symbol (_ZN7Catccos…Ascend950AllToAllVGroupedMatmul…EPh), which
+# exact set membership silently missed.  Keep in sync with
+# metrics.core._MC2_FUSED_TYPE_MARKERS and matrix_power._FUSED_MC2_MARKERS.
+MC2_GROUPED_GEMM_MARKERS = ("alltoallvgroupedmatmul", "groupedmatmulalltoallv")
 # These fused kernels perform repeated sparse gather/scatter work that cannot be
 # reconstructed from the one-time input/output tensor footprint in profiler CSV.
 SPARSE_DISCRETE_TRAFFIC_TYPES = (SPARSE_ATTENTION_TYPES | DSA_INDEXER_TYPES | COUNTER_MODEL_COMPUTE_TYPES
@@ -106,6 +111,12 @@ def _is_custom_model_compute_type(op_type: str) -> bool:
 def _is_kda_model_compute_type(op_type: str) -> bool:
     value = (op_type or "").lower()
     return any(marker in value for marker in KDA_MODEL_COMPUTE_MARKERS)
+
+
+def _is_mc2_grouped_gemm_type(op_type: str) -> bool:
+    """MC2 fused AllToAllv + GroupedMatMul kernels (plain label or mangled symbol)."""
+    value = (op_type or "").lower()
+    return any(marker in value for marker in MC2_GROUPED_GEMM_MARKERS)
 
 
 def _is_aicpu_dispatch_type(op_type: str) -> bool:
@@ -826,6 +837,14 @@ def _estimate_matmul_training_flops(rows: List[Dict[str, Any]]) -> Dict[str, Any
     }
 
 
+def _median(values: List[float]) -> float:
+    ordered = sorted(v for v in values if v is not None)
+    if not ordered:
+        return 0.0
+    mid = len(ordered) // 2
+    return float(ordered[mid]) if len(ordered) % 2 else 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
 def _estimate_recompute_from_rows(
     rows: List[Dict[str, Any]],
     matmul_training: Dict[str, Any],
@@ -887,6 +906,12 @@ def _estimate_recompute_from_rows(
             "evidence": "kernel Type 显式包含 recompute",
         })
 
+    # Forward/backward call families.  Recompute replays a forward kernel inside
+    # the backward, so the forward count exceeds the paired backward count.  Both
+    # the Ascend kernel names (snake_case, e.g. causal_conv1d_*_kernel) and the
+    # profiler Type labels (CamelCase, e.g. CausalConv1d) appear across exports, so
+    # the list is explicit AND augmented with the generic `<Type>` / `<Type>Grad`
+    # convention — a model family nobody listed still gets counted.
     pairs = (
         ("FlashAttentionScore", "FlashAttentionScoreGrad"),
         ("SparseFlashAttention", "SparseFlashAttentionGrad"),
@@ -894,16 +919,36 @@ def _estimate_recompute_from_rows(
         ("causal_conv1d_fwd_kernel", "causal_conv1d_bwd_kernel"),
         ("chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
          "chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64"),
+        ("CausalConv1d", "CausalConv1dBwd"),
+        ("ChunkKdaFwdPrepare", "ChunkKdaBwdPrepare"),
+        ("ChunkKdaFwdFinalize", "ChunkKdaBwdFinalize"),
+        ("ChunkFwdH", "ChunkGatedDeltaRuleBwdDhu"),
+        ("_apply_attn_res_kernel", "_apply_attn_res_backward_kernel"),
     )
-    for fwd_type, bwd_type in pairs:
+    present = {str(r["type"]) for r in rows}
+    extra = sorted(t for t in present if t + "Grad" in present)
+    seen_pairs = set()
+    for fwd_type, bwd_type in tuple(pairs) + tuple((t, t + "Grad") for t in extra):
+        if (fwd_type, bwd_type) in seen_pairs:
+            continue
+        seen_pairs.add((fwd_type, bwd_type))
         fwd = [r for r in rows if r["type"] == fwd_type]
         bwd = [r for r in rows if r["type"] == bwd_type]
         if not fwd or not bwd or len(fwd) <= len(bwd):
             continue
-        excess = len(fwd) - len(bwd)
+        # Replay count is count-based: every layer contributes one forward and one
+        # backward; a replayed layer adds a second forward, so excess = fwd - bwd.
+        # Charging it at the Type's MEAN duration overstated a real capture 43x
+        # because one Type mixed a 6.7 ms real fused-attention call with a 48 us aux
+        # variant (mean was dominated by the minority).  MEDIAN is the robust
+        # per-call cost here and stays conservative when the replayed variant is a
+        # minority — the replay window is not observable from per-call rows anyway.
+        excess_count = len(fwd) - len(bwd)
+        per_call_us = _median([float(r["dur_us"]) for r in fwd])
+        excess_us = excess_count * per_call_us
+        per_call_flops = _median([_row_estimate(r) for r in fwd])
+        excess_flops = excess_count * per_call_flops
         ratio = len(fwd) / len(bwd)
-        per_call = sum(_row_estimate(r) for r in fwd) / len(fwd)
-        estimate = excess * per_call
         formula_backed = all(r.get("flops") for r in fwd)
         band = 0.0 if formula_backed else 0.25
         candidates.append({
@@ -911,18 +956,16 @@ def _estimate_recompute_from_rows(
             "paired_backward_type": bwd_type,
             "method": "forward_backward_excess",
             "confidence": "medium",
-            "count": excess,
+            "count": excess_count,
             "forward_count": len(fwd),
             "backward_count": len(bwd),
-            "duration_us": round(
-                sum(float(r["dur_us"]) for r in fwd) * excess / len(fwd), 1
-            ),
-            "recompute_flops": estimate,
-            "recompute_flops_lo": estimate * (1.0 - band),
-            "recompute_flops_hi": estimate * (1.0 + band),
+            "duration_us": round(excess_us, 1),
+            "recompute_flops": excess_flops,
+            "recompute_flops_lo": excess_flops * (1.0 - band),
+            "recompute_flops_hi": excess_flops * (1.0 + band),
             "evidence": (
                 f"forward/backward 调用数 {len(fwd)}/{len(bwd)}={ratio:.2f}；"
-                f"超额 forward {excess} 次"
+                f"超额 forward {excess_count} 次 × 单次中位 {per_call_us:,.0f}us"
             ),
         })
 
@@ -936,7 +979,12 @@ def _estimate_recompute_from_rows(
     share_lo = recompute_lo / executed_flops_hi if executed_flops_hi > 0 else 0.0
     share_hi = recompute_hi / executed_flops_lo if executed_flops_lo > 0 else 0.0
     named = [c for c in candidates if c["method"] != "orientation_phase_split"]
-    likely = "full" if share >= 0.18 and len(named) >= 2 else "selective"
+    # Granularity here can only prove "*some* forward is replayed" vs "none": the
+    # full-vs-selective scope decision lives in parser.derive (caller counts per
+    # family, incl. the custom KDA/conv families this module does not model).  The
+    # old FLOP-share rule (`share >= 0.18 and len(named) >= 2`) was structurally
+    # unreachable whenever the replayed families are unmodeled — it never fired.
+    likely = "selective" if named else "off"
     return {
         "available": bool(candidates and executed_flops > 0),
         "assessment": "recompute_enabled" if candidates else "unknown",
@@ -955,7 +1003,8 @@ def _estimate_recompute_from_rows(
             reverse=True,
         ),
         "basis": (
-            "MatMul 方向/次数相位拆分 + forward/backward 超额调用 + 显式 recompute kernel；"
+            "MatMul 方向/次数相位拆分 + forward/backward 超额调用（按全部计算算子的"
+            "每类 Type 中位单次耗时计费）+ 显式 recompute kernel；"
             "未建模 KDA/causal-conv/MC2 融合 MoE 工作量使用同一采集内 "
             "GEMM/Attention 校准后的 MAC/Vector 周期代理。"
         ),
@@ -1150,7 +1199,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
             # toward whole-model FLOP coverage.  Falls back to the counter proxy
             # when shapes are missing (formula returns None).
             flops = _estimate_kda_flops(types[i], shapes_in, shapes_out)
-        elif types[i] in MC2_GROUPED_GEMM_TYPES:
+        elif _is_mc2_grouped_gemm_type(types[i]):
             # MC2 fused AllToAllv + GroupedMatMul: the recorded activation and
             # per-expert weight give the exact 2·M·N·K Cube work, so the model
             # compute is formula-backed instead of counter-only.  The paired
@@ -1611,7 +1660,12 @@ def compute_efficiency(prof) -> Dict[str, Any]:
     # kernel can still carry substantial work and must not vanish from MFU.
     flop_model_complete = bool(model_rows and len(modeled_model_rows) == len(model_rows))
     recompute_estimate = _estimate_recompute_from_rows(
-        model_rows,
+        # ALL compute rows, not just the FLOP-modelled families: a replay executes
+        # the same forward kernels, and the cheap non-model families (RMSNorm,
+        # activations, MoE routing, conv) are exactly where real captures replay.
+        # Restricting this to model_rows made the measured replay a small fraction
+        # of what the kernels actually show.
+        rows,
         matmul_training_flops,
         counter_scale,
         estimated_flops,
@@ -1774,7 +1828,7 @@ def compute_efficiency(prof) -> Dict[str, Any]:
             "检测到 LightningIndexer/GradKLLoss，但 shape 或 sparse_mode 不足以闭合"
             " useful Cube FLOPs；相关 MFU 按 fail-closed 保持 unavailable。"
         )
-    if any(r["type"] in MC2_GROUPED_GEMM_TYPES and r.get("flops") for r in model_rows):
+    if any(_is_mc2_grouped_gemm_type(str(r["type"])) and r.get("flops") for r in model_rows):
         flop_model_notes.append(
             "AlltoAllvGroupedMatMul / GroupedMatMulAlltoAllv 按 2·M·N·K 计入 Cube FLOPs："
             "M = 通信后 token 数，N/K = expert 权重末两维（K 锚定在激活末维），group 维只切分 M、"

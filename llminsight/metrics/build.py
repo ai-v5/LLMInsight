@@ -28,6 +28,11 @@ def compute_all(prof, capture: Dict[str, Any] = None) -> Dict[str, Any]:
     # index from the public efficiency payload once the timeline has consumed it.
     smart_tl = compute_smart_timeline(prof, eff)
     eff.pop("kernel_index", None)
+    # theoretical BEFORE hidden_overhead: the recompute view is quantified once,
+    # there, and the ledger bucket mirrors it.  Computing the ledger first forced a
+    # second, differently-defined estimate (model projection vs measured replay
+    # duration) and the two sections published a 32x-disagreeing "recompute cost".
+    theoretical = core.theoretical(prof, ov, eff, capture)
     return {
         # `config` exposes the profiling-derived model/capture/guesses (KB-level,
         # secret-free) so the report header and UI show what the DATA says, not a
@@ -41,10 +46,11 @@ def compute_all(prof, capture: Dict[str, Any] = None) -> Dict[str, Any]:
         "efficiency": eff,
         "matrix_power": matrix_power,
         "communication": core.communication(prof),
-        "hidden_overhead": core.hidden_overhead(prof, ov, capture),
+        "hidden_overhead": core.hidden_overhead(
+            prof, ov, capture, recompute_view=theoretical.get("recompute")),
         "attribution": core.attribution(prof),
         "memory": compute_memory(prof),
-        "theoretical": core.theoretical(prof, ov, eff, capture),
+        "theoretical": theoretical,
         "timeline": compute_timeline(prof),
         "smart_timeline": smart_tl,
     }

@@ -62,6 +62,21 @@ _OP_ROWS = [
     ("Cast", "AI_VECTOR_CORE", 20, 40_000.0),
 ]
 
+# A Level-1 capture (no op attributes) publishes the raw kernel symbol as OP Type
+# instead of the profiler label, and records no AI_CPU Mc2AicpuKernel launcher at
+# all.  Exact type matching then loses the whole fused window.
+_MANGLED_OP_ROWS = [
+    ("MatMulV3", "AI_CORE", 10, 600_000.0),
+    ("_ZN7Catccos5DGemm6Device13KernelAdapterINS0_6Kernel31Ascend950"
+     "AllToAllVGroupedMatmulINS0_30AllToAllVAllGatherProblemShape"
+     "EN7Catlass4Gemm5BlockEPh", "MIX_AIC", 4, 200_000.0),
+    ("_ZN7Catccos5DGemm6Device13KernelAdapterINS0_6Kernel25"
+     "GroupedMatmulAllToAllVTlaINS0_30AllToAllVAllGatherProblemShape"
+     "EN7Catlass4Gemm5BlockEPh", "MIX_AIC", 4, 100_000.0),
+    ("HcclLaunchAicpuKernel", "AI_CPU", 8, 60_000.0),
+    ("Cast", "AI_VECTOR_CORE", 20, 40_000.0),
+]
+
 
 def _comm_op(elapse_ms: float, wait_ms: float,
              transit_mb: float = 0.0, transit_ms: float = 0.0) -> dict:
@@ -83,9 +98,11 @@ def _comm_op(elapse_ms: float, wait_ms: float,
     }
 
 
-def _write_capture(root: Path, *, link_bytes_recorded: bool) -> None:
+def _write_capture(root: Path, *, link_bytes_recorded: bool,
+                   mangled_mc2: bool = False) -> None:
     """4.0 s step: computing 2.5 s, not-overlapped comm 0.4 s, free rest."""
     root.mkdir(parents=True, exist_ok=True)
+    op_rows = _MANGLED_OP_ROWS if mangled_mc2 else _OP_ROWS
     stage, computing, comm_no = 4_000_000.0, 2_500_000.0, 400_000.0
     with open(root / "step_trace_time.csv", "w", encoding="utf-8") as fh:
         fh.write(_STEP_HEADER)
@@ -94,14 +111,14 @@ def _write_capture(root: Path, *, link_bytes_recorded: bool) -> None:
 
     with open(root / "op_statistic.csv", "w", encoding="utf-8") as fh:
         fh.write(_OP_HEADER)
-        total = sum(r[3] for r in _OP_ROWS)
-        for op_type, core, count, us in _OP_ROWS:
+        total = sum(r[3] for r in op_rows)
+        for op_type, core, count, us in op_rows:
             fh.write(f"1,{op_type},{core},{count},{us},1,{us / count},{us / count},"
                      f"{us / total * 100:.3f}\n")
 
     with open(root / "kernel_details.csv", "w", encoding="utf-8") as fh:
         fh.write(",".join(_KERNEL_COLUMNS) + "\n")
-        for op_type, core, count, us in _OP_ROWS:
+        for op_type, core, count, us in op_rows:
             for _ in range(count):
                 fh.write(f"1,{op_type},{op_type}_0,{core},{us / count},"
                          "\"128,64;7,64,128\",DT_BF16;DT_BF16,\"128,128\",DT_BF16\n")
@@ -133,11 +150,13 @@ def _write_capture(root: Path, *, link_bytes_recorded: bool) -> None:
 
 class _Base(unittest.TestCase):
     link_bytes_recorded = True
+    mangled_mc2 = False
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self._tmp.name) / "rank_leaf"
-        _write_capture(self.dir, link_bytes_recorded=self.link_bytes_recorded)
+        _write_capture(self.dir, link_bytes_recorded=self.link_bytes_recorded,
+                       mangled_mc2=self.mangled_mc2)
         self.prof = load_profile(str(self.dir))
         self.metrics = compute_all(self.prof)
 
@@ -145,9 +164,30 @@ class _Base(unittest.TestCase):
         self._tmp.cleanup()
 
 
+class FusedA2aVisibilityTests(_Base):
+    """The a2a inside an MC2 fused kernel must not read as "EP is off".
+
+    ``communication.json`` never records it, so the communication section used to
+    publish ``a2a.available = false`` with no explanation, and the EP guess said
+    "no reliable EP world-size signal" even though the fused kernel proves EP is on.
+    """
+
+    def test_communication_a2a_points_at_the_fused_window(self) -> None:
+        comm = self.metrics["communication"]
+        a2a = comm["a2a"]
+        self.assertFalse(a2a["available"])           # nothing in communication.json
+        self.assertGreater(a2a["fused_window_us"], 0)  # ... but the window is real
+        self.assertIn("融合", a2a["note"])
+
+    def test_ep_guess_cites_the_fused_all_to_all(self) -> None:
+        config = self.metrics["meta"]["config"]
+        basis = config["guesses"]["ep_world_size"]["basis"]
+        self.assertIn("MC2 融合 all-to-all", basis)
+        self.assertEqual(config["guesses"]["ep_world_size"]["guess"], None)
+
+
 class LinkBytesNotCollectedTests(_Base):
     """A capture whose HCCL link bytes were never recorded must fail closed."""
-
     link_bytes_recorded = False
 
     def test_zero_transit_is_unavailable_not_a_fact(self) -> None:
@@ -245,6 +285,89 @@ class HiddenOverheadTests(_Base):
         self.assertIn("不等于 step 墙钟", bucket["detail"])
 
 
+class FusedMc2EstimateTests(unittest.TestCase):
+    """Level-1 MC2 rows carry no shapes → estimate MFU from function + anchors.
+
+    The fused window's GEMM work is reconstructed from (a) the same layer's plain
+    expert grouped GEMM (per-expert weight [K,N] + routed-row count M) and (b) the
+    function contract (each call = one two-projection expert GEMM group).  The
+    result is an ESTIMATED equivalent MFU of the fused window (the denominator still
+    contains the internal a2o), never a FORMULA value.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name) / "rank_leaf"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        header = "Device_id,Type,Name,Accelerator Core,Duration(us),Input Shapes," \
+                 "Input Data Types,Output Shapes,Output Data Types\n"
+        dispatch = ("_ZN7Catccos5DGemm6Device13KernelAdapterINS0_6Kernel31Ascend950"
+                    "AllToAllVGroupedMatmulINS0_30AllToAllVAllGatherProblemShapeEPh")
+        combine = ("_ZN7Catccos5DGemm6Device13KernelAdapterINS0_6Kernel25"
+                   "GroupedMatmulAllToAllVTlaINS0_30AllToAllVAllGatherProblemShapeEPh")
+        with open(self.dir / "kernel_details.csv", "w", encoding="utf-8") as fh:
+            fh.write(header)
+            # Plain expert grouped GEMM: activation rows 1024, per-expert weight [4,2048,4096]
+            for _ in range(2):
+                fh.write(f'1,GroupedMatmul,aclnnGroupedMatmulV5,MIX_AIC,500000,'
+                         f'"1024,2048;4,2048,4096",DT_BF16;DT_BF16,"4,2048,4096",DT_BF16\n')
+            # Fused MC2 kernels: NO shapes/dtypes at all (Level-1 capture)
+            for _ in range(2):
+                fh.write(f'1,{dispatch},{dispatch}_0,MIX_AIC,150000,,,,\n')
+            for _ in range(2):
+                fh.write(f'1,{combine},{combine}_0,MIX_AIC,100000,,,,\n')
+        self.prof = load_profile(str(self.dir))
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_equivalent_mfu_is_estimated_from_anchors(self) -> None:
+        from llminsight.config import SETTINGS
+        from llminsight.metrics.matrix_power import compute_matrix_power
+
+        result = compute_matrix_power(self.prof, {})
+        est = result["fused_mc2_estimate"]
+        self.assertIsNotNone(est)
+        self.assertEqual(est["rows"], 1024)
+        self.assertEqual(tuple(est["contracts"][0]), (2048, 4096))
+        self.assertEqual(est["pairs"], 2)
+        self.assertEqual(est["dtype"], "BF16")
+        # 2 calls x 2·M·K·N over 0.5 s of fused window
+        expected_flops = 2 * (2.0 * 1024 * 2048 * 4096)
+        self.assertAlmostEqual(est["total_flops"], expected_flops, delta=expected_flops * 1e-9)
+        peak = SETTINGS.chip.peak_cube_flops("BF16")
+        expected_mfu = expected_flops / (peak * 0.5)
+        self.assertAlmostEqual(est["equivalent_mfu"], expected_mfu, places=9)
+        self.assertFalse(est["above_peak"])
+
+        fused = [g for g in result["groups"] if g["fused_window"]]
+        self.assertEqual(len(fused), 2)
+        for group in fused:
+            self.assertEqual(group["dtype"], "BF16")
+            self.assertEqual(group["evidence_level"], "ESTIMATED")
+            self.assertAlmostEqual(group["mfu"], expected_mfu, places=6)
+            self.assertIsNone(group["mbu"])
+            self.assertIn("功能约定", group["estimate_basis"])
+        # work is split by each kernel's share of the fused window (a2a not separable)
+        by_dur = {g["dur_us"]: g["flops"] for g in fused}
+        self.assertAlmostEqual(by_dur[300000.0], expected_flops * 0.6, delta=1.0)
+        self.assertAlmostEqual(by_dur[200000.0], expected_flops * 0.4, delta=1.0)
+
+    def test_no_anchor_keeps_fused_mfu_unavailable(self) -> None:
+        import pandas as pd
+        from types import SimpleNamespace
+        from llminsight.metrics.matrix_power import compute_matrix_power
+
+        # same capture but with the plain expert GEMM removed -> nothing anchors
+        kd = pd.read_csv(self.dir / "kernel_details.csv", low_memory=False)
+        plain = SimpleNamespace(kernel_details=kd[kd["Type"] != "GroupedMatmul"])
+        result = compute_matrix_power(plain, {})
+        self.assertIsNone(result["fused_mc2_estimate"])
+        for group in (g for g in result["groups"] if g["fused_window"]):
+            self.assertIsNone(group["mfu"])
+            self.assertNotEqual(group["evidence_level"], "ESTIMATED")
+
+
 class MatrixPowerMc2Tests(_Base):
     def test_mc2_fused_rows_are_marked_fused_and_have_no_mbu(self) -> None:
         result = compute_matrix_power(self.prof, self.metrics["efficiency"])
@@ -257,6 +380,90 @@ class MatrixPowerMc2Tests(_Base):
             self.assertIsNone(group["mfu"], group["label"])
         rows = [r for r in result["rows"] if r["operator"] == "AlltoAllvGroupedMatMul"]
         self.assertTrue(rows and all(r["fused_window"] for r in rows))
+
+
+class RecomputeSingleSourceTests(_Base):
+    """The ledger bucket must mirror theoretical.recompute instead of re-deriving.
+
+    Re-deriving produced a model projection (computing × r_re) in the ledger while
+    the What-if lever published the measured replay duration — a 32x disagreement
+    for the same "重计算开销" label plus a full-vs-selective contradiction.
+    """
+
+    def test_hidden_overhead_mirrors_the_shared_recompute_view(self) -> None:
+        from llminsight.metrics import core
+        view = {"granularity": "selective", "overhead_us": 123_456.0,
+                "footprint_us": 987_654.0, "overhead_pct": 3.09}
+        ho = core.hidden_overhead(
+            self.prof, core.overview(self.prof), {"capture": {"recompute": {"value": "selective"}}},
+            recompute_view=view)
+        bucket = next(b for b in ho["buckets"] if b["key"] == "recompute")
+        self.assertAlmostEqual(bucket["us"], 123_456.0, places=1)
+        self.assertIn("Selective", bucket["label"])
+        self.assertIn("保守下界", bucket["detail"])
+        self.assertIn("足迹上界", bucket["detail"])
+        # non-additive: recompute already lives inside Computing
+        self.assertFalse(bucket.get("additive", True))
+
+    def test_display_name_keeps_known_families_apart(self) -> None:
+        from llminsight.parser.names import op_display_name
+        dispatch = ("_ZN7Catccos5DGemm6Device13KernelAdapterINS0_6Kernel31Ascend950"
+                    "AllToAllVGroupedMatmulINS0_30AllToAllVAllGatherProblemShapeEPh")
+        combine = ("_ZN7Catccos5DGemm6Device13KernelAdapterINS0_6Kernel25"
+                   "GroupedMatmulAllToAllVTlaINS0_30AllToAllVAllGatherProblemShapeEPh")
+        self.assertIn("alltoallvgroupedmatmul", op_display_name(dispatch).lower())
+        self.assertIn("groupedmatmulalltoallv", op_display_name(combine).lower())
+        self.assertNotEqual(op_display_name(dispatch), op_display_name(combine))
+        self.assertEqual(op_display_name("MatMulV3"), "MatMulV3")
+        # already-truncated symbols (e.g. a timeline payload capped at 90 chars) must
+        # still resolve to the canonical family instead of leaking a raw prefix
+        self.assertIn("alltoallvgroupedmatmul", op_display_name(dispatch[:90]).lower())
+
+
+class MangledMc2SymbolTests(_Base):
+    """A Level-1 capture names the MC2 fused kernels with the raw C++ symbol.
+
+    ``_ZN7Catccos…Ascend950AllToAllVGroupedMatmul…EPh`` never equals the profiler
+    label, so exact OP-Type matching lost the whole fused window: it fell into
+    ``Elementwise/Other`` while ``moe_focus.fused_dispatch_combine_us`` read 0 —
+    the same failure the plain-label fix (#70) removed for op-attr captures.
+    """
+
+    mangled_mc2 = True
+
+    def test_attribution_matches_fused_window_by_symbol_marker(self) -> None:
+        attr = self.metrics["attribution"]
+        modules = {m["module"]: m["us"] for m in attr["modules"]}
+        fused_key = "MoE fused dispatch/combine (GEMM+comm)"
+        self.assertIn(fused_key, modules)
+        self.assertAlmostEqual(modules[fused_key], 300_000.0, places=1)
+        self.assertAlmostEqual(attr["moe_focus"]["fused_dispatch_combine_us"], 300_000.0,
+                               places=1)
+        # residual keeps only the genuinely unattributed compute (Cast)
+        self.assertAlmostEqual(modules["Elementwise/Other"], 40_000.0, places=1)
+        # total must not double count the moved rows
+        self.assertAlmostEqual(
+            attr["total_us"],
+            sum(m["us"] for m in attr["modules"]), places=1)
+
+    def test_matrix_power_marks_mangled_fused_rows(self) -> None:
+        result = compute_matrix_power(self.prof, self.metrics["efficiency"])
+        fused = [g for g in result["groups"]
+                 if "alltoallvgroupedmatmul" in g["operator"].lower()
+                 or "groupedmatmulalltoallv" in g["operator"].lower()]
+        self.assertEqual(len(fused), 2)
+        for group in fused:
+            self.assertTrue(group["fused_window"], group["label"])
+            self.assertIsNone(group["mfu"], group["label"])
+
+    def test_fused_markers_do_not_swallow_plain_expert_gemm(self) -> None:
+        from llminsight.metrics.efficiency import _is_mc2_grouped_gemm_type
+        self.assertFalse(_is_mc2_grouped_gemm_type("GroupedMatmul"))
+        self.assertFalse(_is_mc2_grouped_gemm_type("MatMulV3"))
+        self.assertTrue(_is_mc2_grouped_gemm_type("AlltoAllvGroupedMatMul"))
+        self.assertTrue(_is_mc2_grouped_gemm_type(
+            "_ZN7Catccos5DGemm6Device13KernelAdapterINS0_6Kernel25"
+            "GroupedMatmulAllToAllVTlaEPh"))
 
 
 if __name__ == "__main__":

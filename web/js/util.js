@@ -56,6 +56,15 @@ const LI = (function () {
   }
   function h(html) { const d = el("div"); d.innerHTML = html; return d; }
   function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;" }[c])); }
+  // Profiler Type fields can be whole C++ symbols (Level-1 captures name the MC2
+  // fused kernels `_ZN7Catccos…EPh`, 500+ chars), which blows up table layouts.
+  // Shorten for display and keep the raw name in a title tooltip.
+  function shortOp(s, n) {
+    s = String(s == null ? "" : s); n = n || 44;
+    if (s.length <= n) return s;
+    const cut = s.lastIndexOf("_", n);          // prefer a symbol boundary
+    return s.slice(0, cut > n / 2 ? cut : n - 1) + "…";
+  }
 
   // metric card
   function metric(label, value, opts) {
@@ -101,6 +110,6 @@ const LI = (function () {
 
   function sevColor(s) { return { high:"#f85149", medium:"#d29922", low:"#58a6ff", info:"#8b949e" }[s] || "#8b949e"; }
 
-  return { api, apiPost, clearCache, fmt, el, h, esc, metric, panel, banner,
+  return { api, apiPost, clearCache, fmt, el, h, esc, shortOp, metric, panel, banner,
            chart, resizeAll, palette, axis, tooltipBase, sevColor };
 })();
