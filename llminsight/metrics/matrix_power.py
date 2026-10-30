@@ -30,6 +30,15 @@ _FUSED_MARKERS = (
     "causal_conv1d", "_attn_", "attention", "mega_moe",
 )
 
+# MC2 fused MoE kernels run a grouped GEMM and an all-to-all inside ONE recorded
+# duration, so the window is compute+communication, not pure compute.  Their
+# per-operator MFU is therefore not defined from this capture (Level-1 gives no
+# in-window phase split) and their "MBU" would divide shape bytes by a duration
+# that also contains the a2a — a lower bound at best.  Both are reported as
+# unavailable and the row is flagged as a fused window, which is what the section
+# note already promises.
+_FUSED_MC2_MARKERS = ("alltoallvgroupedmatmul", "groupedmatmulalltoallv")
+
 
 def _canonical_dtype(value: str) -> str:
     d = (value or "").strip().upper()
@@ -178,6 +187,7 @@ def compute_matrix_power(prof, efficiency=None) -> Dict[str, Any]:
         if str(record.get("Accelerator Core", "")).upper() == "AI_CPU":
             continue
         fused_moe = "mega_moe" in f"{op_type} {name}".lower()
+        fused_window = fused_moe or any(m in f"{op_type} {name}".lower() for m in _FUSED_MC2_MARKERS)
         shapes_in = parse_shapes(record.get("Input Shapes"))
         shapes_out = parse_shapes(record.get("Output Shapes")) if has_out_shapes else []
         input_dtypes = parse_dtypes(record.get("Input Data Types"))
@@ -194,9 +204,9 @@ def compute_matrix_power(prof, efficiency=None) -> Dict[str, Any]:
                 if match:
                     dtype, dtype_basis = match[1].upper(), "kernel_symbol"
                     break
-        flops = _flops(op_type, shapes_in, shapes_out) if not fused_moe else None
+        flops = _flops(op_type, shapes_in, shapes_out) if not fused_window else None
         formula_available = flops is not None
-        bytes_moved = _bytes(shapes_in, input_dtypes, shapes_out, output_dtypes, op_type) if not fused_moe else 0.0
+        bytes_moved = _bytes(shapes_in, input_dtypes, shapes_out, output_dtypes, op_type) if not fused_window else 0.0
         peak = SETTINGS.chip.peak_cube_flops(dtype)
         mac_active = None
         if fused_moe:
@@ -210,7 +220,7 @@ def compute_matrix_power(prof, efficiency=None) -> Dict[str, Any]:
         group = grouped.setdefault(label, {"label": label, "operator": op_type, "dtype": dtype,
                                            "count": 0, "dur_us": 0.0, "flops": 0.0,
                                            "bytes": 0.0, "peak_time": 0.0, "modeled_count": 0,
-                                           "fused_window": fused_moe, "proxy_count": 0})
+                                           "fused_window": fused_window, "proxy_count": 0})
         group["count"] += 1
         group["dur_us"] += duration
         group["flops"] += flops or 0.0
@@ -226,7 +236,7 @@ def compute_matrix_power(prof, efficiency=None) -> Dict[str, Any]:
                      "mbu": round(mbu, 4) if mbu is not None else None,
                      "mbu_raw": round(mbu_raw, 4) if mbu_raw is not None else None,
                      "formula_available": formula_available, "evidence_level": evidence,
-                     "fused_window": fused_moe, "mac_active_us": mac_active,
+                     "fused_window": fused_window, "mac_active_us": mac_active,
                      "dtype_basis": dtype_basis})
     if not rows:
         return {"available": False, "reason": "no matrix or matrix-heavy fused kernels"}
@@ -258,4 +268,4 @@ def compute_matrix_power(prof, efficiency=None) -> Dict[str, Any]:
             "total_dur_us": round(total_us, 1), "groups": groups, "rows": rows,
             "kernel_count": len(rows),
             "formula_coverage_pct": round(formula_rows / len(rows) * 100.0, 1),
-            "note": "MFU 分母按每个算子@dtype 对应的 CUBE 峰值。MegaMoE 的 PROXY 仅含同采集校准的 MAC/CUBE 工作量，不含 Vector；分母为完整计算/通信融合窗口，不是纯计算 MFU。缺少校准、计数器或 dtype 时保持不可用；内部通信和 MBU 未知。其它融合算子统计可由 shape 重建的矩阵工作。"}
+            "note": "MFU 分母按每个算子@dtype 对应的 CUBE 峰值。MegaMoE 的 PROXY 仅含同采集校准的 MAC/CUBE 工作量，不含 Vector；分母为完整计算/通信融合窗口，不是纯计算 MFU。MC2 融合算子（AlltoAllvGroupedMatMul / GroupedMatMulAlltoAllv）同样按融合窗口标记，其内部通信无法从本次采集拆分，故 MFU/MBU 均不可用。缺少校准、计数器或 dtype 时保持不可用；内部通信和 MBU 未知。其它融合算子统计可由 shape 重建的矩阵工作。"}

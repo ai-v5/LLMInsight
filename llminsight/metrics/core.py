@@ -154,6 +154,30 @@ def overview(prof) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+_MC2_WRAPPER_SUFFIX = "Mc2AicpuKernel"
+
+
+def _mc2_wrapper_duplicate_mask(df: "pd.DataFrame") -> "pd.Series":
+    """Flag AI_CPU ``*Mc2AicpuKernel`` rows that merely mirror a real kernel.
+
+    An MC2 fused op is recorded at two layers: the AI_CPU launcher
+    (``<op>Mc2AicpuKernel``) and the MIX_AIC kernel that actually executes, both
+    stamped with the same wall clock.  Summing both makes the operator table
+    exceed the step time and deflates every share, so the launcher row is dropped
+    — but only when its base name is also present on a non-AI_CPU core, so a
+    capture without the paired kernel keeps its data.
+    """
+    types = df["OP Type"].astype(str)
+    cores = (df["Core Type"].astype(str).str.upper()
+             if "Core Type" in df.columns else pd.Series([""] * len(df), index=df.index))
+    is_wrapper = types.str.endswith(_MC2_WRAPPER_SUFFIX) & (cores == "AI_CPU")
+    if not bool(is_wrapper.any()):
+        return is_wrapper
+    real_types = set(types[~cores.isin(["AI_CPU"])])
+    bases = types.str.slice(0, -len(_MC2_WRAPPER_SUFFIX))
+    return is_wrapper & bases.isin(real_types)
+
+
 def hotspots(prof) -> Dict[str, Any]:
     op = prof.op_statistic
     if op.empty:
@@ -161,6 +185,12 @@ def hotspots(prof) -> Dict[str, Any]:
     df = op.copy()
     df["Total Time(us)"] = num(df["Total Time(us)"])
     df["Count"] = num(df["Count"])
+    duplicate = _mc2_wrapper_duplicate_mask(df)
+    dedup_us = float(_f(df.loc[duplicate, "Total Time(us)"].sum())) if bool(duplicate.any()) else 0.0
+    dedup_types = sorted(set(df.loc[duplicate, "OP Type"].astype(str))) if dedup_us else []
+    reported_total = df["Total Time(us)"].sum()
+    if dedup_us:
+        df = df[~duplicate].copy()
     total = df["Total Time(us)"].sum()
 
     ops = [
@@ -171,7 +201,9 @@ def hotspots(prof) -> Dict[str, Any]:
             "total_us": round(_f(row["Total Time(us)"]), 1),
             "avg_us": round(_f(row.get("Avg Time(us)")), 2),
             "max_us": round(_f(row.get("Max Time(us)")), 2),
-            "ratio": round(_f(row.get("Ratio(%)")), 3),
+            # share of the de-duplicated operator total (NOT of op_statistic's raw
+            # Σ, which double counts the MC2 launcher layer and exceeds the step)
+            "ratio": round(100.0 * _f(row["Total Time(us)"]) / total, 3) if total else 0.0,
         }
         for _, row in df.iterrows()
     ]
@@ -194,6 +226,14 @@ def hotspots(prof) -> Dict[str, Any]:
         "ops": ops,
         "top": ops[:15],
         "by_core": core_rows,
+        "dedup": {
+            "excluded_us": round(dedup_us, 1),
+            "excluded_types": dedup_types,
+            "reported_total_us": round(_f(reported_total), 1),
+            "note": ("op_statistic 把 MC2 融合算子记了两层（AI_CPU 的 *Mc2AicpuKernel 启动壳 + "
+                     "真正执行的 MIX_AIC 内核，同一段墙钟）。此处剔除启动壳，占比与合计按去重后的"
+                     "算子时间计算；reported_total_us 为原始 Σ（含重复层）。"),
+        },
     }
 
 
@@ -259,8 +299,16 @@ def _fsdp_unit_counts(prof) -> Dict[str, int]:
     }
 
 
-def _classify_group_role(stats: Dict[str, Any], units: Dict[str, int]):
-    """(role, basis) for one HCCL communicator group."""
+def _classify_group_role(stats: Dict[str, Any], units: Dict[str, int],
+                         link_bytes_recorded: bool = True):
+    """(role, basis) for one HCCL communicator group.
+
+    ``link_bytes_recorded=False`` means the capture carries no HCCL link bytes at
+    all (see ``communication()``), so "this communicator moves no payload" is not
+    an observation — it is the absence of one.  In that case no role conclusion is
+    published: calling a 16/64-rank gradient communicator a "pure barrier" sends
+    the reader to the wrong bottleneck.
+    """
     types = stats.get("types") or {}
     ag = int(types.get("allGather", 0))
     rs = int(types.get("reduceScatter", 0))
@@ -292,6 +340,10 @@ def _classify_group_role(stats: Dict[str, Any], units: Dict[str, int]):
     if dense_match:
         return ("dense_fsdp",
                 f"AG/RS 次数 ({ag}/{rs}) 与 FSDP 非 expert 单元数 ({dense_ag}/{dense_rs}) 匹配")
+    if not link_bytes_recorded:
+        return ("unknown",
+                "链路字节（Transit Size/Time）整份采集未记录：无法区分「零字节 barrier」与"
+                "「未采集带宽」，本通信域不下角色结论")
     if stats.get("zero_payload_count") and stats["zero_payload_count"] == stats.get("count"):
         return "barrier", "该通信域全部算子 0 载荷（纯同步）"
     if ag or rs:
@@ -381,6 +433,12 @@ def communication(prof) -> Dict[str, Any]:
         sum(l.get("transit_mb", 0) for l in c["links"].values()) for c in comms
     )
     total_transit_ms = sum(c["transit_ms"] for c in comms)
+    # Were link bytes recorded at all?  Level-1 captures emit communication.json
+    # with every "Transit Size(MB)"/"Transit Time(ms)" at 0 — the HCCL bandwidth
+    # detail is simply not collected.  That absence must never be read as "these
+    # collectives moved no bytes": it would turn every communicator into a
+    # "pure barrier" and every op into a zero-payload diagnosis.
+    link_bytes_recorded = bool(total_transit_mb > 0.01 or total_transit_ms > 0)
     overall_bandwidth_gbps = (round(total_transit_mb / total_transit_ms, 1)
                               if total_transit_ms > 0 else None)
     overall_bandwidth_with_wait_gbps = (round(total_transit_mb / total_elapse, 1)
@@ -421,8 +479,15 @@ def communication(prof) -> Dict[str, Any]:
         g["wait_pct"] = (round(100.0 * g["_wait_ratio_sum"] / g["count"], 1)
                          if g["count"] else 0.0)
         g.pop("_wait_ratio_sum", None)
-        g["role"], g["role_basis"] = _classify_group_role(g, units)
+        g["role"], g["role_basis"] = _classify_group_role(
+            g, units, link_bytes_recorded=link_bytes_recorded)
         g["role_label"] = _COMM_ROLE_LABELS.get(g["role"], g["role"])
+        # Per-group zero-payload counts are only meaningful when transit bytes were
+        # recorded; otherwise report "unknown" rather than a fabricated 0.
+        g["zero_payload_available"] = link_bytes_recorded
+        if not link_bytes_recorded:
+            g["zero_payload_count"] = None
+            g["zero_payload_ms"] = None
         role_by_group[g["group"]] = g["role"]
         group_rows.append(g)
     group_rows.sort(key=lambda x: x["elapse_ms"], reverse=True)
@@ -542,50 +607,75 @@ def communication(prof) -> Dict[str, Any]:
     # parallel group (e.g. a 2-rank edp group doing a 0-byte allReduce per layer),
     # so their time is pure synchronization, not bandwidth.  Surfaced separately
     # because it is invisible in the bandwidth table (transit≈0 -> bandwidth N/A).
-    zero_transit_ops = [
-        c for c in comms
-        if _op_transit_mb(c) <= 0.01 and (c.get("elapse_ms") or 0.0) >= 0.05
-    ]
-    zero_transit_elapse = round(sum(c["elapse_ms"] for c in zero_transit_ops), 3)
-    zero_by_type: Dict[str, Dict[str, Any]] = {}
-    zero_by_group: Dict[str, Dict[str, Any]] = {}
-    for c in zero_transit_ops:
-        row = zero_by_type.setdefault(c["type"], {"count": 0, "elapse_ms": 0.0,
-                                                  "sync_ms": 0.0, "wait_ms": 0.0})
-        row["count"] += 1
-        row["elapse_ms"] += c["elapse_ms"]
-        row["sync_ms"] += c.get("sync_ms") or 0.0
-        row["wait_ms"] += c.get("wait_ms") or 0.0
-        if c.get("group"):
-            gr = zero_by_group.setdefault(c["group"], {"group": c["group"], "count": 0,
-                                                       "elapse_ms": 0.0, "wait_ms": 0.0})
-            gr["count"] += 1
-            gr["elapse_ms"] += c["elapse_ms"]
-            gr["wait_ms"] += c.get("wait_ms") or 0.0
-    for row in zero_by_type.values():
-        for key in ("elapse_ms", "sync_ms", "wait_ms"):
-            row[key] = round(row[key], 3)
-    zero_group_rows = []
-    for gr in zero_by_group.values():
-        gr["elapse_ms"] = round(gr["elapse_ms"], 3)
-        gr["wait_ms"] = round(gr["wait_ms"], 3)
-        gr["role"] = role_by_group.get(gr["group"], "unknown")
-        gr["role_label"] = _COMM_ROLE_LABELS.get(gr["role"], gr["role"])
-        zero_group_rows.append(gr)
-    zero_transit = {
-        "count": len(zero_transit_ops),
-        "elapse_ms": zero_transit_elapse,
-        "pct_of_comm": (round(100.0 * zero_transit_elapse / total_elapse, 2)
-                        if total_elapse else None),
-        "mean_elapse_ms": (round(zero_transit_elapse / len(zero_transit_ops), 3)
-                           if zero_transit_ops else None),
-        "by_type": zero_by_type,
-        "groups": sorted(zero_by_group.keys()),
-        "by_group": sorted(zero_group_rows, key=lambda x: -x["elapse_ms"]),
-        "note": ("Transit Size≈0 的集合通信：耗时几乎全是 wait/synchronization，"
-                 "属于并行组内的 barrier / 相位对齐占位，不是链路带宽问题。"
-                 "优先核查并行组划分（谁和谁同步）与能否合并/消除这些 0 字节 collective。"),
-    }
+    #
+    # This is only a diagnosis when the capture actually recorded link bytes for
+    # SOME op.  When not a single op carries a transit size, "0 bytes" is the
+    # profiler's default for "not collected", and reporting 全部 collective 零载荷
+    # would fabricate the finding (a Level-1 capture can read 0 for every record
+    # while the sibling MindStudio DB still holds the real transfers).
+    if not link_bytes_recorded:
+        zero_transit: Dict[str, Any] = {
+            "available": False,
+            "evidence_level": "UNAVAILABLE",
+            "count": 0,
+            "reason": ("本次采集没有记录集合通信的链路字节（communication.json 的 "
+                       "Transit Size(MB) / Transit Time(ms) 对全部算子均为 0，通常是 profiling "
+                       "level 不足 / 未开互联采集）：无法区分「零字节 barrier」与「未采集带宽」，"
+                       "因此不输出零载荷诊断，也不给出可回收结论。如需该诊断，请用更高的 "
+                       "profiler level 复采。"),
+        }
+    else:
+        zero_transit_ops = [
+            c for c in comms
+            if _op_transit_mb(c) <= 0.01 and (c.get("elapse_ms") or 0.0) >= 0.05
+        ]
+        zero_transit_elapse = round(sum(c["elapse_ms"] for c in zero_transit_ops), 3)
+        zero_by_type: Dict[str, Dict[str, Any]] = {}
+        zero_by_group: Dict[str, Dict[str, Any]] = {}
+        for c in zero_transit_ops:
+            row = zero_by_type.setdefault(c["type"], {"count": 0, "elapse_ms": 0.0,
+                                                      "sync_ms": 0.0, "wait_ms": 0.0})
+            row["count"] += 1
+            row["elapse_ms"] += c["elapse_ms"]
+            row["sync_ms"] += c.get("sync_ms") or 0.0
+            row["wait_ms"] += c.get("wait_ms") or 0.0
+            if c.get("group"):
+                gr = zero_by_group.setdefault(c["group"], {"group": c["group"], "count": 0,
+                                                           "elapse_ms": 0.0, "wait_ms": 0.0})
+                gr["count"] += 1
+                gr["elapse_ms"] += c["elapse_ms"]
+                gr["wait_ms"] += c.get("wait_ms") or 0.0
+        for row in zero_by_type.values():
+            for key in ("elapse_ms", "sync_ms", "wait_ms"):
+                row[key] = round(row[key], 3)
+        zero_group_rows = []
+        for gr in zero_by_group.values():
+            gr["elapse_ms"] = round(gr["elapse_ms"], 3)
+            gr["wait_ms"] = round(gr["wait_ms"], 3)
+            gr["role"] = role_by_group.get(gr["group"], "unknown")
+            gr["role_label"] = _COMM_ROLE_LABELS.get(gr["role"], gr["role"])
+            zero_group_rows.append(gr)
+        zero_transit = {
+            "available": True,
+            "evidence_level": "OBSERVED",
+            "count": len(zero_transit_ops),
+            "elapse_ms": zero_transit_elapse,
+            # Share of the SUMMED per-op elapse, which is a legitimate relative
+            # measure.  It is NOT a share of the step: parallel communicators
+            # overlap, so Σ(elapse) can exceed the device wall clock several times
+            # over.  Step-level exposure lives in step_trace_time.csv only.
+            "pct_of_comm": (round(100.0 * zero_transit_elapse / total_elapse, 2)
+                            if total_elapse else None),
+            "mean_elapse_ms": (round(zero_transit_elapse / len(zero_transit_ops), 3)
+                               if zero_transit_ops else None),
+            "by_type": zero_by_type,
+            "groups": sorted(zero_by_group.keys()),
+            "by_group": sorted(zero_group_rows, key=lambda x: -x["elapse_ms"]),
+            "note": ("Transit Size≈0 的集合通信：耗时几乎全是 wait/synchronization，"
+                     "属于并行组内的 barrier / 相位对齐占位，不是链路带宽问题。"
+                     "优先核查并行组划分（谁和谁同步）与能否合并/消除这些 0 字节 collective。"
+                     "elapse_ms 是逐 op 累计值（多并行组区间重叠），不是 step 墙钟。"),
+        }
 
     # msprof: device-level effective-transfer vs cross-rank-wait split (None on
     # torch_npu, whose communication.json already carries Transit/Wait per op).
@@ -597,6 +687,7 @@ def communication(prof) -> Dict[str, Any]:
                 "Wait/Synchronization 为卡间等待，不计入去等待带宽分母。")
     else:
         note = ("本采集 Transit≈0：communication.json 无可用传输字节，平均/去等待带宽均 N/A；"
+                "零载荷诊断与通信域角色一并停用（0 字节是「未采集」而不是「不搬数据」）。"
                 "若存在 MindStudio DB，则用 device 子任务分解等待与有效传输时间，但不能反推真实链路带宽。")
 
     return {
@@ -608,6 +699,10 @@ def communication(prof) -> Dict[str, Any]:
         "overall_wait_pct": round(mean_wait_ratio * 100, 1),
         "total_transit_mb": round(total_transit_mb, 3),
         "total_transit_ms": round(total_transit_ms, 3),
+        # False when no op carries transit bytes: bandwidth / zero-payload / group
+        # role are then data-absent, not measured. Consumers must degrade, not
+        # interpret 0 bytes as a physical fact.
+        "transit_collected": link_bytes_recorded,
         # overall 有效带宽 (None when transit≈0); per-category in by_type[].bandwidth_gbps
         "overall_bandwidth_gbps": overall_bandwidth_gbps,
         "overall_bandwidth_with_wait_gbps": overall_bandwidth_with_wait_gbps,
@@ -694,7 +789,9 @@ def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None) ->
             "key": "comm_not_overlapped", "domain": "device",
             "label": "通信未掩盖 (Not Overlapped)",
             "us": round(comm_no, 1),
-            "detail": f"未掩盖通信 {comm_no:,.0f}us 直接计入 step；集合通信 Wait 总量 {comm_wait_ms*1000.0:,.0f}us（其余与计算重叠）；kernel Wait {kernel_wait_us:,.0f}us",
+            "detail": f"未掩盖通信 {comm_no:,.0f}us 直接计入 step；集合通信 Wait 合计 {comm_wait_ms*1000.0:,.0f}us "
+                      "（Σ 逐 op 累计口径：多个并行域的区间互相重叠，不等于 step 墙钟）；"
+                      f"kernel Wait {kernel_wait_us:,.0f}us",
             "source": "step_trace + communication.json + kernel_details",
             "suggestion": "扩大计算-通信重叠（moe-fb-overlap / 异步通信），减少同步点。",
         },
@@ -707,10 +804,16 @@ def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None) ->
             "suggestion": "定位空泡来源（同步等待 vs 下发不及时），与等待/下发联合优化。",
         },
         {
-            "key": "format_init", "domain": "device",
-            "label": "格式转换 / 内存初始化 (Cast/ZerosLike/TensorMove)",
+            # format_init (Cast / ZerosLike / TensorMove / Concat / Slice) is device
+            # compute that ALREADY lives inside Computing.  It is shown as a lens for
+            # "how much of the compute is format/init work", never summed into the
+            # hidden-overhead total.
+            "key": "format_init", "domain": "device", "additive": False,
+            "label": "格式转换 / 内存初始化 (Cast/ZerosLike/TensorMove · 已含在 Computing 内)",
             "us": round(cast_init, 1),
-            "detail": f"device 侧 Cast/ZerosLike/TensorMove/Concat/Slice {cast_init:,.0f}us",
+            "detail": f"device 侧 Cast/ZerosLike/TensorMove/Concat/Slice {cast_init:,.0f}us"
+                      "（这部分时间已包含在 Computing 内，仅作构成视角，不并入 Device 合计，"
+                      "否则会把正常计算重复算成隐性开销）",
             "source": "op_statistic",
             "suggestion": "算子融合 / 内存复用 / 减少不必要的 dtype 转换与拷贝。",
         },
@@ -794,6 +897,12 @@ def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None) ->
 
 # --------------------------------------------------------------------------- #
 _MODULE_RULES = [
+    # MC2 fused dispatch/combine GEMMs.  They carry both the expert GEMM and the
+    # all-to-all inside one window, so they get their own module instead of
+    # falling through to the Elementwise/Other residual (which used to swallow the
+    # whole fused window and made "MoE-Dispatch (alltoallv) = 0" look plausible).
+    ("MoE fused dispatch/combine (GEMM+comm)",
+     ["AlltoAllvGroupedMatMul", "GroupedMatMulAlltoAllv"]),
     ("MoE-Experts", ["GroupedMatmul", "GroupedMatmulAdd", "SwiGlu", "SwiGluGrad",
                       "ScatterAdd", "InplaceIndexAdd", "ScatterElementsV2",
                       "GatherElements"]),
@@ -878,10 +987,15 @@ def attribution(prof) -> Dict[str, Any]:
 
     # MoE专属：专家计算 vs 分发通信
     moe_compute = assigned.get("MoE-Experts", 0.0)
+    mc2_fused = assigned.get("MoE fused dispatch/combine (GEMM+comm)", 0.0)
     moe_focus = {
         "expert_compute_us": round(moe_compute, 1),
         "dispatch_comm_us": round(comm_moe, 1),
         "fused_expert_window_us": round(fused_us, 1),
+        # MC2 dispatch/combine windows: expert GEMM and the a2a share one duration,
+        # so they cannot be split from this capture and are NOT added to
+        # dispatch_comm_us (which only counts standalone alltoallv ops).
+        "fused_dispatch_combine_us": round(mc2_fused, 1),
     }
 
     return {
@@ -894,6 +1008,9 @@ def attribution(prof) -> Dict[str, Any]:
         "note": (
             "按算子命名启发式归因，基于 device 计算时间；GEMM/Projections 为 Attention 投影 / Router / "
             "LM-Head 共用未细分。MoE fused 为包含内部通信的完整窗口，不能解释为纯计算。"
+            "MC2 融合算子（AlltoAllvGroupedMatMul / GroupedMatMulAlltoAllv）的 all-to-all 在算子内部，"
+            "不会出现在 communication.json 里，因此其 dispatch/combine 时间单列为"
+            "「MoE fused dispatch/combine」窗口，既不进 Elementwise，也不计入外部通信。"
             "外部通信单独列出，不与融合窗口相加。"
         ),
     }

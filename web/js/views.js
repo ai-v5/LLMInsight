@@ -503,8 +503,16 @@
     const waByRole = Array.isArray(waitAttr.by_role) ? waitAttr.by_role : [];
     const bwNum = v => (v == null ? "—" : (+v).toFixed(1));
     const gbText = v => (v == null ? "—" : (+v).toFixed(2) + " GB");
+    // Level-1 captures ship communication.json with every Transit Size/Time at 0:
+    // the HCCL bandwidth detail was never collected.  That is "unknown", not
+    // "these collectives move no bytes", so all payload/zero-payload claims must
+    // degrade instead of printing a physical 0.  Backend flag; older payloads
+    // omit it, in which case the historical rendering is kept.
+    const transitCollected = cm.transit_collected !== false;
+    const notCollected = '<span style="color:var(--text-dim)">未采集</span>';
     // 0 字节集合通信：显式标注"仅 barrier"，不显示成 0.0 GB/s 的伪带宽
     const payload = v => (v == null ? "—"
+      : (!transitCollected) ? '<span style="color:var(--text-dim)">未采集</span>'
       : (+v) <= 0.001 ? '<span style="color:var(--warn)">0 字节（仅 barrier）</span>'
       : (+v).toFixed(2) + " GB");
     const groupsText = xs => (Array.isArray(xs) ? xs : []).join("、") || "—";
@@ -577,18 +585,28 @@
         .sort((x, y) => (g.types[y] || 0) - (g.types[x] || 0))
         .map(k => `${esc(k)}×${fmt.int(g.types[k])}`).join("、");
       const zero = (g.zero_payload_count || 0) > 0;
-      return `<tr><td class="mono">${esc(g.group)}</td><td${g.role_basis ? ` title="${esc(g.role_basis)}"` : ""}>${roleLabel(g.role)}</td><td>${fmt.int(g.count)}</td><td>${types || "—"}</td><td>${fmt.ms(g.elapse_ms)}</td><td>${gbText(g.size_gb)}</td><td>${fmt.ms(g.wait_ms)}</td><td>${bw(g.bandwidth_gbps)}</td><td>${bw(g.bandwidth_with_wait_gbps)}</td><td>${zero ? `<span style="color:var(--warn)">${fmt.int(g.zero_payload_count)} 次 / ${fmt.ms(g.zero_payload_ms)}</span>` : fmt.int(g.zero_payload_count)}</td></tr>`;
+      const zeroCell = (g.zero_payload_available === false)
+        ? notCollected
+        : (zero ? `<span style="color:var(--warn)">${fmt.int(g.zero_payload_count)} 次 / ${fmt.ms(g.zero_payload_ms)}</span>` : fmt.int(g.zero_payload_count));
+      const groupTransit = (g.size_gb == null || !transitCollected) ? "—" : gbText(g.size_gb);
+      return `<tr><td class="mono">${esc(g.group)}</td><td${g.role_basis ? ` title="${esc(g.role_basis)}"` : ""}>${roleLabel(g.role)}</td><td>${fmt.int(g.count)}</td><td>${types || "—"}</td><td>${fmt.ms(g.elapse_ms)}</td><td>${groupTransit}</td><td>${fmt.ms(g.wait_ms)}</td><td>${bw(g.bandwidth_gbps)}</td><td>${bw(g.bandwidth_with_wait_gbps)}</td><td>${zeroCell}</td></tr>`;
     }).join("");
     const zt = cm.zero_transit || {};
+    const ztAvailable = zt.available !== false;
     const ztGroups = Array.isArray(zt.groups) ? zt.groups : [];
     const ztByGroup = Array.isArray(zt.by_group) ? zt.by_group : [];
     const ztLine = ztByGroup.length
       ? ztByGroup.map(z => `通信域 ${esc(z.group)}：${fmt.int(z.count)} 次 / ${fmt.ms(z.elapse_ms)}`).join("；")
       : ztGroups.map(g => `通信域 ${esc(g)}`).join("；");
+    const ztNote = (!ztAvailable)
+      ? `<div class="note" style="color:var(--text-dim)">零载荷诊断不可用：${esc(zt.reason || "本次采集未记录链路字节")}</div>`
+      : (ztLine ? `<div class="note">零载荷（barrier-only）集合通信：${ztLine} —— 不搬字节，优化方向是减少同步次数 / 合并并行组，而不是链路带宽。累计值是多并行组重叠的逐 op 求和，不是 step 墙钟。</div>` : "");
     const groupPanel = byGroup.length ? panel("按通信域（HCCL communicator）",
-      "有效带宽 = Σ流量 ÷ Σ Transit Time；零载荷 = 不搬字节的 barrier 型 collective",
+      transitCollected
+        ? "有效带宽 = Σ流量 ÷ Σ Transit Time；零载荷 = 不搬字节的 barrier 型 collective"
+        : "本次采集未记录链路字节（Transit≈0）：流量 / 带宽 / 零载荷 / 角色均无法判定",
       `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>通信域</th><th>角色</th><th>算子数</th><th>主要算子</th><th>Elapse</th><th>流量</th><th>等待</th><th>有效带宽</th><th>含等待带宽</th><th>零载荷</th></tr></thead><tbody>${groupRows}</tbody></table></div>
-      ${ztLine ? `<div class="note">零载荷（barrier-only）集合通信：${ztLine} —— 不搬字节，优化方向是减少同步次数 / 合并并行组，而不是链路带宽。</div>` : ""}`) : "";
+      ${ztNote}`) : "";
 
     const waTopRows = waTop.slice(0, 10).map(raw => {
       const t = raw || {};
@@ -611,7 +629,7 @@
     const contractHtml = `${contractCardsHtml}${cmpGrid || ""}${groupPanel}${waitPanel}`;
 
     const rows = cm.by_type.map(t =>
-      `<tr><td>${esc(t.type)}</td><td>${fmt.int(t.count)}</td><td>${fmt.ms(t.elapse_ms)}</td><td>${fmt.ms(t.wait_ms)}</td><td>${fmt.pct(t.wait_pct)}</td><td>${fmt.ms(t.transit_ms)}</td><td>${t.transit_mb.toFixed(1)} MB</td><td>${bw(t.bandwidth_with_wait_gbps)}</td><td>${bw(t.bandwidth_gbps)}</td></tr>`).join("");
+      `<tr><td>${esc(t.type)}</td><td>${fmt.int(t.count)}</td><td>${fmt.ms(t.elapse_ms)}</td><td>${fmt.ms(t.wait_ms)}</td><td>${fmt.pct(t.wait_pct)}</td><td>${fmt.ms(t.transit_ms)}</td><td>${transitCollected ? t.transit_mb.toFixed(1) + " MB" : "未采集"}</td><td>${bw(t.bandwidth_with_wait_gbps)}</td><td>${bw(t.bandwidth_gbps)}</td></tr>`).join("");
     const topRows = cm.top.slice(0, 12).map(t =>
       `<tr><td class="mono">${esc(t.name)}</td><td>${esc(t.type)}</td><td>${fmt.ms(t.elapse_ms)}</td><td>${fmt.pct(t.wait_ratio * 100)}</td><td>${bw(t.bandwidth_with_wait_gbps)}</td><td>${bw(t.bandwidth_gbps)}</td></tr>`).join("");
     // msprof: effective-transfer vs cross-rank-wait split (device HCCL sub-tasks)
@@ -627,10 +645,10 @@
     root.innerHTML = `
       <div class="grid cols-4">
         ${metric("集合通信次数", fmt.int(cm.count))}
-        ${metric("总 Elapse", fmt.ms(cm.total_elapse_ms), { foot: "wall-clock" })}
-        ${metric("平均等待占比", fmt.pct(cm.overall_wait_pct), { tone: "bad", barPct: cm.overall_wait_pct })}
-        ${metric("平均带宽(含等待)", cm.overall_bandwidth_with_wait_gbps != null ? cm.overall_bandwidth_with_wait_gbps + " GB/s" : "—", { foot: cm.overall_bandwidth_with_wait_gbps != null ? "Σ Transit ÷ Σ Elapse" : "采集未记录链路带宽（Transit≈0）" })}
-        ${metric("有效带宽(去等待)", cm.overall_bandwidth_gbps != null ? cm.overall_bandwidth_gbps + " GB/s" : "—", { foot: cm.overall_bandwidth_gbps != null ? "Σ Transit ÷ Σ Transit Time" : "采集未记录链路带宽（Transit≈0）", tone: cm.overall_bandwidth_gbps != null ? "good" : undefined })}
+        ${metric("总 Elapse", fmt.ms(cm.total_elapse_ms), { foot: "Σ 逐 op 累计（多并行域重叠，非墙钟）" })}
+        ${metric("平均等待占比", fmt.pct(cm.overall_wait_pct), { tone: "bad", barPct: cm.overall_wait_pct, foot: "每 op wait/elapse 均值" })}
+        ${metric("平均带宽(含等待)", cm.overall_bandwidth_with_wait_gbps != null ? cm.overall_bandwidth_with_wait_gbps + " GB/s" : "—", { foot: cm.overall_bandwidth_with_wait_gbps != null ? "Σ Transit ÷ Σ Elapse" : "链路字节未采集（Transit≈0）" })}
+        ${metric("有效带宽(去等待)", cm.overall_bandwidth_gbps != null ? cm.overall_bandwidth_gbps + " GB/s" : "—", { foot: cm.overall_bandwidth_gbps != null ? "Σ Transit ÷ Σ Transit Time" : "链路字节未采集（Transit≈0）", tone: cm.overall_bandwidth_gbps != null ? "good" : undefined })}
       </div>
       ${contractHtml}
       ${bdHtml}

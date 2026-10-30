@@ -24,7 +24,7 @@
 | # | id | 严重度 | 类别 | 触发条件（要点） | 置信 |
 |---|---|---|---|---|---|
 | 1 | `comm_not_overlapped` | high | 通信 | 未掩盖通信 ≥10% 或 重叠率 <40% | 0.9 |
-| 1b | `comm_zero_transit` | medium | 通信 | 零载荷（Transit≈0）collective 占通信 ≥5% 或 step ≥3%——并行组内 barrier/相位对齐占位 | 0.6 |
+| 1b | `comm_zero_transit` | medium | 通信 | 零载荷（Transit≈0）collective 占**集合通信累计 elapse** ≥5%——并行组内 barrier/相位对齐占位。仅在采集记录了链路字节时成立；收益上界取 `step_trace` 的未掩盖通信占比，逐 op 累计值不作 step 占比 | 0.6 |
 | 2 | `aicpu_dispatch` | high | 通信 | `HcclLaunchAicpuKernel` 占比 ≥10%（AICPU 驱动的集合通信执行，≈通信本身、非下发延迟） | 0.85 |
 | 3/11 | `capture_blocking` | high | 采集体检 | 反推 blocking=True（Synchronize/launch 次数比 >0.5）——异步下发时**不命中** | 1.0 |
 | 3b | `host_sync_stall` | medium | 等待·同步 | 非 blocking 但 `aclrtSynchronizeStream` 占 host API ≥20%（根因：动态 shape 的 D2H 同步，如 `aclnnMaskedSelect`） | 0.8 |
