@@ -82,8 +82,14 @@ def _expert_gemm_anchors(kd) -> Dict[str, Any]:
         source_ops.add(str(record.get("Type")))
         # Expert weights appear as a 3-D [G, K, N] operand: either the input of a
         # forward grouped GEMM or the output of its weight-gradient counterpart.
-        weight = next((s for s in shapes_out if len(s) == 3), None) \
-            or next((s for s in shapes_in if len(s) == 3), None)
+        # A grouped op can also carry a 3-D *activation*; its trailing dims repeat
+        # another operand's trailing dims, so those candidates are skipped first
+        # (a wrong, smaller "weight" would publish a too-low MFU without tripping
+        # the above-peak guard).
+        three_d = [s for s in shapes_out if len(s) == 3] + [s for s in shapes_in if len(s) == 3]
+        operand_tails = {tuple(s[-2:]) for s in (shapes_in + shapes_out) if len(s) == 2}
+        weight = next((s for s in three_d if tuple(s[1:]) not in operand_tails), None) \
+            or (three_d[0] if three_d else None)
         if weight:
             _, k, n = weight
             if k and n:

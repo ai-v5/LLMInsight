@@ -367,6 +367,22 @@ class FusedMc2EstimateTests(unittest.TestCase):
             self.assertIsNone(group["mfu"])
             self.assertNotEqual(group["evidence_level"], "ESTIMATED")
 
+    def test_anchor_prefers_the_expert_weight_over_a_3d_activation(self) -> None:
+        """A 3-D activation repeats a 2-D operand's tail; that must not become K,N."""
+        import pandas as pd
+        from llminsight.metrics.matrix_power import _expert_gemm_anchors
+
+        frame = pd.DataFrame([{
+            "Type": "GroupedMatmul",
+            "Input Shapes": '"1024,2048;4,2048,4096"',
+            "Output Shapes": '"4,1024,2048;4,512,1024"',
+            "Input Data Types": "DT_BF16;DT_BF16",
+        }])
+        anchors = _expert_gemm_anchors(frame)
+        self.assertEqual(anchors["rows"], 1024)
+        # [4,1024,2048] trails the activation shape [1024,2048] -> skipped as weight
+        self.assertEqual(anchors["contracts"], [(512, 1024)])
+
     def test_anchor_implying_above_peak_fails_closed(self) -> None:
         """A wrong anchor (too many rows / wrong operand) must not publish an MFU."""
         from types import SimpleNamespace
