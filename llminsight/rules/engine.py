@@ -114,30 +114,38 @@ def run_rules(m: Dict[str, Any], capture: Optional[Dict[str, Any]] = None) -> Li
     # 1b. zero-payload collectives: barriers / phase alignment, not bandwidth.
     #     (Real case: 17 zero-byte allReduce ops in a {r, r+128} edp group cost
     #     ~1 s of a 4.7 s step; a bandwidth table cannot see transit≈0.)
+    #
+    #     Scoping caveat that used to be wrong here: ``zero_transit.elapse_ms`` is
+    #     the SUM of per-op intervals.  Parallel communicators overlap, so that sum
+    #     is not wall clock and dividing it by the step publishes a share that can
+    #     exceed the true not-overlapped communication by an order of magnitude.
+    #     The recoverable bound therefore comes from step_trace_time.csv only.
     zt = comm.get("zero_transit") or {}
-    if zt.get("count"):
-        stage_ms = (us.get("stage") or 0) / 1000.0
-        pct_step = round(100.0 * zt["elapse_ms"] / stage_ms, 2) if stage_ms else None
+    if zt.get("available", bool(zt.get("count"))) and zt.get("count"):
         pct_comm = zt.get("pct_of_comm")
+        cno = round(float(ratios.get("comm_not_overlapped_pct", 0) or 0), 2)
         zt_types = "、".join(
             f"{k}×{v['count']}"
             for k, v in sorted((zt.get("by_type") or {}).items(),
                                key=lambda kv: -kv[1]["elapse_ms"])[:3])
-        if (pct_comm or 0) >= 5 or (pct_step or 0) >= 3:
+        if (pct_comm or 0) >= 5:
             cards.append(_card(
                 "comm_zero_transit", "medium", "通信",
-                f"零载荷集合通信占通信时间 {pct_comm}%（{zt['count']} 次，约 "
-                f"{zt['elapse_ms']/1000:.2f}s/step，step 的 {pct_step}%）：并行组内 barrier/相位对齐",
+                f"零载荷集合通信占集合通信累计时长 {pct_comm}%（{zt['count']} 次，"
+                f"Σ {zt['elapse_ms']/1000:.2f}s，非 wall-clock）：并行组内 barrier/相位对齐",
                 f"这些 op 的 Transit Size≈0（{zt_types}），耗时几乎全是 wait/synchronization；"
                 "常见来源是某一并行维度进程组内部每层插入的 0 字节 allReduce/allGather，"
-                "等价于跨组同步点——表观上是通信，本质是同步占位，带宽表里看不出问题。",
+                "等价于跨组同步点——表观上是通信，本质是同步占位，带宽表里看不出问题。"
+                f"注意 Σ 是逐 op 累计时长（多个并行域区间互相重叠），不等于 step 墙钟："
+                f"本 step 未掩盖通信仅占 {cno}%，通信总墙钟见总览页。",
                 "核对还原这些 collective 的并行组与 rank 映射（打印 HCCL group / mesh 维度）；"
                 "能合并的同步点合并进相邻梯度归约，确认是否可由 reduceScatter/allGather 一并完成；"
                 "检查 HCCL 版本/算法是否产生 0 字节占位，以及并行组划分是否把同步放到了关键路径。",
-                f"若消除/合并，最多回收 step 的 {pct_step or 0:.1f}%（上界，必要同步点仍需保留）。",
+                f"收益上界 = step 的未掩盖通信 {cno}%（若这些 op 已被计算掩盖则收益为 0）；"
+                "逐 op 累计时长不能当作可回收量。",
                 0.6,
                 {"count": zt["count"], "elapse_ms": zt["elapse_ms"],
-                 "pct_of_comm": pct_comm, "pct_of_step": pct_step,
+                 "pct_of_comm": pct_comm, "comm_not_overlapped_pct": cno,
                  "by_type": zt.get("by_type")},
             ))
 

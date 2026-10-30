@@ -24,6 +24,7 @@
 读 `op_statistic.csv`：
 - **Top 榜**：按 `Total Time(us)` 降序（HcclLaunchAicpuKernel ~28%、GroupedMatmul、MatMulV3、FlashAttention 前后向、GemmV3…）。
 - **按 Core 类型聚合**：AI_CORE / AI_VECTOR_CORE / MIX_AIC / **AI_CPU**，一眼看出 AI_CPU（通信下发）占比异常。
+- **MC2 启动壳去重**：MC2 融合算子会记两层——AI_CPU 的 `<op>Mc2AicpuKernel` 启动壳与真正执行的 MIX_AIC 内核，两者是**同一段墙钟**。启动壳被剔除（仅当同名内核也出现在非 AI_CPU 核上），`total_us` 与 `ratio` 按去重后的算子时间计算，并在 `dedup` 里给出被剔除量与原始 Σ，否则合计会超过 step 时间、每条占比都被系统性低估。
 
 ## 4.3 efficiency · MFU / MBU / Roofline（H5 核心）
 
@@ -84,6 +85,8 @@ bound = "compute" if t_compute >= t_mem else "memory"
 读归一化后的集合通信：
 - **按类型聚合** elapse / wait / sync / transit，并算**等待占比**。等待占比用「每算子 wait/elapse 比率的均值」（`overall_wait_pct`），**避免** ∑wait / ∑elapse 产生的 >100% 假象。
 - 单卡现象：集合通信几乎全为 Wait/Synchronization，Transit≈0、带宽≈0 → 通信时间以「等待对端」为主，真实链路带宽需多卡数据。
+- **`elapse_ms` 是逐 op 累计值，不是墙钟**：多个并行域的通信区间互相重叠，Σ(elapse) 可以显著超过设备侧通信墙钟（那要取 `step_trace_time.csv` 的 `Communication`）。因此本板块只把 Σ 用作**相对**度量（如「该类型占累计 elapse 的比例」），不用它除以 step 时间。
+- **`transit_collected`**：整份采集是否记录了链路字节（任一算子 `Transit Size/Time` 为正）。为 `false` 时（常见于低 profiler level）说明带宽信息**未采集**——此时 `zero_transit.available=false` 并给出原因，`by_group[].role` 不下结论、`zero_payload_available=false`。把"全 0 字节"读成"全部是零载荷 barrier"会凭空造出一个占大量 step 的假诊断。
 
 ## 4.5 hidden_overhead · 隐性开销分桶（H6）
 
@@ -94,7 +97,7 @@ bound = "compute" if t_compute >= t_mem else "memory"
 | AICPU 集合通信执行（同段，不计入合计） | device | op_statistic (AI_CPU) | `HcclLaunchAicpuKernel` 占 28%，≈ Communication 的 72% |
 | 通信未掩盖 | device | step_trace + comm + kernel | 直接计入 step |
 | 空泡 / Free | device | step_trace | ≈18.56% |
-| 格式转换 / 内存初始化 | device | op_statistic | Cast/ZerosLike/TensorMove |
+| 格式转换 / 内存初始化（已含在 Computing 内，不计入合计） | device | op_statistic | Cast/ZerosLike/TensorMove |
 | Host Kernel Launch | host | api_statistic | launch 类累计 |
 | Host 同步阻塞 | host | api_statistic | `aclrtSynchronize*`（被 blocking 放大） |
 | 动态 shape 抖动 | host | api_statistic | MaskedSelect/NonZero，max 166ms |
@@ -103,6 +106,8 @@ bound = "compute" if t_compute >= t_mem else "memory"
 > **口径警示**：host 与 device 时间**不可直接相加**（部分并发 / 被 blocking 放大）。device 桶与 step 同口径可比；host 桶反映下发 / 同步压力。用于「相对量级与归因」。
 >
 > **避免重复计入**：`HcclLaunchAicpuKernel` 是 AICPU 展开模式下驱动集合通信的 AI_CPU 算子。其设备时长可能覆盖 collective 执行或等待，不应直接当作内核启动延迟。它与通信分解可能是同一时段的两种视角，标记为 `additive:false`，不并入 Device 合计；具体等待与传输比例由当前采集核对。
+>
+> `format_init`（Cast/ZerosLike/TensorMove/Concat/Slice）同理标记为 `additive:false`：它是 device 计算且**已经包含在 `Computing` 内**，只作构成视角，并入合计会把正常计算重复算成隐性开销。
 
 ## 4.6 attribution · 模型结构归因（H3）
 
@@ -110,6 +115,7 @@ bound = "compute" if t_compute >= t_mem else "memory"
 
 | 模块 | 代表算子 |
 |---|---|
+| MoE fused dispatch/combine（GEMM+comm） | AlltoAllvGroupedMatMul, GroupedMatMulAlltoAllv |
 | MoE-Experts | GroupedMatmul, SwiGlu, ScatterAdd… |
 | MoE-Router | TopKV2, Sigmoid, Sort, Cumsum… |
 | Attention-MLA | FlashAttentionScore(Grad), RotaryPositionEmbedding… |
@@ -119,6 +125,7 @@ bound = "compute" if t_compute >= t_mem else "memory"
 | GEMM/Projections（共用） | MatMulV3, GemmV3, BatchMatMul |
 
 - **排除通信下发算子**（AI_CPU / HCCL 前缀），否则 676k us 会污染 Elementwise。
+- **MC2 融合算子单列**：`AlltoAllvGroupedMatMul` / `GroupedMatMulAlltoAllv` 的 all-to-all 在算子内部，不出现于 `communication.json`，因此归到自己的模块而不是 Elementwise 残差（也不计入外部通信），并在 `moe_focus.fused_dispatch_combine_us` 暴露；否则会出现「Elementwise 占比异常高 + MoE-Dispatch=0」的自相矛盾结论。
 - **通信单独列出**（MoE-Dispatch alltoallv vs TP/SP/DP），为 wall-clock（多为等待），**不并入计算环**以免混口径。
 - **MoE 专项**：专家计算（GroupedMatmul）vs 分发通信（alltoallv）占比。
 

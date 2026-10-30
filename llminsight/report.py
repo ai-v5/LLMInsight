@@ -551,9 +551,14 @@ def _sec_hotspots(hot: Dict) -> str:
                   _us(b.get("total_us")), _pct(b.get("pct"))]
                  for b in (hot.get("by_core") or [])]
     core_tbl = _table(["Core 类型", "次数", "总耗时", "占比"], core_rows)
+    dedup = hot.get("dedup") or {}
+    dedup_note = ""
+    if dedup.get("excluded_us"):
+        dedup_note = (f"；已剔除 MC2 启动壳重复层 {_us(dedup.get('excluded_us'))}"
+                      f"（原始 Σ {_us(dedup.get('reported_total_us'))}）")
     return _panel(
         "算子热点 Top 15",
-        f"算子总耗时 {_us(hot.get('total_us'))}（含 AICPU 集合通信执行）",
+        f"算子总耗时 {_us(hot.get('total_us'))}（已去重；含 AICPU 集合通信执行）{dedup_note}",
         f'<div class="two-col"><div>{tbl}</div>'
         f'<div><div class="mini-h">按 Core 类型聚合</div>{core_tbl}</div></div>')
 
@@ -652,7 +657,10 @@ def _sec_communication(comm: Dict) -> str:
     note = f'<div class="note">{_e(comm.get("note", ""))}</div>'
     zt = comm.get("zero_transit") or {}
     zt_note = ""
-    if zt.get("count"):
+    if not zt.get("available", bool(zt.get("count"))):
+        if zt.get("reason"):
+            zt_note = f'<div class="note"><b>零载荷诊断不可用</b>：{_e(zt.get("reason", ""))}</div>'
+    elif zt.get("count"):
         by_type = "、".join(f"{k}×{v.get('count')}"
                             for k, v in sorted((zt.get("by_type") or {}).items(),
                                                key=lambda kv: -kv[1].get("elapse_ms", 0))[:4])
@@ -661,7 +669,8 @@ def _sec_communication(comm: Dict) -> str:
                    f'占通信 Elapse {_pct(zt.get("pct_of_comm"))}（{_e(by_type)}）；'
                    f'平均单次 {zt.get("mean_elapse_ms", 0):.1f}ms，时间几乎全是 '
                    f'wait/synchronization——属于并行组内 barrier / 相位对齐占位，'
-                   f'不是链路带宽问题。</div>')
+                   f'不是链路带宽问题。累计值是多并行组重叠的逐 op 求和，'
+                   f'不是 step 墙钟，不能当作可回收量。</div>')
     return _panel("通信分析", sub, tbl + bd_note + zt_note + note)
 
 
@@ -685,8 +694,9 @@ def _sec_hidden(ho: Dict) -> str:
                  rows, align=["l", "c", "r", "l"])
     sub = (f"Device 合计 {_us(ho.get('device_total_us'))}（与 step 同口径）· "
            f"Host 合计 {_us(ho.get('host_total_us'))}（反映下发/同步压力，不与 device 相加）")
-    note = ('<div class="note">* AICPU 集合通信执行与「未掩盖通信」为同一段时间，'
-            '仅作算子视角，不并入 Device 合计（避免重复计入）。</div>')
+    note = ('<div class="note">* 标记项已含在别的口径里、不并入合计：'
+            'AICPU 集合通信执行与「未掩盖通信」为同一段时间；'
+            '格式转换/内存初始化是 Computing 的子集。</div>')
     return _panel("隐性开销总账", sub, tbl + note)
 
 
@@ -703,7 +713,9 @@ def _sec_attribution(attr: Dict) -> str:
     moe_line = (f'<div class="note">MoE 专属：专家计算 (GroupedMatmul) '
                 f'{_us(moe.get("expert_compute_us"))} vs 分发通信 (alltoallv) '
                 f'{_us(moe.get("dispatch_comm_us"))}；融合 MoE 窗口 '
-                f'{_us(moe.get("fused_expert_window_us"))}（含内部通信，不与外部通信相加）。</div>')
+                f'{_us(moe.get("fused_expert_window_us"))}（含内部通信，不与外部通信相加）；'
+                f'MC2 融合 dispatch/combine 窗口 {_us(moe.get("fused_dispatch_combine_us"))}'
+                f'（GEMM 与 a2a 同一段时长，无法拆分，故不计入上面的外部通信）。</div>')
     return _panel(
         "模型结构归因",
         "按算子命名启发式归因到 Attention / MoE / Norm / Optimizer 等（基于 device 计算时间）",
