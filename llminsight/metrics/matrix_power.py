@@ -257,13 +257,27 @@ def _estimate_fused_mc2(mc2_groups: List[Dict[str, Any]], anchor: Dict[str, Any]
             f"{rows_per_call:,}；共 {pairs} 次调用。GEMM 工作量按各算子占融合窗口的时长份额"
             "分摊（窗口内计算/通信不可拆），dtype 取自同层专家 GEMM。分母含内部 a2a，"
             "故为「融合窗口等效 MFU」= 纯计算 MFU 的下界。"
+            + ("（该锚点推断出的吞吐超过物理峰值 → 锚点不可信，MFU 保持不可用。）"
+               if equivalent_mfu > 1.02 else "")
         ),
     }
 
 
 def _apply_fused_mc2(mc2_groups: List[Dict[str, Any]], rows: List[Dict[str, Any]],
                      estimate: Dict[str, Any]) -> None:
-    """Attach the fused-window estimate to the MC2 groups and their kernels."""
+    """Attach the fused-window estimate to the MC2 groups and their kernels.
+
+    Fail closed like the rest of the MFU layer: an anchor that implies more work
+    than the device can physically execute means the anchor is wrong (wrong dtype,
+    wrong routed-row count, a 3-D operand mistaken for the expert weight), so the
+    MFU stays unavailable and only the reconstruction note is published.
+    """
+    if estimate.get("above_peak"):
+        for item in mc2_groups:
+            if item["dtype"] == "UNKNOWN":
+                item["dtype"] = estimate["dtype"]
+            item["fused_estimate"] = {"flops": None, "mfu": None, "basis": estimate["basis"]}
+        return
     total_flops = estimate["total_flops"]
     total_dur_us = estimate["total_dur_us"]
     peak = SETTINGS.chip.peak_cube_flops(estimate["dtype"])
@@ -416,7 +430,7 @@ def compute_matrix_power(prof, efficiency=None) -> Dict[str, Any]:
                                  else (round(item["flops"], 1)
                                        if item["modeled_count"] and (complete or not item["fused_window"])
                                        else None)),
-                       "evidence_level": ("ESTIMATED" if estimate else
+                       "evidence_level": ("ESTIMATED" if estimate.get("mfu") is not None else
                                           "PROXY" if complete and item["proxy_count"] else
                                           "FORMULA" if complete else "UNAVAILABLE"),
                        "fused_window": item["fused_window"],

@@ -367,6 +367,27 @@ class FusedMc2EstimateTests(unittest.TestCase):
             self.assertIsNone(group["mfu"])
             self.assertNotEqual(group["evidence_level"], "ESTIMATED")
 
+    def test_anchor_implying_above_peak_fails_closed(self) -> None:
+        """A wrong anchor (too many rows / wrong operand) must not publish an MFU."""
+        from types import SimpleNamespace
+        from llminsight.metrics.matrix_power import compute_matrix_power
+
+        kd = self.prof.kernel_details.copy()
+        # 1000x more routed rows than the window could physically compute
+        kd.loc[kd["Type"] == "GroupedMatmul", "Input Shapes"] = '"1024,2048;4,2048,4096"'
+        bumped = kd.copy()
+        bumped["Input Shapes"] = bumped["Input Shapes"].where(
+            bumped["Type"] != "GroupedMatmul", '"1024000000,2048;4,2048,4096"')
+        result = compute_matrix_power(SimpleNamespace(kernel_details=bumped), {})
+        est = result["fused_mc2_estimate"]
+        self.assertIsNotNone(est)
+        self.assertTrue(est["above_peak"])
+        for group in (g for g in result["groups"] if g["fused_window"]):
+            self.assertIsNone(group["mfu"])
+            self.assertIsNone(group["flops"])
+            self.assertNotEqual(group["evidence_level"], "ESTIMATED")
+            self.assertIn("超过物理峰值", group["estimate_basis"])
+
 
 class MatrixPowerMc2Tests(_Base):
     def test_mc2_fused_rows_are_marked_fused_and_have_no_mbu(self) -> None:
