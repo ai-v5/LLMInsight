@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from .names import is_mc2_fused_type
 from .profile import ProfileData
 from .shapes import parse_dtypes, parse_shapes
 
@@ -46,9 +47,23 @@ _UNKNOWN = _fact(None, "数据中无可靠信号", "unknown")
 # Model-compute families whose FLOP/phase semantics are not implemented yet.
 # Their presence is still important: attention-only phase counts must not be
 # promoted to a whole-model recompute conclusion on a hybrid KDA model.
+# Matched on a normalised form (lowercase, separators removed) because profiler
+# Type values are CamelCase ("ChunkKdaFwdPrepare", "CausalConv1d") while the
+# markers were written snake_case — the raw substring test never matched them, so
+# the guard silently disengaged for exactly the hybrid-KDA model it was written
+# for.
 _CUSTOM_MODEL_MARKERS = (
     "chunk_kda", "kda_", "gated_delta", "chunk_gla", "causal_conv1d", "mega_moe",
     "mhcpre", "mhcpost", "mhcsinkhorn",
+)
+
+
+def _normalise_op_name(value: str) -> str:
+    return "".join(ch for ch in str(value).lower() if ch.isalnum() or ch == "_").replace("_", "")
+
+
+_CUSTOM_MODEL_MARKERS_NORM = tuple(
+    _normalise_op_name(marker).replace("_", "") for marker in _CUSTOM_MODEL_MARKERS
 )
 
 
@@ -58,7 +73,7 @@ def _custom_model_types(kd: pd.DataFrame) -> List[str]:
     values = (kd["Type"].astype(str) if "Type" in kd.columns else _name_series(kd))
     return sorted({
         value for value in values
-        if any(marker in value.lower() for marker in _CUSTOM_MODEL_MARKERS)
+        if any(marker in _normalise_op_name(value) for marker in _CUSTOM_MODEL_MARKERS_NORM)
     })
 
 
@@ -389,6 +404,9 @@ def derive_capture(prof: ProfileData) -> Dict[str, Dict[str, Any]]:
         + (f"；最重 aclnn 调用为 {root}，需时间线核对其与同步的因果关系" if root else ""),
         "high" if total_api_t else "unknown",
     )
+    # Structured root-cause API so the rule/card text names the API that THIS
+    # capture actually spent its host time in, instead of a hardcoded guess.
+    out["host_sync_stall"]["root_api"] = root
 
     # --- recompute granularity, from fused-attention fwd/grad count ----------
     # Forward attention runs once per layer; full recompute reruns it in the
@@ -533,17 +551,28 @@ def derive_guesses(prof: ProfileData,
 
     # alltoallv proves expert parallelism exists, but a single rank cannot reveal
     # its world size.  A model-family default (for example EP64) is not evidence.
+    # The a2a can also be fused INTO the expert GEMM (MC2 offload), in which case
+    # communication.json has no alltoallv entry at all and only the kernel names
+    # prove EP is on.
     has_alltoall = any(
         c.get("type", "").lower().startswith("alltoall")
         for c in (prof.communication or [])
     )
+    has_fused_a2a = False
+    kd = getattr(prof, "kernel_details", None)
+    if kd is not None and not kd.empty and "Type" in kd.columns:
+        has_fused_a2a = any(is_mc2_fused_type(value)
+                            for value in kd["Type"].astype(str).unique())
+    evidence_kind = ("存在 alltoallv（专家并行已开启）" if has_alltoall else
+                     "存在 MC2 融合 all-to-all kernel（专家并行已开启）" if has_fused_a2a else "")
     ep_guess = None
     guesses: Dict[str, Dict[str, Any]] = {
         "ep_world_size": {
             "label": "未知",
             "guess": ep_guess,
-            "basis": ("存在 alltoallv（专家并行已开启），但单 rank profiling 无 peer topology，"
-                      "无法推出 EP world size" if has_alltoall else "无可靠 EP world-size 信号"),
+            "basis": (f"{evidence_kind}，但单 rank profiling 无 peer topology，"
+                      "无法推出 EP world size" if evidence_kind
+                      else "无可靠 EP world-size 信号"),
         },
         "num_experts": {
             "label": "未知",

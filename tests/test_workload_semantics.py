@@ -127,7 +127,13 @@ class WorkloadTests(unittest.TestCase):
                 """)
                 con.commit()
             frame = pd.DataFrame([{"Device_id": 0, "Stream ID": 3, "Task ID": 9, "Start Time(us)": 2500.5}])
-            result = annotate_workload(os.path.relpath(td), frame)
+            try:
+                data_dir = os.path.relpath(td)   # exercise the relative-path lookup
+            except ValueError:
+                # Windows: the temp dir can live on a different drive than the CWD,
+                # where relpath() has no representation — fall back to the absolute path.
+                data_dir = td
+            result = annotate_workload(data_dir, frame)
             self.assertTrue(result["optimizer_window_count"])
             self.assertEqual(frame.iloc[0]["Workload Phase"], "optimizer")
 

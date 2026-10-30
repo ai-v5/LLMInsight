@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from ..config import SETTINGS
+from ..parser.names import is_mc2_fused_type
 from ..parser.profile import num
 
 
@@ -514,6 +515,18 @@ def communication(prof) -> Dict[str, Any]:
     # ---- a2a (MC2 fused AllToAllV) ------------------------------------------- #
     a2a_ops = [c for c in comms if (c.get("type") or "").startswith("alltoallv")]
     a2a: Dict[str, Any] = {"available": bool(a2a_ops)}
+    if not a2a_ops:
+        # "no alltoallv in communication.json" is NOT the same as "this run has no
+        # all-to-all": with MC2 fused MoE the a2a runs inside the expert GEMM kernel
+        # and never reaches communication.json.  Surface the fused window instead of
+        # letting the reader conclude EP is off.
+        fused_us = _fused_mc2_us(prof)
+        if fused_us > 0:
+            a2a["fused_window_us"] = round(fused_us, 1)
+            a2a["note"] = (
+                f"communication.json 中没有独立 alltoallv：本采集的 all-to-all 在 MC2 融合 "
+                f"kernel 内部（融合窗口 {fused_us:,.0f}us，见「结构归因 → MoE fused "
+                "dispatch/combine」），因此不能用本段判断 EP 是否开启。")
     if a2a_ops:
         size_mb = sum(_op_transit_mb(c) for c in a2a_ops)
         transit_ms = sum(c["transit_ms"] for c in a2a_ops)
@@ -737,7 +750,34 @@ def _op_time(op: pd.DataFrame, names: List[str]) -> float:
     return _f(num(op[mask]["Total Time(us)"]).sum())
 
 
-def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None) -> Dict[str, Any]:
+def _fused_mc2_us(prof) -> float:
+    """Wall-clock of the MC2 fused (all-to-all + grouped GEMM) kernels.
+
+    These windows never appear in ``communication.json``, so the communication
+    section (and the EP guesses in parser.derive) must read them from
+    ``op_statistic``.  AI_CPU launcher rows are a second record of the same wall
+    clock and are excluded.
+    """
+    op = getattr(prof, "op_statistic", None)
+    if op is None or op.empty or "OP Type" not in op.columns:
+        return 0.0
+    df = op.copy()
+    df["Total Time(us)"] = num(df["Total Time(us)"])
+    mask = df["OP Type"].astype(str).map(is_mc2_fused_type)
+    if "Core Type" in df.columns:
+        mask &= df["Core Type"].astype(str).str.upper() != "AI_CPU"
+    return float(df.loc[mask, "Total Time(us)"].sum())
+
+
+def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None,
+                    recompute_view: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Hidden-overhead ledger.
+
+    ``recompute_view`` is the already-quantified ``theoretical.recompute`` payload.
+    The ledger must mirror it instead of re-deriving a second, differently-defined
+    number (the model projection ``computing × r_re`` and the measured replay
+    duration disagreed by 32x for the same "重计算开销" label).
+    """
     api = prof.api_statistic
     op = prof.op_statistic
     kd = prof.kernel_details
@@ -768,6 +808,10 @@ def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None) ->
     blocking = bool((cap_state.get("blocking", {}) or {}).get("value")) if cap_state else \
         ((cap.get("env") or {}).get("ASCEND_LAUNCH_BLOCKING") == "1")
     recompute = (cap_state.get("recompute", {}) or {}).get("value")  # full|selective|off|None
+    # Heaviest aclnn API this capture actually spent host time in (parser.derive).
+    # The suggestion text used to hardcode "aclnnMaskedSelect", which is simply not
+    # the API in every capture (e.g. aclnnNonzeroV2 dominates here).
+    sync_root = (cap_state.get("host_sync_stall", {}) or {}).get("root_api") if cap_state else None
 
     buckets = [
         {
@@ -780,8 +824,13 @@ def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None) ->
             "label": "AICPU 集合通信执行 (HcclLaunchAicpuKernel · 同段通信不计入合计)",
             "us": round(aicpu_dispatch, 1),
             "detail": f"AI_CPU 驱动集合通信合计 {aicpu_dispatch:,.0f}us（占 step {_pct(aicpu_dispatch, stage)}%）。"
-                      "单卡下几乎全为 Wait、Transit≈0 → 这是「未掩盖通信」的算子视角，与 Communication 为同一段时间，"
-                      "已从 Device 合计中剔除以免与未掩盖通信重复计入。",
+                      # 拓扑相关结论必须由数据决定：单卡采集里该算子几乎全是 Wait、
+                      # Transit≈0；多卡采集里它是 AICPU 展开执行集合通信的算子视角。
+                      # 早期版本把「单卡」写死，在多卡采集上直接是错误陈述。
+                      + ("单卡下几乎全为 Wait、Transit≈0 → " if _single_card(prof)
+                         else "多卡采集下这是 AICPU 展开执行集合通信的算子视角（耗时含等待与实际传输）→ ")
+                      + "这是「未掩盖通信」的算子视角，与 Communication 为同一段时间，"
+                        "已从 Device 合计中剔除以免与未掩盖通信重复计入。",
             "source": "op_statistic (AI_CPU)",
             "suggestion": "本质是通信而非下发延迟：优先掩盖到计算下（moe-fb-overlap / 异步通信），再缩短通信本身（HCCL 算法/buffsize、EP 规模）。",
         },
@@ -834,7 +883,8 @@ def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None) ->
             "suggestion": (
                 "ASCEND_LAUNCH_BLOCKING=1 放大了同步开销（采集干扰项）；正式训练应关闭。" if blocking else
                 "本次未检出 blocking（profiling 反推）：该同步主要来自动态 shape 的 D2H 同步"
-                "（aclnnMaskedSelect 等）→ 固定 expert capacity / 对路由结果 padding，合并或减少同步点。"
+                + (f"（最重 aclnn 调用为 {sync_root}）" if sync_root else "")
+                + " → 固定 expert capacity / 对路由结果 padding，合并或减少同步点。"
             ),
         },
         {
@@ -848,30 +898,48 @@ def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None) ->
     ]
     # 重计算桶：仅当 profiling 反推重计算开启（full/selective）时呈现；反推为 off/未知时
     # 本次配置无此开销，不臆造（与「配置只来自 profiling、不依赖启动脚本」一致）。
-    if recompute in ("full", "selective"):
-        _rc_kind = "Full" if recompute == "full" else "Selective"
-        # Quantify the recompute time (computing × r_re from the FA ratio). domain=
-        # config + additive:False → a lens, NOT summed into device/host (it already
-        # lives inside Computing).
-        _computing = ov["us"]["computing"] if ov.get("available") else 0.0
-        _rc_ov = _recompute_overhead(_computing, cap_state.get("recompute"))
-        if _rc_ov:
+    # 数值必须来自 theoretical.recompute（单一真源）：本函数早于 theoretical 计算时曾
+    # 自行用 computing × r_re 再算一次，两处对同一个「重计算开销」相差 32 倍。
+    _rc_view = recompute_view or None
+    _rc_gran = (_rc_view or {}).get("granularity") or recompute
+    if _rc_gran in ("full", "selective"):
+        _rc_kind = "Full" if _rc_gran == "full" else "Selective"
+        _rc_us = (_rc_view or {}).get("overhead_us")
+        _fp_us = (_rc_view or {}).get("footprint_us")
+        if _rc_us is not None:
+            _rc_detail = (
+                "profiling 反推重计算={g}（前向/反向调用数 + 可识别重放算子）→ 反向重跑前向。"
+                "实测可识别重放算子耗时 ≈ {us:,.0f}us（step 的 {pct}%）。"
+                "该口径只计入能直接配对到的重放算子，因此是保守下界；"
+            ).format(g=_rc_gran, us=_rc_us, pct=_pct(_rc_us, stage))
+            if _fp_us:
+                _rc_detail += (
+                    "若全部前向算子都被重放，足迹上界约 {fp:,.0f}us（step 的 {fp_pct}%，"
+                    "computing × r_re 投影）。"
+                ).format(fp=_fp_us, fp_pct=_pct(_fp_us, stage))
+            _rc_detail += "重放与反向计算并发，可回收收益见「理论上界 / What-if」重计算项。"
+        else:
+            # 没有共享视图时（独立调用本函数）退回模型投影，并显式标注它是投影。
+            _computing = ov["us"]["computing"] if ov.get("available") else 0.0
+            _rc_ov = _recompute_overhead(_computing, cap_state.get("recompute"))
+            _rc_us = _rc_ov["us"] if _rc_ov else None
             _rc_detail = (
                 "profiling 反推重计算={g}（FA 前向/反向次数比）→ 反向重跑前向。"
-                "估算重算耗时 ≈ {us:,.0f}us（step 的 {pct}%，band {lo:,.0f}–{hi:,.0f}us）"
-                "= computing × {sh:.0%}；覆盖全部前向计算算子，非仅 FA。"
-            ).format(g=recompute, us=_rc_ov["us"], pct=_pct(_rc_ov["us"], stage),
-                     lo=_rc_ov["us_lo"], hi=_rc_ov["us_hi"], sh=_rc_ov["flops_share"])
-        else:
-            _rc_detail = (f"profiling 反推重计算={recompute}（FA 前向/反向次数比）→ 反向重跑前向；"
-                          "缺前向/反向计数，未能量化耗时。")
+                "估算重算足迹 ≈ {us:,.0f}us（step 的 {pct}%，band {lo:,.0f}–{hi:,.0f}us）"
+                "= computing × {sh:.0%} 的投影，假设前向算子全部重放。"
+            ).format(g=_rc_gran, us=_rc_ov["us"] if _rc_ov else 0.0,
+                     pct=_pct(_rc_ov["us"], stage) if _rc_ov else 0.0,
+                     lo=_rc_ov["us_lo"] if _rc_ov else 0.0,
+                     hi=_rc_ov["us_hi"] if _rc_ov else 0.0,
+                     sh=_rc_ov["flops_share"] if _rc_ov else 0.0) if _rc_ov else \
+                f"profiling 反推重计算={_rc_gran}→ 反向重跑前向；缺前向/反向计数，未能量化耗时。"
         buckets.append({
             "key": "recompute", "domain": "config", "additive": False,
             "label": f"重计算开销 ({_rc_kind} Recompute)",
-            "us": _rc_ov["us"] if _rc_ov else None,
+            "us": _rc_us,
             "detail": _rc_detail,
-            "source": "profiling 反推 (parser.derive) + 1:2:1 估算",
-            "suggestion": "评估「选择性重计算 / 减少重计算层」做显存↔耗时平衡；量化收益见 What-if 重计算项。",
+            "source": "profiling 反推 (parser.derive) + 可识别重放算子",
+            "suggestion": "评估「减少/关闭重计算」做显存↔耗时平衡；量化收益见 What-if 重计算项。",
         })
     device_total = sum(b["us"] for b in buckets
                        if b["domain"] == "device" and b.get("additive", True)
@@ -896,6 +964,26 @@ def hidden_overhead(prof, ov: Dict[str, Any], capture: Dict[str, Any] = None) ->
 
 
 # --------------------------------------------------------------------------- #
+# MC2 fused dispatch/combine GEMM labels, matched case-insensitively as SUBSTRINGS.
+# A capture that records op attributes publishes the profiler label
+# ("AlltoAllvGroupedMatMul"), but a Level-1 capture (no op attrs) publishes the raw
+# kernel symbol as OP Type instead, e.g.
+#   _ZN7Catccos5DGemm6Device13KernelAdapterINS0_6Kernel31Ascend950AllToAllVGroupedMatmul…
+# Exact equality then silently dropped the whole fused window into
+# Elementwise/Other and left moe_focus.fused_dispatch_combine_us = 0.  Keep the
+# markers narrow (parser.names owns the single list).
+def _module_type_mask(types: "pd.Series", name: str) -> "pd.Series":
+    """Rows whose OP Type is *name*, tolerating mangled/fused kernel symbols.
+
+    Exact equality for every module rule; the MC2 fused GEMMs additionally match
+    by marker so qualified C++ symbols (Level-1 captures) are attributed too.
+    """
+    mask = types == name
+    if is_mc2_fused_type(name):
+        mask = mask | types.str.lower().str.contains(name.lower(), regex=False)
+    return mask
+
+
 _MODULE_RULES = [
     # MC2 fused dispatch/combine GEMMs.  They carry both the expert GEMM and the
     # all-to-all inside one window, so they get their own module instead of
@@ -949,9 +1037,10 @@ def attribution(prof) -> Dict[str, Any]:
     assigned["Optimizer"] = optimizer_us
     elementwise = 0.0
     seen = set()
+    op_types = df["OP Type"].astype(str)
     for module, types in _MODULE_RULES:
         for t in types:
-            mask = df["OP Type"].astype(str) == t
+            mask = _module_type_mask(op_types, t)
             assigned[module] += _f(df[mask]["Total Time(us)"].sum())
             seen.update(df[mask].index.tolist())
     for idx, row in df.iterrows():
@@ -1411,10 +1500,32 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
         r_lo_est = float(recompute_est.get("flops_share_lo") or r_est)
         r_hi_est = float(recompute_est.get("flops_share_hi") or r_est)
         multiplier = float(rc_state.get("recompute_forward_multiplier") or 0.0)
+        candidates_us = round(sum(c.get("duration_us", 0)
+                                  for c in recompute_est.get("candidates", [])), 1)
+        # Two different questions share the "recompute" label and must not be
+        # conflated:
+        #   footprint   = how much of Computing is replay work (model estimate
+        #                 computing × r_re; same one the hidden-overhead ledger uses)
+        #   reclaimable = wall time owned by the *identifiable* replay kernels
+        #                 (excess forward calls); unidentified families keep theirs,
+        #                 so this is a conservative lower bound on the saving.
+        # The lever uses the conservative bound, but the granularity classification
+        # comes from the caller counts (parser.derive): efficiency's share-based
+        # heuristic measures "how much FLOPs", not full-vs-selective, so letting it
+        # win made the What-if card say selective while the ledger said full.
+        footprint = _recompute_overhead(
+            computing,
+            rc_state,
+            bwd_fwd_flop_ratio=(attn_flops.get("backward_forward_flop_ratio")
+                                if exact_attn_flops else None),
+            recompute_forward_multiplier=(attn_flops.get("recompute_forward_multiplier")
+                                          if exact_attn_flops else None),
+            component_flops=component_flops,
+        )
         rc_ov = {
-            "us": round(sum(c.get("duration_us", 0) for c in recompute_est.get("candidates", [])), 1),
+            "us": candidates_us,
             "us_lo": 0.0,
-            "us_hi": round(sum(c.get("duration_us", 0) for c in recompute_est.get("candidates", [])), 1),
+            "us_hi": candidates_us,
             "flops_share": round(r_est, 4),
             "flops_share_lo": round(r_lo_est, 4),
             "flops_share_hi": round(r_hi_est, 4),
@@ -1422,8 +1533,13 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
             "recompute_forward_multiplier": round(multiplier, 4),
             "bwd_fwd_flop_ratio": 2.0,
             "flop_ratio_source": "operator_candidates_plus_counter_calibration",
-            "granularity": recompute_est.get("likely_granularity") or rc_state.get("value"),
-            "basis": "已识别重计算候选算子的累计时间上界；与通信/其它计算的重叠尚未扣除，非关键路径实测收益。",
+            "granularity": rc_state.get("value") or recompute_est.get("likely_granularity"),
+            # 重算在 Computing 里的全量足迹（与隐性开销桶同口径），仅作对照，不并入收益。
+            "footprint_us": footprint.get("us") if footprint else None,
+            "footprint_pct": _pct(footprint["us"], stage) if footprint else None,
+            "basis": ("可回收上界 = 已识别重放算子（超额 forward 调用）的累计耗时，未识别到的"
+                      "模型家族不计入收益，因此是保守值；重算在 Computing 中的全量足迹另见"
+                      "隐性开销「重计算」桶（computing × r_re 估算）。"),
             "candidates": recompute_est.get("candidates") or [],
             "confidence": recompute_est.get("confidence") or "medium",
         }
@@ -1687,6 +1803,10 @@ def theoretical(prof, ov: Dict[str, Any], eff: Dict[str, Any],
             "overhead_us_lo": rc_ov["us_lo"],
             "overhead_us_hi": rc_ov["us_hi"],
             "overhead_pct": _pct(rc_ov["us"], stage),
+            # 足迹口径（与 hidden_overhead 桶一致）：仅当该分支用「可识别重放耗时」
+            # 作为收益上界时才有值，供卡片说明两者区别。
+            "footprint_us": rc_ov.get("footprint_us"),
+            "footprint_pct": rc_ov.get("footprint_pct"),
             "rho": rc_ov["rho"],
             "flops_share": rc_ov["flops_share"],
             "flops_share_lo": rc_ov["flops_share_lo"],

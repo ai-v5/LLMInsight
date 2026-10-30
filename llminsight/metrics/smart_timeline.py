@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 
 from ..cache import cached_json, file_signature
 from ..config import SETTINGS
+from ..parser.names import op_display_name
 from ..parser.trace import iter_events, event_ts_us
 from .efficiency import MATMUL_TYPES, ATTENTION_TYPES
 
@@ -464,9 +465,13 @@ def _apply_chip(geom: Dict[str, Any], eff: Dict[str, Any], prof=None) -> Dict[st
         ki = kindex.get(s["name"])
         nm = s["name"]
         out_slices.append({
-            "name": nm if len(nm) <= 90 else nm[:88] + "…",
+            # Display names only: the full name was already used for the chip-overlay
+            # join above.  A Level-1 capture logs the raw C++ symbol (1000+ chars) as
+            # both name and Type, which used to ship ~30% of this payload in three
+            # repeated strings — canonical labels keep the tooltip readable.
+            "name": op_display_name(nm, limit=90),
             "stream": s["stream"],
-            "type": s["type"],
+            "type": op_display_name(s["type"] or "", limit=90) or s["type"],
             "core": s["core"],
             "dtype": s["dtype"],
             "start_ms": s["start_ms"],

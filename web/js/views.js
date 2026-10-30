@@ -1,6 +1,6 @@
 /* LLMInsight frontend — view renderers. Each async fn fills its root element. */
 (function () {
-  const { api, apiPost, fmt, esc, metric, panel, banner, chart, axis, tooltipBase, sevColor } = LI;
+  const { api, apiPost, fmt, esc, shortOp, metric, panel, banner, chart, axis, tooltipBase, sevColor } = LI;
   const V = {};
 
   function charts(defs) { // defs: [{id, option}] — init after DOM exists
@@ -186,7 +186,7 @@
     if (!hs.available) { root.innerHTML = `<div class="empty">无 op_statistic 数据</div>`; return; }
     const top = hs.top.slice(0, 12);
     const rows = hs.ops.slice(0, 40).map(o =>
-      `<tr><td>${esc(o.type)}</td><td><span class="tag ${coreClass(o.core)}">${esc(o.core || "—")}</span></td>
+      `<tr><td class="mono" title="${esc(o.type)}">${esc(shortOp(o.type))}</td><td><span class="tag ${coreClass(o.core)}">${esc(o.core || "—")}</span></td>
        <td>${fmt.int(o.count)}</td><td>${fmt.us(o.total_us)}</td><td>${fmt.us(o.avg_us)}</td><td>${fmt.us(o.max_us)}</td><td>${fmt.pct(o.ratio, 2)}</td></tr>`).join("");
     root.innerHTML = `
       <div class="grid cols-2">
@@ -236,17 +236,22 @@
     const dtypes = [...new Set(rows.map(r => r.dtype).filter(Boolean))].sort();
     const state = { sort: "dur_us", dir: "desc", operators: new Set(operators), dtypes: new Set(dtypes) };
     const fmtM = (value, evidence) => (value == null ? "—" : fmt.mfu(value))
-      + (evidence === "PROXY" ? ' <span class="tag">PROXY</span>' : "");
+      + (evidence === "PROXY" ? ' <span class="tag">PROXY</span>' : "")
+      // MC2 fused window: GEMM work rebuilt from function + same-capture anchors and
+      // the denominator still contains the internal a2a -> equivalent (lower) MFU.
+      + (evidence === "ESTIMATED"
+        ? ' <span class="tag" title="按功能约定 + 同采集专家 GEMM 锚点重建；分母含内部 a2a，是纯计算 MFU 的下界">估</span>'
+        : "");
     const filterBox = (field, values, label) => `<details class="matrix-filter"><summary>筛选</summary><div class="matrix-filter-menu">`
       + `<label><input type="checkbox" data-filter-all="${field}" checked> 全选</label>`
-      + values.map(value => `<label><input type="checkbox" data-filter="${field}" value="${esc(value)}" checked> ${esc(value)}</label>`).join("")
+      + values.map(value => `<label title="${esc(value)}"><input type="checkbox" data-filter="${field}" value="${esc(value)}" checked> ${esc(shortOp(value, 40))}</label>`).join("")
       + `</div></details>`;
     const head = (field, label, filter) => `<th><button class="matrix-sort" data-sort="${field}">${label}<span class="sort-mark"></span></button>${filter || ""}</th>`;
     root.innerHTML = `
       <div class="matrix-intro">${banner("info", "▦", `<strong>矩阵算力</strong>按 ${esc(mp.kernel_count)} 个 MatMul / GroupedMatmul / FA / KDA / MegaMoE 矩阵相关 kernel 展开；精度以矩阵输入 dtype 或明确的 kernel 精度标记归一。芯片：<strong>${esc((mp.chip || {}).name || "—")}</strong>。${esc(mp.note || "")}`)}</div>
       <div class="grid cols-2">
         ${panel("算子@dtype 耗时占比", "矩阵相关 kernel 的 device duration", `<div id="matrix-donut" class="chart"></div>`)}
-        ${panel("算子@dtype MFU", "按 FLOPs /（对应 dtype 峰值 × 耗时）聚合；MegaMoE 使用完整融合窗口", `<div class="tbl-wrap matrix-summary-wrap"><table class="tbl matrix-summary"><thead><tr><th>算子@dtype</th><th>次数</th><th>耗时</th><th>占比</th><th>MFU</th><th>MBU</th></tr></thead><tbody>${groups.map(g => `<tr><td class="mono">${esc(g.label)}</td><td>${fmt.int(g.count)}</td><td>${fmt.us(g.dur_us)}</td><td>${fmt.pct(g.dur_pct, 2)}</td><td>${fmtM(g.mfu, g.evidence_level)}</td><td>${fmtM(g.mbu)}</td></tr>`).join("")}</tbody></table></div>`)}
+        ${panel("算子@dtype MFU", "按 FLOPs /（对应 dtype 峰值 × 耗时）聚合；MegaMoE 使用完整融合窗口；MC2 融合窗口为「等效 MFU（估）」", `<div class="tbl-wrap matrix-summary-wrap"><table class="tbl matrix-summary"><thead><tr><th>算子@dtype</th><th>次数</th><th>耗时</th><th>占比</th><th>MFU</th><th>MBU</th></tr></thead><tbody>${groups.map(g => `<tr><td class="mono" title="${esc(g.label)}">${esc(shortOp(g.label, 48))}</td><td>${fmt.int(g.count)}</td><td>${fmt.us(g.dur_us)}</td><td>${fmt.pct(g.dur_pct, 2)}</td><td title="${esc(g.estimate_basis || "")}">${fmtM(g.mfu, g.evidence_level)}</td><td>${fmtM(g.mbu)}</td></tr>`).join("")}</tbody></table></div>`)}
       </div>
       ${panel("矩阵算子明细", "点击表头排序；筛选菜单支持多选。shape 为 profiler 记录的输入 → 输出，— 表示该字段无法从本次采集闭合。", `<div class="matrix-toolbar"><span class="matrix-count"></span><button class="btn ghost matrix-reset">重置筛选</button></div><div class="tbl-wrap matrix-detail-wrap"><table class="tbl matrix-detail"><thead><tr>
         ${head("operator", "算子", filterBox("operator", operators, "算子"))}
@@ -271,7 +276,7 @@
         if (bv == null) return -1;
         return (typeof av === "string" ? av.localeCompare(String(bv)) : av - bv) * dir;
       });
-      tbody.innerHTML = filtered.map(row => `<tr><td class="mono" title="${esc(row.name)}">${esc(row.operator)}</td><td><span class="tag compute" title="${row.dtype_basis === "kernel_symbol" ? "来自 kernel 精度标记" : "来自 profiler dtype"}">${esc(row.dtype)}</span></td><td class="mono matrix-shape" title="${esc(row.shape)}">${esc(row.shape)}</td><td>${fmt.us(row.dur_us)}</td><td>${fmtM(row.mfu, row.evidence_level)}</td><td>${fmtM(row.mbu)}</td></tr>`).join("");
+      tbody.innerHTML = filtered.map(row => `<tr><td class="mono" title="${esc(row.name)}">${esc(shortOp((row.label || row.operator || "").replace(/@[^@]*$/, ""), 48))}</td><td><span class="tag compute" title="${row.dtype_basis === "kernel_symbol" ? "来自 kernel 精度标记" : row.dtype_basis === "sibling_expert_gemm_dtype" ? "来自同层专家 GEMM（本算子未记录 dtype）" : "来自 profiler dtype"}">${esc(row.dtype)}</span></td><td class="mono matrix-shape" title="${esc(row.shape)}">${esc(row.shape)}</td><td>${fmt.us(row.dur_us)}</td><td>${fmtM(row.mfu, row.evidence_level)}</td><td>${fmtM(row.mbu)}</td></tr>`).join("");
       count.textContent = `显示 ${filtered.length.toLocaleString("en-US")} / ${rows.length.toLocaleString("en-US")} 个 kernel`;
       root.querySelectorAll(".matrix-sort").forEach(button => {
         const mark = button.querySelector(".sort-mark");
@@ -317,7 +322,7 @@
     // than empty charts that would read as "0% everywhere".
     if (ef.shapes_available === false) {
       const rows = (ef.by_type || []).slice(0, 30).map(t =>
-        `<tr><td>${esc(t.type)}</td><td class="mono">${t.dtype ? esc(t.dtype) : "—"}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td><td>${t.mac_ratio_weighted != null ? fmt.mfu(t.mac_ratio_weighted) : "—"}</td></tr>`).join("");
+        `<tr><td class="mono" title="${esc(t.type)}">${esc(shortOp(t.type))}</td><td class="mono">${t.dtype ? esc(t.dtype) : "—"}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td><td>${t.mac_ratio_weighted != null ? fmt.mfu(t.mac_ratio_weighted) : "—"}</td></tr>`).join("");
       root.innerHTML = `
         ${banner("warn", "⚠️", `此 profiling 为 <strong>msprof 轻量采集</strong>，未记录算子 shape/dtype → <strong>MFU / MBU / Roofline 不可用</strong>（建模需要 shape）。下方仅按算子类型展示耗时分布；如需算力效率，请使用记录了 shape 的采集（op_summary 的 Input Shapes 非 N/A）。`)}
         ${panel("按算子类型耗时", "MAC 周期占比来自 profiler 计数器，按 kernel 耗时加权；它不是 MFU", `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Type</th><th>dtype</th><th>Count</th><th>耗时</th><th>MAC周期占比(加权)</th></tr></thead><tbody>${rows}</tbody></table></div>`)}`;
@@ -368,13 +373,13 @@
       return `${gap >= 0 ? "+" : ""}${gap.toFixed(1)} pp`;
     };
     const byType = ef.by_type.slice(0, 20).map(t =>
-      `<tr><td>${esc(t.type)}</td><td class="mono">${t.dtype ? esc(t.dtype) : "—"}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td><td>${mfuCell(t)}</td><td title="计数器耗时覆盖 ${Number(t.mac_ratio_coverage_pct || 0).toFixed(1)}%">${t.mac_ratio_weighted != null ? fmt.mfu(t.mac_ratio_weighted) : "—"}</td><td>${macGap(t)}</td><td>${t.mbu != null ? fmt.mfu(t.mbu) : "—"}</td><td>${fmt.us(t.reclaim_us != null ? t.reclaim_us : t.wasted_us)}</td></tr>`).join("");
+      `<tr><td class="mono" title="${esc(t.type)}">${esc(shortOp(t.type))}</td><td class="mono">${t.dtype ? esc(t.dtype) : "—"}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td><td>${mfuCell(t)}</td><td title="计数器耗时覆盖 ${Number(t.mac_ratio_coverage_pct || 0).toFixed(1)}%">${t.mac_ratio_weighted != null ? fmt.mfu(t.mac_ratio_weighted) : "—"}</td><td>${macGap(t)}</td><td>${t.mbu != null ? fmt.mfu(t.mbu) : "—"}</td><td>${fmt.us(t.reclaim_us != null ? t.reclaim_us : t.wasted_us)}</td></tr>`).join("");
     const sparseMac = (ef.by_type || []).filter(t =>
       (t.type === "SparseFlashAttention" || t.type === "SparseFlashAttentionGrad") &&
       t.mfu != null && t.mac_ratio_weighted != null);
     const ob = ef.overhead_bound_ops || [];
     const obRows = ob.map(t =>
-      `<tr><td>${esc(t.type)}</td><td class="mono">${t.dtype ? esc(t.dtype) : "—"}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td><td>${t.mfu != null ? fmt.mfu(t.mfu) : "—"}</td><td>${t.mbu != null ? fmt.mfu(t.mbu) : "—"}</td></tr>`).join("");
+      `<tr><td class="mono" title="${esc(t.type)}">${esc(shortOp(t.type))}</td><td class="mono">${t.dtype ? esc(t.dtype) : "—"}</td><td>${fmt.int(t.count)}</td><td>${fmt.us(t.dur_us)}</td><td>${t.mfu != null ? fmt.mfu(t.mfu) : "—"}</td><td>${t.mbu != null ? fmt.mfu(t.mbu) : "—"}</td></tr>`).join("");
     // 算子极致优化 summary: per-class ceilings + how many kernels are already
     // saturated (filtered out of the ranking) + total reclaimable-to-ceiling time.
     const oco = ef.op_ceiling_opt;
@@ -383,7 +388,7 @@
       ? `<div class="note" style="margin-top:8px">🎯 算子 MFU 天花板：matmul <strong>${ceilPct(oco.ceilings.matmul)}%</strong> / FA <strong>${ceilPct(oco.ceilings.attention)}%</strong> / FAG <strong>${ceilPct(oco.ceilings.attention_grad)}%</strong>　·　已达天花板 <strong>${oco.n_capped}/${oco.n_modeled}</strong> 个算子（不再优化）　·　全部提升至天花板可回收 <strong>${fmt.us(oco.total_reclaim_us)}</strong>。下方「优化候选 / 排行」已据此筛选。</div>`
       : "";
     const fidelity = !ef.flop_model_complete
-      ? banner("warn", "⚠️", `模型 FLOP 公式覆盖 <strong>${fmt.pct(ef.flop_coverage_pct)}</strong>；未建模：<strong>${esc(Object.keys(ef.unmodeled_flop_types || {}).join("、") || "未知主导算子")}</strong>。完整模型 MFU 改用同次采集 MAC/Vector 周期校准估算；未知算子不生成 Roofline 收益。`)
+      ? banner("warn", "⚠️", `模型 FLOP 公式覆盖 <strong>${fmt.pct(ef.flop_coverage_pct)}</strong>；未建模：<strong>${esc(Object.keys(ef.unmodeled_flop_types || {}).map(shortOp).join("、") || "未知主导算子")}</strong>。完整模型 MFU 改用同次采集 MAC/Vector 周期校准估算；未知算子不生成 Roofline 收益。`)
       : "";
     const peakWarning = ef.peak_inconsistent
       ? banner("warn", "⚠️", "观测吞吐超过所选芯片/精度峰值；请核对 active chip、dtype 与 shape 语义。当前 MFU 不作为有效结论。")
