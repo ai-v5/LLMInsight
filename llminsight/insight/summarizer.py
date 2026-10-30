@@ -123,7 +123,9 @@ def build_summary(m: Dict[str, Any],
             "composition": ov.get("composition"),
         } if ov.get("available") else None,
         "hotspots_top": [
-            {"type": o["type"], "core": o["core"], "ratio": o["ratio"],
+            # display label: a Level-1 capture names fused kernels with a 1000+ char
+            # C++ symbol, which would dominate the LLM prompt for no extra signal.
+            {"type": o.get("display") or o["type"], "core": o["core"], "ratio": o["ratio"],
              "total_us": o["total_us"], "count": o["count"]}
             for o in hot.get("top", [])[:8]
         ] if hot.get("available") else None,
