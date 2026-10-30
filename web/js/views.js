@@ -186,7 +186,7 @@
     if (!hs.available) { root.innerHTML = `<div class="empty">无 op_statistic 数据</div>`; return; }
     const top = hs.top.slice(0, 12);
     const rows = hs.ops.slice(0, 40).map(o =>
-      `<tr><td class="mono" title="${esc(o.type)}">${esc(shortOp(o.type))}</td><td><span class="tag ${coreClass(o.core)}">${esc(o.core || "—")}</span></td>
+      `<tr><td class="mono" title="${esc(o.type)}">${esc(o.display || shortOp(o.type))}</td><td><span class="tag ${coreClass(o.core)}">${esc(o.core || "—")}</span></td>
        <td>${fmt.int(o.count)}</td><td>${fmt.us(o.total_us)}</td><td>${fmt.us(o.avg_us)}</td><td>${fmt.us(o.max_us)}</td><td>${fmt.pct(o.ratio, 2)}</td></tr>`).join("");
     root.innerHTML = `
       <div class="grid cols-2">
@@ -388,7 +388,7 @@
       ? `<div class="note" style="margin-top:8px">🎯 算子 MFU 天花板：matmul <strong>${ceilPct(oco.ceilings.matmul)}%</strong> / FA <strong>${ceilPct(oco.ceilings.attention)}%</strong> / FAG <strong>${ceilPct(oco.ceilings.attention_grad)}%</strong>　·　已达天花板 <strong>${oco.n_capped}/${oco.n_modeled}</strong> 个算子（不再优化）　·　全部提升至天花板可回收 <strong>${fmt.us(oco.total_reclaim_us)}</strong>。下方「优化候选 / 排行」已据此筛选。</div>`
       : "";
     const fidelity = !ef.flop_model_complete
-      ? banner("warn", "⚠️", `模型 FLOP 公式覆盖 <strong>${fmt.pct(ef.flop_coverage_pct)}</strong>；未建模：<strong>${esc(Object.keys(ef.unmodeled_flop_types || {}).map(shortOp).join("、") || "未知主导算子")}</strong>。完整模型 MFU 改用同次采集 MAC/Vector 周期校准估算；未知算子不生成 Roofline 收益。`)
+      ? banner("warn", "⚠️", `模型 FLOP 公式覆盖 <strong>${fmt.pct(ef.flop_coverage_pct)}</strong>；未建模：<strong>${esc(Object.keys(ef.unmodeled_flop_types || {}).map(t => shortOp(t)).join("、") || "未知主导算子")}</strong>。完整模型 MFU 改用同次采集 MAC/Vector 周期校准估算；未知算子不生成 Roofline 收益。`)
       : "";
     const peakWarning = ef.peak_inconsistent
       ? banner("warn", "⚠️", "观测吞吐超过所选芯片/精度峰值；请核对 active chip、dtype 与 shape 语义。当前 MFU 不作为有效结论。")
@@ -501,6 +501,9 @@
     // 旧 profiling 没有这些字段：逐个做存在性判断，缺失时对应卡片/面板整体不渲染，
     // 页面完整回落为原有内容（向后兼容）。
     const a2a = (cm.a2a && cm.a2a.available) ? cm.a2a : null;
+    // No standalone alltoallv is NOT "no expert parallelism": with MC2 fused MoE the
+    // a2a runs inside the expert GEMM kernel and never reaches communication.json.
+    const a2aFused = (cm.a2a && !cm.a2a.available && cm.a2a.fused_window_us) ? cm.a2a : null;
     const fsdp = (cm.fsdp && cm.fsdp.available) ? cm.fsdp : null;
     const byGroup = Array.isArray(cm.by_group) ? cm.by_group : [];
     const waitAttr = cm.wait_attribution || {};
@@ -631,7 +634,10 @@
     const cmpGrid = a2aPanel && fsdpPanel
       ? `<div class="grid cols-2">${a2aPanel}${fsdpPanel}</div>`
       : (a2aPanel || fsdpPanel);
-    const contractHtml = `${contractCardsHtml}${cmpGrid || ""}${groupPanel}${waitPanel}`;
+    const fusedA2aNote = a2aFused
+      ? banner("info", "⇄", `本采集 <strong>没有独立的 alltoallv</strong>（communication.json 不记录融合 kernel 内部的通信）：all-to-all 位于 <strong>MC2 融合 kernel</strong> 内部，融合窗口累计 <strong>${fmt.us(a2aFused.fused_window_us)}</strong>。因此不能用本页判断 EP 是否开启；融合窗口的等效 MFU 见「矩阵算力」。${esc(a2aFused.note || "")}`)
+      : "";
+    const contractHtml = `${contractCardsHtml}${fusedA2aNote}${cmpGrid || ""}${groupPanel}${waitPanel}`;
 
     const rows = cm.by_type.map(t =>
       `<tr><td>${esc(t.type)}</td><td>${fmt.int(t.count)}</td><td>${fmt.ms(t.elapse_ms)}</td><td>${fmt.ms(t.wait_ms)}</td><td>${fmt.pct(t.wait_pct)}</td><td>${fmt.ms(t.transit_ms)}</td><td>${transitCollected ? t.transit_mb.toFixed(1) + " MB" : "未采集"}</td><td>${bw(t.bandwidth_with_wait_gbps)}</td><td>${bw(t.bandwidth_gbps)}</td></tr>`).join("");
