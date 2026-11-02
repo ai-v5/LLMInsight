@@ -34,33 +34,32 @@ LLMInsight 是独立开源项目，由维护者与贡献者按开源协作方式
 
 ## 快速开始
 
-### Windows（推荐）
+### Windows x64 安装包
 
-在仓库根目录打开 PowerShell：
-
-```powershell
-pip install -r requirements.txt
-.\restart_insight.bat
-```
-
-脚本会停止旧进程并启动服务。服务固定绑定 `127.0.0.1`，不支持远程监听。打开
-<http://127.0.0.1:8765/>，选择要分析的 Profiling 目录。
+从 [Release 下载 Windows 安装包](https://github.com/ai-v5/LLMInsight/releases/latest/download/LLMInsight-Setup-x64.exe)，
+双击安装后从开始菜单启动 LLMInsight。安装包已包含 Python 和运行依赖，无需另行安装。
+启动后浏览器会打开 <http://127.0.0.1:8765/>；选择要分析的 Profiling 目录。
+关闭 LLMInsight 命令窗口即可停止服务。服务固定绑定 `127.0.0.1`，不支持远程监听。
+安装包未签名，Windows 可能提示未知发布者；可使用 [Release 页面](https://github.com/ai-v5/LLMInsight/releases/latest)的
+`SHA256SUMS` 校验下载文件。
 
 浏览器请求只接受当前本机来源。自行调用 POST API 时，需发送
 `Content-Type: application/json` 和 `X-LLMInsight-Request: 1`；
 `/api/llm` 仅接受 POST。不要将服务通过反向代理或端口转发暴露给远端。
 
-### Linux/macOS
+### Linux / macOS：从源码安装
 
 ```bash
-pip install -r requirements.txt
-./restart_insight.sh
+git clone https://github.com/ai-v5/LLMInsight.git
+cd LLMInsight
+python3 -m pip install -r requirements.txt
+python3 -m llminsight.server --port 8765
 ```
 
-也可以直接运行：
+需要不自动打开浏览器时：
 
 ```bash
-python -m llminsight.server --port 8765 --no-browser
+python3 -m llminsight.server --port 8765 --no-browser
 ```
 
 如果没有手动选择目录，可用 `LLMINSIGHT_DATA_DIR` 指定数据目录。重启脚本默认

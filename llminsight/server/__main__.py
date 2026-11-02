@@ -6,11 +6,11 @@ import argparse
 from .app import LOOPBACK_HOST, serve
 
 
-def main() -> None:
+def main(default_port: int = 8000) -> None:
     ap = argparse.ArgumentParser(prog="llminsight.server",
                                  description="LLMInsight — Ascend NPU profiling insight web app")
     ap.add_argument("--host", default=LOOPBACK_HOST)
-    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--port", type=int, default=default_port)
     ap.add_argument("--no-browser", action="store_true", help="don't auto-open the browser")
     args = ap.parse_args()
     if args.host != LOOPBACK_HOST:

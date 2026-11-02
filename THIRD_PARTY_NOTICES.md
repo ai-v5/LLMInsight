@@ -47,3 +47,9 @@ installed distribution metadata when producing a binary redistribution.
 
 The Python standard library components used by LLMInsight are covered by the
 Python Software Foundation License; they are not vendored by this repository.
+
+The Windows installer bundles a Python runtime and the dependencies selected in
+`scripts/requirements-windows-build.txt`. Their exact distribution metadata and
+license files are installed under `licenses/python-packages/`; the Python
+runtime license is installed under `licenses/python/`. The installer also
+includes the license for the PyInstaller bootloader used to build the app.
