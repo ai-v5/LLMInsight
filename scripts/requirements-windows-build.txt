@@ -1,0 +1,14 @@
+# Reproducible Windows x64 installer inputs, for Python 3.12.
+numpy==2.3.5
+pandas==2.3.3
+PyYAML==6.0.3
+python-dateutil==4.0.0
+pytz==2026.6
+tzdata==2026.6
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9
+altgraph==0.17.5
+packaging==26.3
+pefile==2024.8.26
+pywin32-ctypes==0.2.3
+setuptools==84.2.1
