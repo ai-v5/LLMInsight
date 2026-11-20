@@ -1,0 +1,13 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const html = fs.readFileSync('docs/index.html', 'utf8');
+const policy = html.match(/http-equiv="Content-Security-Policy" content="([^"]+)"/)[1];
+const directives = Object.fromEntries(policy.split(';').map(part => { const [name, ...values] = part.trim().split(/\s+/); return [name, values]; }));
+assert.deepEqual(directives['default-src'], ["'none'"]);
+assert.deepEqual(directives['style-src'], ["'self'"]);
+assert.deepEqual(directives['script-src'], ["'self'", 'https://www.googletagmanager.com']);
+assert.deepEqual(directives['img-src'], ["'self'", 'https://www.googletagmanager.com', 'https://*.google-analytics.com']);
+assert.deepEqual(directives['connect-src'], ['https://www.googletagmanager.com', 'https://*.google-analytics.com', 'https://*.google.com']);
+assert.ok(!html.includes('<style>'));
+assert.match(fs.readFileSync('docs/styles.css', 'utf8'), /#analytics-consent:not\(\[hidden\]\)/);
+console.log('analytics CSP checks passed');

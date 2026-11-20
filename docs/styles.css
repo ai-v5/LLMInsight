@@ -8,3 +8,6 @@
 @media(max-width:600px){.clues{grid-template-columns:1fr;gap:18px}.clues li{gap:13px}.clues li+li{border-top:1px solid var(--line);padding-top:18px}.clues h4{font-size:14px}.clues p{font-size:12px}}
 @media(prefers-reduced-motion:reduce){:root{scroll-behavior:auto}}
 @media(max-width:480px){.hero-actions{flex-wrap:wrap}.hero-actions .button,.hero-actions .text-link{white-space:nowrap}}
+
+#analytics-consent:not([hidden]){position:fixed;z-index:1000;bottom:0;left:0;right:0;padding:1rem;background:#fff;color:#222;box-shadow:0 -2px 12px #0003}
+#analytics-consent p{margin:0 0 .5rem}
